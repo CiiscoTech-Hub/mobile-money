@@ -12,6 +12,13 @@ jest.mock("../../src/services/stellar/webhooks", () => ({
   enqueueSepWebhook: jest.fn().mockResolvedValue(undefined),
 }));
 
+// Mock TransactionModel to prevent Redis connection hangs during tests
+jest.mock("../../src/models/transaction", () => ({
+  TransactionModel: jest.fn().mockImplementation(() => ({
+    findById: jest.fn().mockResolvedValue(null)
+  }))
+}));
+
 import sep24Router from "../../src/stellar/sep24";
 import { errorHandler } from "../../src/middleware/errorHandler";
 

@@ -41,6 +41,9 @@ RUN npm ci --omit=dev --omit=optional --ignore-scripts && \
 FROM node:20-alpine AS production
 ENV NODE_ENV=production
 
+# Upgrade base OS packages to patch vulnerabilities caught by Trivy
+RUN apk upgrade --no-cache
+
 # Create non-root user for security
 RUN addgroup -g 1001 -S nodejs && \
     adduser -S nodejs -u 1001
