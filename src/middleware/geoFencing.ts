@@ -1,4 +1,5 @@
 import { Request, Response, NextFunction } from "express";
+// @ts-ignore
 import geoip from "geoip-lite";
 
 // Operational regions: African countries where mobile money services are supported
@@ -89,7 +90,9 @@ export function geoFencingMiddleware(
   if (!geo || !geo.country) {
     // Unable to determine location - fail closed in production
     if (process.env.NODE_ENV === "production") {
-      console.warn(`[GEOFENCE] Unable to determine location for IP: ${clientIp}`);
+      console.warn(
+        `[GEOFENCE] Unable to determine location for IP: ${clientIp}`,
+      );
       res.status(403).json({
         error: "Forbidden",
         message: "Unable to verify geographic location",

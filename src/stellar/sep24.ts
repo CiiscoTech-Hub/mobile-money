@@ -1,7 +1,8 @@
-import { Router, Request, Response } from "express";
+import logger from "../utils/logger";
+import { Router, Request, Response, NextFunction } from "express";
 import { sep24RateLimiter } from "../middleware/rateLimit";
 import { v4 as uuidv4 } from "uuid";
-import { Transaction, Keypair, StrKey } from "stellar-sdk";
+import { Transaction, Keypair, StrKey, Memo } from "@stellar/stellar-sdk";
 import {
   getStellarServer,
   getNetworkPassphrase,
@@ -11,6 +12,25 @@ import { ERROR_CODES } from "../constants/errorCodes";
 import { TransactionModel } from "../models/transaction";
 import { createError } from "../middleware/errorHandler";
 import { enqueueSepWebhook } from "../services/stellar/webhooks";
+import {
+  generateSignedSep24Url,
+  verifySep24Signature,
+} from "../utils/sep24Signature";
+import {
+  Sep24MemoType,
+  formatSep24ValidationError,
+  sep24DepositRequestSchema,
+  toStellarMemo,
+} from "../validators/sep24";
+import {
+  PostgresSep24TransactionStore,
+  Sep24TransactionStore,
+} from "./sep24Store";
+import { renderSep24InteractivePage } from "../services/sep24InteractivePage";
+import {
+  OrangeQrCodeGenerator,
+  renderOrangeMoneyQrSection,
+} from "../providers/orange/qrCode";
 
 function isValidStellarPublicKey(key: string): boolean {
   try {
@@ -63,7 +83,8 @@ export interface Sep24Transaction {
   asset_out?: string;
   account?: string;
   memo?: string;
-  memo_type?: "text" | "hash" | "id";
+  memo_type?: Sep24MemoType;
+  stellar_transaction_id?: string;
   from?: string;
   to?: string;
   callback?: string;
@@ -88,7 +109,9 @@ export interface DepositRequest {
   asset_code: string;
   amount: string;
   account: string;
+  /** Memo to attach to the Stellar payment, e.g. for a shared exchange address. */
   memo?: string;
+  memo_type?: Sep24MemoType;
   email?: string;
   wallet_name?: string;
   wallet_url?: string;
@@ -122,9 +145,47 @@ export interface InteractiveFlowResponse {
 
 const transactions = new Map<string, Sep24Transaction>();
 
+let transactionStore: Sep24TransactionStore =
+  new PostgresSep24TransactionStore();
+
+/** Swap the persistence backend (used by tests and alternative deployments). */
+export const setSep24TransactionStore = (
+  store: Sep24TransactionStore,
+): void => {
+  transactionStore = store;
+};
+
+/**
+ * Write-through to durable storage. Failures are logged rather than thrown so
+ * a database outage does not break the interactive flow.
+ */
+async function persistTransaction(
+  transaction: Sep24Transaction,
+): Promise<void> {
+  try {
+    await transactionStore.save({ ...transaction });
+  } catch (error) {
+    logger.error(
+      { err: error, transactionId: transaction.id },
+      "[sep24] Failed to persist transaction",
+    );
+  }
+}
+
+// Token limits: max active interactive transactions per account
+const MAX_ACTIVE_TRANSACTIONS_PER_ACCOUNT = 5;
+const activeTransactionsPerAccount = new Map<string, number>();
+
 // ============================================================================
 // Configuration
 // ============================================================================
+
+// Well-known testnet issuers, used as defaults when an env override is not
+// set. A mainnet deployment must override these via env vars.
+const DEFAULT_TESTNET_USDC_ISSUER =
+  "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
+const DEFAULT_TESTNET_EURC_ISSUER =
+  "GC5GIOFB4CTFDMYD37EQE7O5D6HKAYD73BXHYEG27KFONBURSTLPQGLD";
 
 export const getSep24Config = () => ({
   webAuthDomain:
@@ -145,6 +206,36 @@ export const getSep24Config = () => ({
       sep24_enabled: true,
       min_amount: 1,
       max_amount: 1000000,
+    } as Sep24Asset,
+    USDC: {
+      asset_code: "USDC",
+      asset_issuer:
+        process.env.SEP38_USDC_ISSUER ||
+        process.env.STELLAR_ASSET_ISSUER ||
+        DEFAULT_TESTNET_USDC_ISSUER,
+      sep6_enabled: true,
+      deposits_enabled: true,
+      withdrawals_enabled: true,
+      transfer_server:
+        process.env.STELLAR_HORIZON_URL ||
+        "https://horizon-testnet.stellar.org",
+      sep24_enabled: true,
+      min_amount: 1,
+      max_amount: 100000,
+    } as Sep24Asset,
+    EURC: {
+      asset_code: "EURC",
+      asset_issuer:
+        process.env.SEP38_EURC_ISSUER || DEFAULT_TESTNET_EURC_ISSUER,
+      sep6_enabled: true,
+      deposits_enabled: true,
+      withdrawals_enabled: true,
+      transfer_server:
+        process.env.STELLAR_HORIZON_URL ||
+        "https://horizon-testnet.stellar.org",
+      sep24_enabled: true,
+      min_amount: 1,
+      max_amount: 100000,
     } as Sep24Asset,
   } as Record<string, Sep24Asset>,
   features: {
@@ -184,6 +275,14 @@ export const generateInteractiveUrl = async (
   const config = getSep24Config();
   const transactionId = uuidv4();
 
+  // Enforce token limits: reject if account already has too many active transactions
+  const currentCount = activeTransactionsPerAccount.get(request.account) || 0;
+  if (currentCount >= MAX_ACTIVE_TRANSACTIONS_PER_ACCOUNT) {
+    throw new Error(
+      `Too many active interactive transactions for account. Limit is ${MAX_ACTIVE_TRANSACTIONS_PER_ACCOUNT}.`,
+    );
+  }
+
   const transaction: Sep24Transaction = {
     id: transactionId,
     kind,
@@ -192,11 +291,15 @@ export const generateInteractiveUrl = async (
     amount_in: request.amount,
     account: request.account,
     memo: request.memo,
+    memo_type: request.memo
+      ? ("memo_type" in request && request.memo_type) || "text"
+      : undefined,
     callback: request.callback,
     created_at: new Date().toISOString(),
   };
 
   transactions.set(transactionId, transaction);
+  activeTransactionsPerAccount.set(request.account, currentCount + 1);
 
   const params = new URLSearchParams({
     transaction_id: transactionId,
@@ -206,7 +309,11 @@ export const generateInteractiveUrl = async (
     lang: request.lang || "en",
   });
 
+  if ((request as any).token) params.append("token", (request as any).token);
+  if ((request as any).session_token) params.append("session_token", (request as any).session_token);
+
   if (request.memo) params.append("memo", request.memo);
+  if (transaction.memo_type) params.append("memo_type", transaction.memo_type);
   if (request.email) params.append("email", request.email);
   if (request.wallet_name) params.append("wallet_name", request.wallet_name);
   if (request.wallet_url) params.append("wallet_url", request.wallet_url);
@@ -221,15 +328,35 @@ export const generateInteractiveUrl = async (
       ? config.interactiveUrlBase
       : config.interactiveUrlBase.replace("deposit", "withdraw");
 
-  return {
-    url: `${baseUrl}?${params.toString()}`,
-    id: transactionId,
-  };
+  try {
+    // Sign the interactive URL with HMAC-SHA256 for query hash validation
+    const signedUrl = generateSignedSep24Url(
+      baseUrl,
+      Object.fromEntries(params),
+    );
+
+    await persistTransaction(transaction);
+
+    return {
+      url: signedUrl,
+      id: transactionId,
+    };
+  } catch (error) {
+    // Clean up on failure to sign URL
+    transactions.delete(transactionId);
+    decrementActiveTransactionCount(request.account);
+    throw error;
+  }
 };
 
 export const initiateDeposit = async (
-  request: DepositRequest,
+  input: DepositRequest,
 ): Promise<InteractiveFlowResponse> => {
+  const parsed = sep24DepositRequestSchema.safeParse(input);
+  if (!parsed.success) {
+    throw new Error(formatSep24ValidationError(parsed.error));
+  }
+  const request = parsed.data as DepositRequest;
   const config = getSep24Config();
   const asset = config.assets[request.asset_code as keyof typeof config.assets];
 
@@ -288,6 +415,13 @@ export const initiateWithdrawal = async (
 export const getTransaction = (id: string): Sep24Transaction | undefined =>
   transactions.get(id);
 
+function decrementActiveTransactionCount(account: string): void {
+  const current = activeTransactionsPerAccount.get(account) || 0;
+  if (current > 0) {
+    activeTransactionsPerAccount.set(account, current - 1);
+  }
+}
+
 export const updateTransactionStatus = (
   id: string,
   status: Sep24TransactionStatus,
@@ -304,10 +438,21 @@ export const updateTransactionStatus = (
     transaction.completed_at = new Date().toISOString();
 
   transactions.set(id, transaction);
+  void persistTransaction(transaction);
+
+  // Decrement active count when transaction reaches terminal state
+  if (["completed", "failed", "expired"].includes(status)) {
+    decrementActiveTransactionCount(transaction.account);
+  }
 
   if (statusChanged && transaction.callback) {
-    enqueueSepWebhook(transaction.id, status, transaction.callback, transaction).catch((err) =>
-      console.error(`[sep24-webhook] Error enqueuing webhook:`, err)
+    enqueueSepWebhook(
+      transaction.id,
+      status,
+      transaction.callback,
+      transaction,
+    ).catch((err) =>
+      logger.error(`[sep24-webhook] Error enqueuing webhook:`, err),
     );
   }
 
@@ -351,16 +496,104 @@ export const processCallback = async (
 
   if (["completed", "failed", "expired"].includes(status)) {
     transaction.completed_at = new Date().toISOString();
+    decrementActiveTransactionCount(transaction.account);
   }
 
   transactions.set(transaction_id, transaction);
+  void persistTransaction(transaction);
 
   if (statusChanged && transaction.callback) {
-    enqueueSepWebhook(transaction.id, status, transaction.callback, transaction).catch((err) =>
-      console.error(`[sep24-webhook] Error enqueuing webhook:`, err)
+    enqueueSepWebhook(
+      transaction.id,
+      status,
+      transaction.callback,
+      transaction,
+    ).catch((err) =>
+      logger.error(`[sep24-webhook] Error enqueuing webhook:`, err),
     );
   }
 
+  return transaction;
+};
+
+/** Sends the Stellar payment for a deposit (StellarService in production). */
+export interface DepositPaymentSender {
+  sendPayment(
+    destination: string,
+    amount: string,
+    senderName?: string,
+    receiverName?: string,
+    useFeeBump?: boolean,
+    memo?: Memo,
+  ): Promise<{ hash?: string }>;
+}
+
+async function defaultPaymentSender(): Promise<DepositPaymentSender> {
+  const { StellarService } =
+    await import("../services/stellar/stellarService.js");
+  return new StellarService();
+}
+
+/**
+ * Fulfils a SEP-24 deposit by sending the asset to the wallet's account,
+ * attaching the memo the wallet supplied so shared exchange addresses can
+ * credit the right customer. Call once the off-chain (mobile money) leg has
+ * been received.
+ *
+ * On a submission error the transaction stays `pending_stellar` and the
+ * error is rethrown: the payment may still land, so blindly retrying could
+ * pay twice.
+ */
+export const fulfillDeposit = async (
+  id: string,
+  sender?: DepositPaymentSender,
+): Promise<Sep24Transaction> => {
+  const transaction = transactions.get(id);
+  if (!transaction) throw new Error(`Transaction ${id} not found`);
+  if (transaction.kind !== "deposit") {
+    throw new Error(`Transaction ${id} is not a deposit`);
+  }
+  if (transaction.status === "completed") return transaction;
+  if (transaction.status === "pending_stellar") {
+    throw new Error(`Deposit ${id} is already being submitted`);
+  }
+  if (["failed", "expired"].includes(transaction.status)) {
+    throw new Error(`Deposit ${id} is ${transaction.status}`);
+  }
+
+  const amount = transaction.amount_out ?? transaction.amount_in;
+  if (!transaction.account || !amount) {
+    throw new Error(`Deposit ${id} is missing account or amount`);
+  }
+
+  const memo = transaction.memo
+    ? toStellarMemo(transaction.memo, transaction.memo_type ?? "text")
+    : undefined;
+
+  updateTransactionStatus(id, "pending_stellar");
+
+  let result: { hash?: string };
+  try {
+    const payer = sender ?? (await defaultPaymentSender());
+    result = await payer.sendPayment(
+      transaction.account,
+      amount,
+      undefined,
+      undefined,
+      false,
+      memo,
+    );
+  } catch (error) {
+    transaction.message = `Stellar submission failed: ${
+      error instanceof Error ? error.message : String(error)
+    }`;
+    await persistTransaction(transaction);
+    throw error;
+  }
+
+  transaction.stellar_transaction_id = result.hash;
+  updateTransactionStatus(id, "completed");
+  await persistTransaction(transaction);
   return transaction;
 };
 
@@ -436,34 +669,111 @@ sep24Router.get("/fee", async (req: Request, res: Response) => {
   }
 });
 
-sep24Router.post(
-  "/deposit",
-  sep24Limiter,
-  async (req: Request, res: Response) => {
-    try {
-      const result = await initiateDeposit(req.body);
-      res.json(result);
-    } catch (error: any) {
-      throw createError(ERROR_CODES.INVALID_INPUT, error.message, {
+// Express 4 does not route async throws to the error handler, so failures
+// are passed to next() explicitly.
+const depositHandler = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) => {
+  try {
+    const result = await initiateDeposit(req.body);
+    res.json(result);
+  } catch (error: any) {
+    next(
+      createError(ERROR_CODES.INVALID_INPUT, error.message, {
         error: error.message,
-      });
-    }
-  },
-);
+      }),
+    );
+  }
+};
 
-sep24Router.post(
-  "/withdraw",
-  sep24Limiter,
-  async (req: Request, res: Response) => {
-    try {
-      const result = await initiateWithdrawal(req.body);
-      res.json(result);
-    } catch (error: any) {
-      throw createError(ERROR_CODES.INVALID_INPUT, error.message, {
+const withdrawHandler = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) => {
+  try {
+    const result = await initiateWithdrawal(req.body);
+    res.json(result);
+  } catch (error: any) {
+    next(
+      createError(ERROR_CODES.INVALID_INPUT, error.message, {
         error: error.message,
-      });
-    }
-  },
+      }),
+    );
+  }
+};
+
+sep24Router.post("/deposit", sep24Limiter, depositHandler);
+sep24Router.post("/withdraw", sep24Limiter, withdrawHandler);
+
+/**
+ * GET /sep24/interactive/deposit
+ *
+ * Renders the SEP-24 interactive deposit page and, when Orange Money
+ * scan-to-pay parameters are supplied, embeds a base64 QR code image in the
+ * page (#1968).
+ *
+ * Query params: transaction_id, merchant_id, amount, currency, reference,
+ * merchant_name, merchant_city.
+ */
+sep24Router.get("/interactive/deposit", async (req: Request, res: Response) => {
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+
+  const merchantId = req.query.merchant_id
+    ? String(req.query.merchant_id)
+    : undefined;
+  const amount = req.query.amount ? String(req.query.amount) : undefined;
+
+  if (!merchantId || !amount) {
+    return res.send(renderSep24InteractivePage());
+  }
+
+  try {
+    const generator = new OrangeQrCodeGenerator();
+    const qr = await generator.generate({
+      merchantId,
+      amount,
+      currency: req.query.currency ? String(req.query.currency) : undefined,
+      reference: req.query.reference
+        ? String(req.query.reference)
+        : req.query.transaction_id
+          ? String(req.query.transaction_id)
+          : undefined,
+      merchantName: req.query.merchant_name
+        ? String(req.query.merchant_name)
+        : undefined,
+      merchantCity: req.query.merchant_city
+        ? String(req.query.merchant_city)
+        : undefined,
+    });
+
+    return res.send(
+      renderSep24InteractivePage({
+        qrSectionHtml: renderOrangeMoneyQrSection(qr),
+      }),
+    );
+  } catch (error: any) {
+    logger.warn(
+      { error: error.message },
+      "[SEP-24] Failed to render Orange Money QR section",
+    );
+    // Never fail the interactive page because of a provider-specific embed.
+    return res.send(renderSep24InteractivePage());
+  }
+});
+
+// Canonical SEP-24 paths.
+sep24Router.post(
+  "/transactions/deposit/interactive",
+  sep24Limiter,
+  depositHandler,
+);
+sep24Router.post(
+  "/transactions/withdraw/interactive",
+  sep24Limiter,
+  withdrawHandler,
 );
 
 const transactionModel = new TransactionModel();
@@ -535,6 +845,16 @@ sep24Router.get("/transaction", async (req: Request, res: Response) => {
   res.json(response);
 });
 
+sep24Router.get("/interactive/callback", async (req: Request, res: Response, next: NextFunction) => {
+  const { sep24RouteHandler } = await import("../routes/sep24");
+  return sep24RouteHandler(req, res, next);
+});
+
+sep24Router.get("/callback/popup", async (req: Request, res: Response, next: NextFunction) => {
+  const { sep24RouteHandler } = await import("../routes/sep24");
+  return sep24RouteHandler(req, res, next);
+});
+
 sep24Router.put("/transaction/:id", async (req: Request, res: Response) => {
   const { status, message } = req.body;
   const transaction = updateTransactionStatus(req.params.id, status, message);
@@ -545,6 +865,46 @@ sep24Router.put("/transaction/:id", async (req: Request, res: Response) => {
   }
   res.json(transaction);
 });
+
+// GET callback with SEP-24 query hash validation
+sep24Router.get(
+  "/callback/:id",
+  verifySep24Signature,
+  async (req: Request, res: Response) => {
+    try {
+      const { status, message } = req.query;
+      const callbackData: CallbackData = {
+        transaction_id: req.params.id,
+        status: status as Sep24TransactionStatus,
+        message: message as string | undefined,
+      };
+      const transaction = await processCallback(callbackData);
+      if (!transaction) {
+        throw createError(ERROR_CODES.NOT_FOUND, "Not found", {
+          error: "Not found",
+        });
+      }
+
+      const baseUrl = `${req.protocol}://${req.get("host")}`;
+      let redirectUrl = null;
+      if (transaction.status === "completed")
+        redirectUrl = `${baseUrl}/sep24/success?id=${req.params.id}`;
+      if (["failed", "expired"].includes(transaction.status))
+        redirectUrl = `${baseUrl}/sep24/failure?id=${req.params.id}`;
+
+      res.json({
+        success: true,
+        transaction,
+        ...(redirectUrl && { redirect: redirectUrl }),
+      });
+    } catch (_error) {
+      throw createError(
+        ERROR_CODES.INTERNAL_ERROR,
+        "Failed to process callback",
+      );
+    }
+  },
+);
 
 sep24Router.post("/callback/:id", async (req: Request, res: Response) => {
   try {

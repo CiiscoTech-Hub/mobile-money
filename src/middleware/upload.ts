@@ -1,3 +1,4 @@
+import logger from "../utils/logger";
 import multer from "multer";
 import { Request, Response, NextFunction } from "express";
 import crypto from "crypto";
@@ -7,17 +8,19 @@ import sharp from "sharp";
 /**
  * Allowed file types for KYC documents
  */
-const ALLOWED_MIME_TYPES = [
+export const ALLOWED_MIME_TYPES = [
   "application/pdf",
   "image/jpeg",
   "image/jpg",
   "image/png",
 ];
 
+export const ALLOWED_EXTENSIONS = [".pdf", ".jpg", ".jpeg", ".png"];
+
 /**
- * Maximum file size: 5MB
+ * Maximum file size for document uploads: 10MB (#1943)
  */
-const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB in bytes
+export const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB in bytes
 
 /**
  * File filter to validate file types
@@ -55,6 +58,17 @@ export const generateS3Key = (userId: string, filename: string): string => {
   const month = String(date.getMonth() + 1).padStart(2, "0");
 
   return `kyc-documents/${year}/${month}/${userId}/${filename}`;
+};
+
+export const generateComplianceS3Key = (
+  userId: string,
+  filename: string,
+): string => {
+  const date = new Date();
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+
+  return `admin/compliance-reports/${year}/${month}/${userId}/${filename}`;
 };
 
 /**
@@ -128,7 +142,7 @@ export const optimizeProfileImage = async (
 
     next();
   } catch (error) {
-    console.error("Image optimization error:", error);
+    logger.error("Image optimization error:", error);
     res.status(500).json({ error: "Failed to optimize image before upload" });
   }
 };

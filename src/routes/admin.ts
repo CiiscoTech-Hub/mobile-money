@@ -1,5 +1,7 @@
+import logger, { getTelecomAverageMetrics } from "../utils/logger";
+
 import { Router, Request, Response, NextFunction } from "express";
-import * as StellarSdk from "stellar-sdk";
+import * as StellarSdk from "@stellar/stellar-sdk";
 import { generateToken } from "../auth/jwt";
 import {
   updateAdminNotesHandler,
@@ -46,11 +48,17 @@ import {
   ComplianceDocumentUpdateInput,
 } from "../models/complianceDocument";
 import { providerSettingsService } from "../services/providerSettingsService";
+import { systemConfigService } from "../services/systemConfigService";
+import { ProviderConfigCacheInvalidation } from "../services/cacheAside";
 import { resetCircuitBreakerForProvider } from "../utils/circuitBreaker";
 import { ERROR_CODES } from "../constants/errorCodes";
 import { createError } from "../middleware/errorHandler";
+import { AuditLogFilter, AuditLogModel } from "../models/auditLog";
+
+import adminControllerRouter from "../controllers/adminController";
 
 const router = Router();
+router.use("/monitoring", adminControllerRouter);
 const IMPERSONATION_TOKEN_EXPIRES_IN = "15m";
 const IMPERSONATION_TOKEN_TTL_MS = 15 * 60 * 1000;
 const READ_ONLY_IMPERSONATION_MESSAGE = "Read-only mode active";
@@ -122,6 +130,7 @@ const MAX_BULK_IDS = 100;
 const users: User[] = [];
 const transactionModel = new TransactionModel();
 const complianceDocumentModel = new ComplianceDocumentModel();
+const auditLogModel = new AuditLogModel();
 
 const isAdminRole = (role?: string) =>
   role === "admin" || role === "super-admin";
@@ -222,6 +231,283 @@ const paginate = <T>(data: T[], page: number, limit: number) => {
   };
 };
 
+const parseAuditLogQuery = (req: Request) => {
+  const page = Number.parseInt(String(req.query.page ?? "1"), 10);
+  const limit = Number.parseInt(String(req.query.limit ?? "50"), 10);
+
+  if (!Number.isInteger(page) || page < 1) {
+    throw createError(ERROR_CODES.INVALID_INPUT, "page must be a positive integer");
+  }
+  if (!Number.isInteger(limit) || limit < 1 || limit > 200) {
+    throw createError(ERROR_CODES.INVALID_INPUT, "limit must be an integer between 1 and 200");
+  }
+
+  const filter: AuditLogFilter = { limit, offset: (page - 1) * limit };
+  for (const key of ["adminId", "action", "resource", "resourceId"] as const) {
+    const value = req.query[key];
+    if (typeof value === "string" && value.trim()) {
+      filter[key] = value.trim();
+    }
+  }
+
+  return { page, limit, filter };
+};
+
+router.get(
+  "/audit-logs",
+  requireAdmin,
+  logAdminAction("LIST_AUDIT_LOGS"),
+  async (req: Request, res: Response) => {
+    try {
+      const { page, limit, filter } = parseAuditLogQuery(req);
+      const [data, total] = await Promise.all([
+        auditLogModel.list(filter),
+        auditLogModel.count(filter),
+      ]);
+
+      res.json({
+        data,
+        pagination: { total, page, limit, totalPages: Math.ceil(total / limit) },
+      });
+    } catch (error) {
+      if ((error as { statusCode?: number }).statusCode) throw error;
+      logger.error("Error listing audit logs:", error);
+      throw createError(ERROR_CODES.INTERNAL_ERROR, "Failed to list audit logs");
+    }
+  },
+);
+
+router.get(
+  "/audit-logs/view",
+  requireAdmin,
+  logAdminAction("VIEW_AUDIT_LOGS"),
+  (_req: Request, res: Response) => {
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.send(`<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Audit Trail</title><style>
+*{box-sizing:border-box}body{margin:0;padding:24px;font:14px system-ui,sans-serif;background:#f6f7f9;color:#17202a}
+main{max-width:1400px;margin:auto}h1{font-size:24px;margin:0 0 18px}form{display:grid;grid-template-columns:repeat(4,1fr) auto;gap:10px;margin-bottom:18px}
+input,button{font:inherit;padding:9px 10px;border:1px solid #c9d1d9;border-radius:4px;background:white}button{background:#155eef;color:white;border-color:#155eef;cursor:pointer}
+.table-wrap{overflow:auto;background:white;border:1px solid #d8dee4}table{width:100%;border-collapse:collapse;min-width:900px}th,td{text-align:left;vertical-align:top;padding:10px;border-bottom:1px solid #eaeef2}th{background:#eef2f6;font-size:12px;text-transform:uppercase}td{white-space:pre-wrap}td.diff{max-width:360px;word-break:break-word;font-family:ui-monospace,monospace;font-size:12px}#status{margin:12px 0;color:#586069}.pager{display:flex;justify-content:space-between;align-items:center;margin-top:12px}
+@media(max-width:800px){body{padding:14px}form{grid-template-columns:1fr 1fr}.table-wrap{margin:0 -14px;border-left:0;border-right:0}}
+</style></head><body><main><h1>Audit Trail</h1>
+<form id="filters"><input name="adminId" placeholder="Admin ID"><input name="action" placeholder="Action"><input name="resource" placeholder="Resource"><input name="resourceId" placeholder="Resource ID"><button type="submit">Filter</button></form>
+<div id="status">Loading...</div><div class="table-wrap"><table><thead><tr><th>Time</th><th>Admin</th><th>Action</th><th>Resource</th><th>Resource ID</th><th>IP address</th><th>User agent</th><th>Change</th></tr></thead><tbody id="rows"></tbody></table></div>
+<div class="pager"><button id="previous" type="button">Previous</button><span id="page"></span><button id="next" type="button">Next</button></div></main>
+<script>
+const form=document.getElementById('filters'), rows=document.getElementById('rows'), status=document.getElementById('status'), pageLabel=document.getElementById('page');
+let page=1, totalPages=1;
+function cell(row,value, className){const el=document.createElement(row);el.textContent=value ?? '';if(className)el.className=className;return el;}
+async function load(){const params=new URLSearchParams(new FormData(form));params.set('page',page);params.set('limit','50');status.textContent='Loading...';
+try{const response=await fetch('/api/admin/audit-logs?'+params,{credentials:'include'});if(response.status===401||response.status===403){status.innerHTML='Session expired. Please <a href="/api/auth/login" style="color:#155eef;">log in</a> again.';rows.replaceChildren();return;}if(!response.ok)throw new Error('HTTP '+response.status);const result=await response.json();rows.replaceChildren();
+result.data.forEach(log=>{const tr=document.createElement('tr');[new Date(log.createdAt).toLocaleString(),log.adminId,log.action,log.resource,log.resourceId,log.ipAddress,log.userAgent].forEach(value=>tr.appendChild(cell('td',value)));tr.appendChild(cell('td',JSON.stringify(log.diff,null,2),'diff'));rows.appendChild(tr)});
+totalPages=result.pagination.totalPages;pageLabel.textContent='Page '+result.pagination.page+' of '+Math.max(totalPages,1)+' ('+result.pagination.total+' entries)';status.textContent=result.data.length?'':'No audit entries found';document.getElementById('previous').disabled=page<=1;document.getElementById('next').disabled=page>=totalPages;
+}catch(error){status.textContent='Unable to load audit trail';rows.replaceChildren()}}
+form.addEventListener('submit',event=>{event.preventDefault();page=1;load()});document.getElementById('previous').onclick=()=>{if(page>1){page--;load()}};document.getElementById('next').onclick=()=>{if(page<totalPages){page++;load()}};load();
+</script></body></html>`);
+  },
+);
+
+/**
+ * =========================
+ * DYNAMIC SYSTEM CONFIGURATION
+ * =========================
+ */
+
+router.get(
+  "/config",
+  requireAdmin,
+  logAdminAction("LIST_SYSTEM_CONFIG"),
+  async (req: Request, res: Response) => {
+    try {
+      const category = req.query.category as string | undefined;
+      const { systemConfigService } = await import(
+        "../services/systemConfigService.js"
+      );
+      const configs = await systemConfigService.getAll(category);
+
+      res.json({
+        success: true,
+        configs,
+        total: configs.length,
+      });
+    } catch (err) {
+      logger.error("Error listing system config:", err);
+      throw createError(ERROR_CODES.INTERNAL_ERROR, "Failed to list system configuration");
+    }
+  },
+);
+
+router.get(
+  "/config/:key",
+  requireAdmin,
+  logAdminAction("GET_SYSTEM_CONFIG"),
+  async (req: Request, res: Response) => {
+    try {
+      const { systemConfigService } = await import(
+        "../services/systemConfigService.js"
+      );
+      const entry = await systemConfigService.get(req.params.key);
+
+      if (!entry) {
+        throw createError(ERROR_CODES.NOT_FOUND, `Config key '${req.params.key}' not found`);
+      }
+
+      res.json({ success: true, config: entry });
+    } catch (err) {
+      if ((err as any).statusCode) throw err;
+      logger.error("Error fetching system config:", err);
+      throw createError(ERROR_CODES.INTERNAL_ERROR, "Failed to fetch system configuration");
+    }
+  },
+);
+
+router.put(
+  "/config",
+  requireAdmin,
+  logAdminAction("UPSERT_SYSTEM_CONFIG"),
+  async (req: Request, res: Response) => {
+    try {
+      const adminUser = (req as AuthRequest).user;
+      if (!adminUser) {
+        throw createError(ERROR_CODES.UNAUTHORIZED, "Authentication required");
+      }
+
+      const { key, value, category, description, value_type } = req.body;
+
+      if (!key || typeof key !== "string" || key.trim().length === 0) {
+        throw createError(ERROR_CODES.INVALID_INPUT, "key is required and must be a non-empty string");
+      }
+      if (value === undefined || value === null) {
+        throw createError(ERROR_CODES.INVALID_INPUT, "value is required");
+      }
+
+      const validTypes = ["string", "number", "boolean", "json"];
+      if (value_type && !validTypes.includes(value_type)) {
+        throw createError(
+          ERROR_CODES.INVALID_INPUT,
+          `value_type must be one of: ${validTypes.join(", ")}`,
+        );
+      }
+
+      const { systemConfigService } = await import(
+        "../services/systemConfigService.js"
+      );
+      const entry = await systemConfigService.upsert({
+        key: key.trim(),
+        value: String(value),
+        category,
+        description,
+        value_type,
+        updated_by: adminUser.id,
+      });
+
+      res.json({
+        success: true,
+        message: `Config '${key}' updated`,
+        config: entry,
+      });
+    } catch (err) {
+      if ((err as any).statusCode) throw err;
+      logger.error("Error upserting system config:", err);
+      throw createError(ERROR_CODES.INTERNAL_ERROR, "Failed to update system configuration");
+    }
+  },
+);
+
+router.delete(
+  "/config/:key",
+  requireAdmin,
+  logAdminAction("DELETE_SYSTEM_CONFIG"),
+  async (req: Request, res: Response) => {
+    try {
+      const adminUser = (req as AuthRequest).user;
+      if (!adminUser) {
+        throw createError(ERROR_CODES.UNAUTHORIZED, "Authentication required");
+      }
+
+      const { systemConfigService } = await import(
+        "../services/systemConfigService.js"
+      );
+      const deleted = await systemConfigService.delete(req.params.key);
+
+      if (!deleted) {
+        throw createError(ERROR_CODES.NOT_FOUND, `Config key '${req.params.key}' not found`);
+      }
+
+      res.json({
+        success: true,
+        message: `Config '${req.params.key}' deleted`,
+      });
+    } catch (err) {
+      if ((err as any).statusCode) throw err;
+      logger.error("Error deleting system config:", err);
+      throw createError(ERROR_CODES.INTERNAL_ERROR, "Failed to delete system configuration");
+    }
+  },
+);
+
+router.patch(
+  "/config/bulk",
+  requireAdmin,
+  logAdminAction("BULK_UPDATE_SYSTEM_CONFIG"),
+  async (req: Request, res: Response) => {
+    try {
+      const adminUser = (req as AuthRequest).user;
+      if (!adminUser) {
+        throw createError(ERROR_CODES.UNAUTHORIZED, "Authentication required");
+      }
+
+      const { configs } = req.body;
+
+      if (!Array.isArray(configs) || configs.length === 0) {
+        throw createError(
+          ERROR_CODES.INVALID_INPUT,
+          "configs must be a non-empty array of { key, value } objects",
+        );
+      }
+
+      if (configs.length > 50) {
+        throw createError(ERROR_CODES.LIMIT_EXCEEDED, "Maximum 50 configs per bulk update");
+      }
+
+      for (const c of configs) {
+        if (!c.key || typeof c.key !== "string") {
+          throw createError(ERROR_CODES.INVALID_INPUT, "Each config must have a string 'key'");
+        }
+        if (c.value === undefined || c.value === null) {
+          throw createError(ERROR_CODES.INVALID_INPUT, `Config '${c.key}' must have a 'value'`);
+        }
+      }
+
+      const { systemConfigService } = await import(
+        "../services/systemConfigService.js"
+      );
+      const results = await systemConfigService.bulkUpsert(
+        configs.map((c: any) => ({
+          key: c.key.trim(),
+          value: String(c.value),
+          category: c.category,
+          description: c.description,
+          value_type: c.value_type,
+          updated_by: adminUser.id,
+        })),
+      );
+
+      res.json({
+        success: true,
+        message: `Bulk upserted ${results.length} configs`,
+        configs: results,
+      });
+    } catch (err) {
+      if ((err as any).statusCode) throw err;
+      logger.error("Error bulk upserting system config:", err);
+      throw createError(ERROR_CODES.INTERNAL_ERROR, "Failed to bulk update system configuration");
+    }
+  },
+);
+
 /**
  * =========================
  * METRICS
@@ -247,7 +533,7 @@ router.get(
         sla_threshold_hours: 24,
       });
     } catch (err) {
-      console.error("Error fetching transaction resolution metrics:", err);
+      logger.error("Error fetching transaction resolution metrics:", err);
       throw createError(
         ERROR_CODES.INTERNAL_ERROR,
         "Failed to retrieve transaction resolution metrics",
@@ -258,6 +544,34 @@ router.get(
     }
   },
 );
+
+// GET /api/admin/metrics/telecom-latency
+router.get(
+  "/metrics/telecom-latency",
+  requireAdmin,
+  logAdminAction("GET_TELECOM_LATENCY_METRICS"),
+  async (req: Request, res: Response) => {
+    try {
+      const provider = req.query.provider as string | undefined;
+      const metrics = getTelecomAverageMetrics(provider);
+      res.json({
+        success: true,
+        timestamp: new Date().toISOString(),
+        data: metrics,
+      });
+    } catch (err) {
+      logger.error("Error fetching telecom latency metrics:", err);
+      throw createError(
+        ERROR_CODES.INTERNAL_ERROR,
+        "Failed to retrieve telecom latency metrics",
+        {
+          message: err instanceof Error ? err.message : "Unknown error",
+        },
+      );
+    }
+  },
+);
+
 
 // POST /api/admin/users/bulk/freeze
 router.post(
@@ -370,7 +684,7 @@ router.post(
         results,
       });
     } catch (error) {
-      console.error("Error bulk freezing users:", error);
+      logger.error("Error bulk freezing users:", error);
       throw createError(ERROR_CODES.INTERNAL_ERROR, "Internal server error");
     }
   },
@@ -487,7 +801,7 @@ router.post(
         results,
       });
     } catch (error) {
-      console.error("Error bulk unfreezing users:", error);
+      logger.error("Error bulk unfreezing users:", error);
       throw createError(ERROR_CODES.INTERNAL_ERROR, "Internal server error");
     }
   },
@@ -512,7 +826,7 @@ router.get(
         sla_threshold_hours: 24,
       });
     } catch (err) {
-      console.error("Error fetching dispute resolution metrics:", err);
+      logger.error("Error fetching dispute resolution metrics:", err);
       throw createError(
         ERROR_CODES.INTERNAL_ERROR,
         "Failed to retrieve dispute resolution metrics",
@@ -740,7 +1054,7 @@ router.post(
         results,
       });
     } catch (error) {
-      console.error("Error bulk unlocking users:", error);
+      logger.error("Error bulk unlocking users:", error);
       throw createError(ERROR_CODES.INTERNAL_ERROR, "Internal server error");
     }
   },
@@ -870,7 +1184,7 @@ router.post(
         },
       });
     } catch (error) {
-      console.error("Error freezing user account:", error);
+      logger.error("Error freezing user account:", error);
       throw createError(ERROR_CODES.INTERNAL_ERROR, "Internal server error");
     }
   },
@@ -956,7 +1270,7 @@ router.post(
         },
       });
     } catch (error) {
-      console.error("Error unfreezing user account:", error);
+      logger.error("Error unfreezing user account:", error);
       throw createError(ERROR_CODES.INTERNAL_ERROR, "Internal server error");
     }
   },
@@ -988,7 +1302,7 @@ router.get(
         history: auditHistory,
       });
     } catch (error) {
-      console.error("Error fetching user status history:", error);
+      logger.error("Error fetching user status history:", error);
       throw createError(ERROR_CODES.INTERNAL_ERROR, "Internal server error");
     }
   },
@@ -1119,7 +1433,7 @@ router.get(
         },
       });
     } catch (err) {
-      console.error("Error listing transactions for admin:", err);
+      logger.error("Error listing transactions for admin:", err);
       throw createError(
         ERROR_CODES.INTERNAL_ERROR,
         "Failed to list transactions",
@@ -1162,7 +1476,7 @@ router.put(
       const updatedTx = await transactionModel.findById(req.params.id);
       res.json({ message: "Transaction updated", transaction: updatedTx });
     } catch (err) {
-      console.error("Error updating transaction:", err);
+      logger.error("Error updating transaction:", err);
       throw createError(
         ERROR_CODES.INTERNAL_ERROR,
         "Failed to update transaction",
@@ -1268,7 +1582,7 @@ router.patch(
         results,
       });
     } catch (error) {
-      console.error("Error bulk updating transaction admin notes:", error);
+      logger.error("Error bulk updating transaction admin notes:", error);
       throw createError(ERROR_CODES.INTERNAL_ERROR, "Internal server error");
     }
   },
@@ -1359,7 +1673,7 @@ router.patch(
         results,
       });
     } catch (error) {
-      console.error("Error bulk updating transaction status:", error);
+      logger.error("Error bulk updating transaction status:", error);
       throw createError(ERROR_CODES.INTERNAL_ERROR, "Internal server error");
     }
   },
@@ -1469,7 +1783,7 @@ router.post(
         results,
       });
     } catch (error) {
-      console.error("Error bulk refunding transactions:", error);
+      logger.error("Error bulk refunding transactions:", error);
       throw createError(ERROR_CODES.INTERNAL_ERROR, "Internal server error");
     }
   },
@@ -1507,7 +1821,7 @@ router.get(
       const transfers = await getLiquidityTransfers(limit, offset);
       res.json({ transfers });
     } catch (err) {
-      console.error("[liquidity] Failed to list transfers:", err);
+      logger.error("[liquidity] Failed to list transfers:", err);
       throw createError(
         ERROR_CODES.INTERNAL_ERROR,
         "Failed to retrieve liquidity transfers",
@@ -1569,7 +1883,7 @@ router.post(
       res.status(201).json({ message: "Transfer initiated", ...result });
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Transfer failed";
-      console.error("[liquidity] Manual transfer error:", err);
+      logger.error("[liquidity] Manual transfer error:", err);
       throw createError(ERROR_CODES.INTERNAL_ERROR, msg);
     }
   },
@@ -1628,7 +1942,7 @@ router.post(
         result,
       });
     } catch (error: any) {
-      console.error("[CSV RECONCILIATION ERROR]", error);
+      logger.error("[CSV RECONCILIATION ERROR]", error);
 
       if (error.statusCode) {
         throw error;
@@ -1688,7 +2002,7 @@ router.get(
         },
       });
     } catch (error) {
-      console.error("Error fetching reconciliation runs:", error);
+      logger.error("Error fetching reconciliation runs:", error);
       throw createError(
         ERROR_CODES.INTERNAL_ERROR,
         "Failed to fetch reconciliation runs",
@@ -1738,7 +2052,7 @@ router.get(
         },
       });
     } catch (error) {
-      console.error("Error fetching reconciliation alerts:", error);
+      logger.error("Error fetching reconciliation alerts:", error);
       throw createError(
         ERROR_CODES.INTERNAL_ERROR,
         "Failed to fetch reconciliation alerts",
@@ -1797,7 +2111,7 @@ router.patch(
 
       res.json({ message: "Alert reviewed successfully" });
     } catch (error) {
-      console.error("Error reviewing reconciliation alert:", error);
+      logger.error("Error reviewing reconciliation alert:", error);
       throw createError(ERROR_CODES.INTERNAL_ERROR, "Failed to review alert");
     }
   },
@@ -1845,7 +2159,7 @@ router.post(
         result,
       });
     } catch (error) {
-      console.error("Error running manual reconciliation:", error);
+      logger.error("Error running manual reconciliation:", error);
       throw createError(
         ERROR_CODES.INTERNAL_ERROR,
         "Manual reconciliation failed",
@@ -1868,7 +2182,7 @@ router.get(
       const configs = await providerReconciliationService.getProviderConfigs();
       res.json({ data: configs });
     } catch (error) {
-      console.error("Error fetching reconciliation configs:", error);
+      logger.error("Error fetching reconciliation configs:", error);
       throw createError(
         ERROR_CODES.INTERNAL_ERROR,
         "Failed to fetch reconciliation configs",
@@ -1898,7 +2212,7 @@ router.get(
       try {
         providers = mobileMoneyService.getFailoverStats();
       } catch (err) {
-        console.error("Error fetching failover stats:", err);
+        logger.error("Error fetching failover stats:", err);
       }
 
       // Get queue stats
@@ -1910,7 +2224,7 @@ router.get(
           stats: queueStats,
         };
       } catch (err) {
-        console.error("Error fetching queue stats:", err);
+        logger.error("Error fetching queue stats:", err);
       }
 
       // Get Redis status
@@ -1923,7 +2237,7 @@ router.get(
           redis.status = "closed";
         }
       } catch (err) {
-        console.error("Error checking Redis status:", err);
+        logger.error("Error checking Redis status:", err);
         redis.status = "down";
       }
 
@@ -1942,7 +2256,7 @@ router.get(
           replicas: replicaHealth,
         };
       } catch (err) {
-        console.error("Error checking database health:", err);
+        logger.error("Error checking database health:", err);
       }
 
       res.json({
@@ -1954,7 +2268,7 @@ router.get(
         database,
       });
     } catch (err) {
-      console.error("Health check error:", err);
+      logger.error("Health check error:", err);
       throw createError(
         ERROR_CODES.INTERNAL_ERROR,
         "Failed to retrieve health data",
@@ -2012,7 +2326,7 @@ router.get(
 
       res.json({ rows, totals });
     } catch (err) {
-      console.error("[financial/pnl]", err);
+      logger.error("[financial/pnl]", err);
       throw createError(ERROR_CODES.INTERNAL_ERROR, "Failed to fetch PnL data");
     }
   },
@@ -2087,10 +2401,16 @@ router.get(
  <div id="status"></div>
 <script>
 const fmt = (n) => '$' + n.toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2});
+let pollInterval = null;
 
 async function load() {
   try {
     const r = await fetch('/api/admin/financial/pnl', {credentials:'include'});
+    if (r.status === 401 || r.status === 403) {
+      if (pollInterval) clearInterval(pollInterval);
+      document.querySelector('.chart-box').innerHTML = '<div class="error" style="text-align:center;padding:24px;"><h3>Session Expired</h3><p style="margin:12px 0 16px;color:#94a3b8;">Your administrative session has timed out. Please log in again to continue.</p><a href="/api/auth/login" style="display:inline-block;background:#3b82f6;color:white;padding:8px 16px;border-radius:6px;text-decoration:none;font-weight:600;">Log In</a></div>';
+      return;
+    }
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const {rows, totals} = await r.json();
 
@@ -2133,7 +2453,7 @@ function copyRef(ref) {
      toast.classList.add('show');
      setTimeout(() => toast.classList.remove('show'), 2000);
    }).catch(err => {
-     console.error('Failed to copy:', err);
+     logger.error('Failed to copy:', err);
    });
  }
 
@@ -2151,6 +2471,10 @@ function copyRef(ref) {
   
   try {
     const r = await fetch('/api/admin/transactions?reference=' + encodeURIComponent(ref), {credentials:'include'});
+    if (r.status === 401 || r.status === 403) {
+      empty.innerHTML = 'Session expired. Please <a href="/api/auth/login" style="color:#60a5fa;">log in</a> again.';
+      return;
+    }
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const {data} = await r.json();
     
@@ -2193,7 +2517,7 @@ function copyRef(ref) {
 document.getElementById('txSearch').onkeydown = (e) => { if(e.key === 'Enter') searchTx(); };
 
 load();
-setInterval(load, 60000);
+pollInterval = setInterval(load, 60000);
 </script>
 </body>
 </html>`);
@@ -2300,16 +2624,20 @@ const validateComplianceCreate = (
   body: Record<string, unknown>,
 ): ValidationResult<ComplianceDocumentCreateInput> => {
   const title = normalizeString(body.title, "title", true);
-  if (!title.ok) return title as ValidationResult<ComplianceDocumentCreateInput>;
+  if (!title.ok)
+    return title as ValidationResult<ComplianceDocumentCreateInput>;
 
   const docBody = normalizeString(body.body, "body", true);
-  if (!docBody.ok) return docBody as ValidationResult<ComplianceDocumentCreateInput>;
+  if (!docBody.ok)
+    return docBody as ValidationResult<ComplianceDocumentCreateInput>;
 
   const summary = normalizeString(body.summary, "summary", false);
-  if (!summary.ok) return summary as ValidationResult<ComplianceDocumentCreateInput>;
+  if (!summary.ok)
+    return summary as ValidationResult<ComplianceDocumentCreateInput>;
 
   const provider = normalizeString(body.provider, "provider", false);
-  if (!provider.ok) return provider as ValidationResult<ComplianceDocumentCreateInput>;
+  if (!provider.ok)
+    return provider as ValidationResult<ComplianceDocumentCreateInput>;
   if (provider.value && provider.value.length > 100) {
     return { ok: false, message: "provider must be 100 characters or fewer" };
   }
@@ -2319,16 +2647,19 @@ const validateComplianceCreate = (
     "sourceUrl",
     false,
   );
-  if (!sourceUrl.ok) return sourceUrl as ValidationResult<ComplianceDocumentCreateInput>;
+  if (!sourceUrl.ok)
+    return sourceUrl as ValidationResult<ComplianceDocumentCreateInput>;
 
   const country = normalizeCountry(getCountryValue(body));
-  if (!country.ok) return country as ValidationResult<ComplianceDocumentCreateInput>;
+  if (!country.ok)
+    return country as ValidationResult<ComplianceDocumentCreateInput>;
 
   const tags = normalizeTags(body.tags);
   if (!tags.ok) return tags as ValidationResult<ComplianceDocumentCreateInput>;
 
   const status = normalizeStatus(body.status);
-  if (!status.ok) return status as ValidationResult<ComplianceDocumentCreateInput>;
+  if (!status.ok)
+    return status as ValidationResult<ComplianceDocumentCreateInput>;
 
   return {
     ok: true,
@@ -2369,25 +2700,29 @@ const validateComplianceUpdate = (
 
   if (Object.prototype.hasOwnProperty.call(body, "title")) {
     const title = normalizeString(body.title, "title", true);
-    if (!title.ok) return title as ValidationResult<ComplianceDocumentUpdateInput>;
+    if (!title.ok)
+      return title as ValidationResult<ComplianceDocumentUpdateInput>;
     input.title = title.value as string;
   }
 
   if (Object.prototype.hasOwnProperty.call(body, "body")) {
     const docBody = normalizeString(body.body, "body", true);
-    if (!docBody.ok) return docBody as ValidationResult<ComplianceDocumentUpdateInput>;
+    if (!docBody.ok)
+      return docBody as ValidationResult<ComplianceDocumentUpdateInput>;
     input.body = docBody.value as string;
   }
 
   if (Object.prototype.hasOwnProperty.call(body, "summary")) {
     const summary = normalizeString(body.summary, "summary", false);
-    if (!summary.ok) return summary as ValidationResult<ComplianceDocumentUpdateInput>;
+    if (!summary.ok)
+      return summary as ValidationResult<ComplianceDocumentUpdateInput>;
     input.summary = summary.value ?? null;
   }
 
   if (Object.prototype.hasOwnProperty.call(body, "provider")) {
     const provider = normalizeString(body.provider, "provider", false);
-    if (!provider.ok) return provider as ValidationResult<ComplianceDocumentUpdateInput>;
+    if (!provider.ok)
+      return provider as ValidationResult<ComplianceDocumentUpdateInput>;
     if (provider.value && provider.value.length > 100) {
       return { ok: false, message: "provider must be 100 characters or fewer" };
     }
@@ -2403,7 +2738,8 @@ const validateComplianceUpdate = (
       "sourceUrl",
       false,
     );
-    if (!sourceUrl.ok) return sourceUrl as ValidationResult<ComplianceDocumentUpdateInput>;
+    if (!sourceUrl.ok)
+      return sourceUrl as ValidationResult<ComplianceDocumentUpdateInput>;
     input.sourceUrl = sourceUrl.value ?? null;
   }
 
@@ -2413,19 +2749,22 @@ const validateComplianceUpdate = (
     Object.prototype.hasOwnProperty.call(body, "country_code")
   ) {
     const country = normalizeCountry(getCountryValue(body));
-    if (!country.ok) return country as ValidationResult<ComplianceDocumentUpdateInput>;
+    if (!country.ok)
+      return country as ValidationResult<ComplianceDocumentUpdateInput>;
     input.countryCode = country.value ?? null;
   }
 
   if (Object.prototype.hasOwnProperty.call(body, "tags")) {
     const tags = normalizeTags(body.tags);
-    if (!tags.ok) return tags as ValidationResult<ComplianceDocumentUpdateInput>;
+    if (!tags.ok)
+      return tags as ValidationResult<ComplianceDocumentUpdateInput>;
     input.tags = tags.value ?? [];
   }
 
   if (Object.prototype.hasOwnProperty.call(body, "status")) {
     const status = normalizeStatus(body.status);
-    if (!status.ok) return status as ValidationResult<ComplianceDocumentUpdateInput>;
+    if (!status.ok)
+      return status as ValidationResult<ComplianceDocumentUpdateInput>;
     input.status = status.value;
   }
 
@@ -2492,7 +2831,7 @@ function params(){const p = new URLSearchParams();['search','country','provider'
 function setMessage(text, cls){el('message').className = 'message ' + (cls || ''); el('message').textContent = text;}
 async function loadFacets(){const r = await fetch(api + '/facets', {credentials:'include'}); if(!r.ok) return; const f = await r.json(); fill('country', f.countries); fill('provider', f.providers); fill('tag', f.tags);}
 function fill(id, values){const first = el(id).options[0].outerHTML; el(id).innerHTML = first + (values || []).map(v => '<option value="' + esc(v) + '">' + esc(v) + '</option>').join('');}
-async function loadDocs(){const r = await fetch(api + '?' + params().toString(), {credentials:'include'}); const box = el('docs'); if(!r.ok){box.innerHTML='<div class="empty error">Failed to load documents</div>'; return;} const json = await r.json(); if(!json.data.length){box.innerHTML='<div class="empty">No documents found</div>'; return;} box.innerHTML = json.data.map(d => '<div class="doc" onclick="openDoc(\'' + d.id + '\')"><span class="status">' + esc(d.status) + '</span><h3>' + esc(d.title) + '</h3><div class="meta">' + esc(d.countryCode || 'Global') + ' · ' + esc(d.provider || 'Any provider') + '</div><div>' + (d.tags || []).map(t => '<span class="pill">' + esc(t) + '</span>').join('') + '</div></div>').join('');}
+async function loadDocs(){const r = await fetch(api + '?' + params().toString(), {credentials:'include'}); const box = el('docs'); if(r.status===401||r.status===403){box.innerHTML='<div class="empty error">Session expired. Please <a href="/api/auth/login" style="color:#60a5fa;">log in</a> again.</div>'; return;} if(!r.ok){box.innerHTML='<div class="empty error">Failed to load documents</div>'; return;} const json = await r.json(); if(!json.data.length){box.innerHTML='<div class="empty">No documents found</div>'; return;} box.innerHTML = json.data.map(d => '<div class="doc" onclick="openDoc(\'' + d.id + '\')"><span class="status">' + esc(d.status) + '</span><h3>' + esc(d.title) + '</h3><div class="meta">' + esc(d.countryCode || 'Global') + ' · ' + esc(d.provider || 'Any provider') + '</div><div>' + (d.tags || []).map(t => '<span class="pill">' + esc(t) + '</span>').join('') + '</div></div>').join('');}
 async function openDoc(id){const r = await fetch(api + '/' + encodeURIComponent(id), {credentials:'include'}); if(!r.ok){setMessage('Document not found','error'); return;} const d = await r.json(); el('docId').value=d.id; el('title').value=d.title || ''; el('docStatus').value=d.status || 'published'; el('docCountry').value=d.countryCode || ''; el('docProvider').value=d.provider || ''; el('docTags').value=(d.tags || []).join(', '); el('sourceUrl').value=d.sourceUrl || ''; el('summary').value=d.summary || ''; el('body').value=d.body || ''; setMessage('Loaded document','');}
 async function saveDoc(){const id = el('docId').value; const payload = {title:el('title').value, status:el('docStatus').value, country:el('docCountry').value, provider:el('docProvider').value, tags:el('docTags').value, sourceUrl:el('sourceUrl').value, summary:el('summary').value, body:el('body').value}; const r = await fetch(id ? api + '/' + encodeURIComponent(id) : api, {method:id?'PATCH':'POST', headers:{'Content-Type':'application/json'}, credentials:'include', body:JSON.stringify(payload)}); const json = await r.json().catch(()=>({})); if(!r.ok){setMessage(json.message || 'Save failed','error'); return;} setMessage('Saved','success'); el('docId').value=json.id; await loadFacets(); await loadDocs();}
 async function archiveDoc(){const id = el('docId').value; if(!id) return setMessage('Select a document first','error'); const r = await fetch(api + '/' + encodeURIComponent(id), {method:'DELETE', credentials:'include'}); if(!r.ok){setMessage('Archive failed','error'); return;} setMessage('Archived','success'); resetForm(); await loadFacets(); await loadDocs();}
@@ -2548,7 +2887,7 @@ router.get(
         },
       });
     } catch (error) {
-      console.error("[compliance/docs:list]", error);
+      logger.error("[compliance/docs:list]", error);
       if ((error as any).statusCode) {
         throw error;
       }
@@ -2567,7 +2906,7 @@ router.get(
     try {
       res.json(await complianceDocumentModel.getFacets());
     } catch (error) {
-      console.error("[compliance/docs:facets]", error);
+      logger.error("[compliance/docs:facets]", error);
       throw createError(
         ERROR_CODES.INTERNAL_ERROR,
         "Failed to fetch compliance document facets",
@@ -2596,7 +2935,7 @@ router.get(
       }
       res.json(document);
     } catch (error) {
-      console.error("[compliance/docs:get]", error);
+      logger.error("[compliance/docs:get]", error);
       if ((error as any).statusCode) {
         throw error;
       }
@@ -2629,7 +2968,7 @@ router.post(
       );
       res.status(201).json(document);
     } catch (error) {
-      console.error("[compliance/docs:create]", error);
+      logger.error("[compliance/docs:create]", error);
       if ((error as any).statusCode) {
         throw error;
       }
@@ -2672,7 +3011,7 @@ router.patch(
       }
       res.json(document);
     } catch (error) {
-      console.error("[compliance/docs:update]", error);
+      logger.error("[compliance/docs:update]", error);
       if ((error as any).statusCode) {
         throw error;
       }
@@ -2702,7 +3041,7 @@ router.post(
       await stellarService.enableClawback();
       res.json({ message: "Clawback capability enabled on issuance account" });
     } catch (err) {
-      console.error("Error enabling clawback:", err);
+      logger.error("Error enabling clawback:", err);
       throw createError(
         ERROR_CODES.INTERNAL_ERROR,
         "Failed to enable clawback capability",
@@ -2787,7 +3126,7 @@ router.post(
         transactionId,
       });
     } catch (err) {
-      console.error("Error executing clawback:", err);
+      logger.error("Error executing clawback:", err);
       throw createError(
         ERROR_CODES.INTERNAL_ERROR,
         "Failed to execute clawback",
@@ -2902,7 +3241,7 @@ router.post(
         totalTimeMs: batchResult.totalTimeMs,
       });
     } catch (err) {
-      console.error("Error executing batch payment:", err);
+      logger.error("Error executing batch payment:", err);
       throw createError(
         ERROR_CODES.INTERNAL_ERROR,
         "Failed to execute batch payment",
@@ -2937,7 +3276,7 @@ router.delete(
       }
       res.json(document);
     } catch (error) {
-      console.error("[compliance/docs:archive]", error);
+      logger.error("[compliance/docs:archive]", error);
       if ((error as any).statusCode) {
         throw error;
       }
@@ -2962,10 +3301,10 @@ router.get(
       const settings = await providerSettingsService.getAllSettings();
       res.json(settings);
     } catch (error) {
-      console.error("Error fetching provider settings:", error);
+      logger.error("Error fetching provider settings:", error);
       res.status(500).json({ message: "Failed to fetch provider settings" });
     }
-  }
+  },
 );
 
 router.put(
@@ -2976,22 +3315,80 @@ router.put(
     try {
       const providerName = req.params.providerName;
       const { failure_threshold, timeout_ms, fallback_order } = req.body;
-      
+
       const settings = await providerSettingsService.upsertProviderSettings(
         providerName,
         failure_threshold || 3,
         timeout_ms || 5000,
-        fallback_order || null
+        fallback_order || null,
       );
-      
+
+      // 1. Reset the circuit breaker so the new settings take effect immediately.
       resetCircuitBreakerForProvider(providerName);
-      
-      res.json({ message: "Provider settings updated successfully", settings });
+
+      // 2. Invalidate all caches that reference this provider's config across
+      //    every cluster instance (L1 + Redis L2 + Pub/Sub broadcast).
+      await ProviderConfigCacheInvalidation.invalidateOnConfigModification(
+        providerName,
+      );
+
+      res.json({
+        message: "Provider settings updated successfully",
+        settings,
+        invalidatedAt: new Date().toISOString(),
+      });
     } catch (error) {
-      console.error("Error updating provider settings:", error);
+      logger.error("Error updating provider settings:", error);
       res.status(500).json({ message: "Failed to update provider settings" });
     }
-  }
+  },
+);
+
+router.post(
+  "/provider-maintenance",
+  requireAdmin,
+  logAdminAction("CREATE_PROVIDER_MAINTENANCE_OUTAGE"),
+  async (req: Request, res: Response) => {
+    try {
+      const adminUser = (req as AuthRequest).user;
+      const {
+        provider_name,
+        providerName,
+        starts_at,
+        startsAt,
+        ends_at,
+        endsAt,
+        reason,
+        fallback_provider,
+        fallbackProvider,
+        notify_users,
+        notifyUsers,
+      } = req.body;
+
+      const outage = await providerSettingsService.createMaintenanceOutage({
+        providerName: providerName ?? provider_name,
+        startsAt: startsAt ?? starts_at,
+        endsAt: endsAt ?? ends_at,
+        reason: reason ?? null,
+        fallbackProvider: fallbackProvider ?? fallback_provider ?? null,
+        notifyUsers: notifyUsers ?? notify_users ?? true,
+        createdBy: adminUser?.id ?? null,
+      });
+
+      res.status(201).json({
+        message: "Provider maintenance outage scheduled",
+        outage,
+      });
+    } catch (error) {
+      console.error("Error scheduling provider maintenance outage:", error);
+      res.status(400).json({
+        message:
+          error instanceof Error
+            ? error.message
+            : "Failed to schedule provider maintenance outage",
+      });
+    }
+  },
 );
 
 /**
@@ -3022,7 +3419,7 @@ router.get(
         providerHealth,
       ] = await Promise.all([
         getQueueStats().catch((err) => {
-          console.error("[Dashboard] Queue stats error:", err);
+          logger.error("[Dashboard] Queue stats error:", err);
           return {
             pending: 0,
             active: 0,
@@ -3037,14 +3434,14 @@ router.get(
             replicas,
           }))
           .catch((err) => {
-            console.error("[Dashboard] Database health error:", err);
+            logger.error("[Dashboard] Database health error:", err);
             return { status: "unhealthy" as const, replicas: [] };
           }),
         redisClient
           .ping()
           .then(() => ({ status: "healthy" as const, responseTime: 0 }))
           .catch((err) => {
-            console.error("[Dashboard] Redis health error:", err);
+            logger.error("[Dashboard] Redis health error:", err);
             return { status: "unhealthy" as const, responseTime: undefined };
           }),
         (async () => {
@@ -3059,7 +3456,7 @@ router.get(
             activeUsers: await (UserModel as any).countActiveUsers(24),
           };
         })().catch((err) => {
-          console.error("[Dashboard] Transaction stats error:", err);
+          logger.error("[Dashboard] Transaction stats error:", err);
           return {
             totalCount: 0,
             successRate: 0,
@@ -3072,7 +3469,7 @@ router.get(
           try {
             return mobileMoneyService.getFailoverStats();
           } catch (err) {
-            console.error("[Dashboard] Provider health error:", err);
+            logger.error("[Dashboard] Provider health error:", err);
             return {};
           }
         })(),
@@ -3117,8 +3514,11 @@ router.get(
         ),
       });
     } catch (error) {
-      console.error("[Dashboard] Failed to fetch stats:", error);
-      throw createError(ERROR_CODES.INTERNAL_ERROR, "Failed to fetch dashboard stats");
+      logger.error("[Dashboard] Failed to fetch stats:", error);
+      throw createError(
+        ERROR_CODES.INTERNAL_ERROR,
+        "Failed to fetch dashboard stats",
+      );
     }
   },
 );
@@ -3154,7 +3554,7 @@ router.get(
         responseTime,
       });
     } catch (error) {
-      console.error("[Health] Check failed:", error);
+      logger.error("[Health] Check failed:", error);
       res.status(503).json({
         database: "unhealthy",
         redis: "unhealthy",
@@ -3187,8 +3587,66 @@ router.get(
         timestamp: new Date().toISOString(),
       });
     } catch (error) {
-      console.error("[Queue] Stats fetch failed:", error);
-      throw createError(ERROR_CODES.INTERNAL_ERROR, "Failed to fetch queue stats");
+      logger.error("[Queue] Stats fetch failed:", error);
+      throw createError(
+        ERROR_CODES.INTERNAL_ERROR,
+        "Failed to fetch queue stats",
+      );
+    }
+  },
+);
+
+import { reconcilePendingTransactions } from "../services/providers/mtnMomo";
+
+// POST /api/admin/transactions/reconcile
+router.post(
+  "/transactions/reconcile",
+  requireAdmin,
+  logAdminAction("RECONCILE_TRANSACTIONS"),
+  async (req: Request, res: Response) => {
+    try {
+      const dryRun = req.body?.dryRun === true;
+
+      if (dryRun) {
+        // Dry-run: fetch pending list without writing any updates.
+        const { queryRead } = await import("../config/database.js");
+        const result = await queryRead(
+          `SELECT
+             id,
+             reference_number   AS "referenceNumber",
+             provider_reference AS "providerReference",
+             amount::text       AS amount,
+             status,
+             created_at         AS "createdAt"
+           FROM transactions
+           WHERE status = $1
+             AND provider ILIKE 'mtn%'
+           ORDER BY created_at ASC`,
+          [TransactionStatus.Pending],
+        );
+
+        return res.json({
+          total: result.rows.length,
+          updated: 0,
+          results: result.rows.map((r: any) => ({
+            id: r.id,
+            referenceNumber: r.referenceNumber,
+            previousStatus: r.status,
+            newStatus: null,
+            updated: false,
+            providerStatus: "not_queried",
+          })),
+        });
+      }
+
+      const report = await reconcilePendingTransactions();
+      return res.json(report);
+    } catch (err) {
+      logger.error({ err }, "Error running transaction reconciliation");
+      throw createError(
+        ERROR_CODES.INTERNAL_ERROR,
+        "Reconciliation failed",
+      );
     }
   },
 );

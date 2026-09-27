@@ -1,3 +1,4 @@
+import logger from "../utils/logger";
 import sgMail from "@sendgrid/mail";
 import { Transaction } from "../models/transaction";
 import { DailySnapshot } from "../models/snapshot";
@@ -25,6 +26,13 @@ export interface EmailOptions {
   }>;
 }
 
+export interface LowBalanceAlert {
+  provider: string;
+  availableBalance: number;
+  currency: string;
+  threshold: number;
+}
+
 export interface VulnerabilityReport {
   total: number;
   critical: number;
@@ -36,7 +44,9 @@ export interface VulnerabilityReport {
 
 export class EmailService {
   private resolveTemplateId(
-    baseEnvName: "SENDGRID_RECEIPT_TEMPLATE_ID" | "SENDGRID_FAILURE_TEMPLATE_ID",
+    baseEnvName:
+      | "SENDGRID_RECEIPT_TEMPLATE_ID"
+      | "SENDGRID_FAILURE_TEMPLATE_ID",
     locale: string,
   ): string {
     const resolvedLocale = resolveLocale(locale).toUpperCase();
@@ -53,14 +63,15 @@ export class EmailService {
 
     try {
       await sgMail.send({
-        from: process.env.EMAIL_FROM || '"Mobile Money" <no-reply@mobilemoney.com>',
+        from:
+          process.env.EMAIL_FROM || '"Mobile Money" <no-reply@mobilemoney.com>',
         to: options.to,
         templateId: options.templateId,
         dynamicTemplateData: options.dynamicTemplateData,
         attachments: options.attachments,
       });
     } catch (error) {
-      console.error("Email delivery failed:", error);
+      logger.error("Email delivery failed:", error);
       // We don't throw here to prevent blocking the transaction flow
       // but in a real app, we might want to retry or log to a dedicated service
     }
@@ -73,7 +84,12 @@ export class EmailService {
     merchantDisplayName?: string | null,
   ): Promise<void> {
     const resolvedLocale = resolveLocale(locale);
-    const transactionHash = transaction.transactionHash;
+    // The Stellar hash lives inside transaction metadata
+    // (see worker.ts metadata.stellar.transactionHash).
+    const stellarMetadata = transaction.metadata?.stellar as
+      | { transactionHash?: string }
+      | undefined;
+    const transactionHash = stellarMetadata?.transactionHash;
     await this.sendEmail({
       to: email,
       templateId: this.resolveTemplateId(
@@ -96,7 +112,9 @@ export class EmailService {
           ? `https://stellar.expert/explorer/public/tx/${transactionHash}`
           : undefined,
         merchantDisplayName: merchantDisplayName ?? undefined,
-        createdAt: new Date(transaction.createdAt).toLocaleString(resolvedLocale),
+        createdAt: new Date(transaction.createdAt).toLocaleString(
+          resolvedLocale,
+        ),
         locale: resolvedLocale,
         year: new Date().getFullYear(),
       },
@@ -168,7 +186,85 @@ export class EmailService {
         });
       }
     } catch (error) {
-      console.error("[Email] Lockout notification delivery failed:", error);
+      logger.error("[Email] Lockout notification delivery failed:", error);
+    }
+  }
+
+  async sendAdminBalanceAlert(
+    email: string,
+    alerts: LowBalanceAlert[],
+  ): Promise<void> {
+    if (process.env.NODE_ENV === "test") {
+      console.log("Skipping balance alert email in test environment");
+      return;
+    }
+
+    const templateId = process.env.SENDGRID_BALANCE_ALERT_TEMPLATE_ID;
+    const from =
+      process.env.EMAIL_FROM || '"Mobile Money" <no-reply@mobilemoney.com>';
+    const generatedAt = new Date().toLocaleString();
+
+    try {
+      if (templateId) {
+        await sgMail.send({
+          from,
+          to: email,
+          templateId,
+          dynamicTemplateData: {
+            alerts,
+            generatedAt,
+            year: new Date().getFullYear(),
+          },
+        });
+      } else {
+        // Inline HTML fallback — no template required in SendGrid.
+        const rows = alerts
+          .map(
+            (alert) =>
+              `<tr>
+                <td style="padding:6px 8px;border-bottom:1px solid #eee;">${alert.provider.toUpperCase()}</td>
+                <td style="padding:6px 8px;border-bottom:1px solid #eee;text-align:right;">${alert.availableBalance.toFixed(2)} ${alert.currency}</td>
+                <td style="padding:6px 8px;border-bottom:1px solid #eee;text-align:right;">${alert.threshold.toFixed(2)} ${alert.currency}</td>
+              </tr>`,
+          )
+          .join("");
+
+        await sgMail.send({
+          from,
+          to: email,
+          subject: `Low settlement balance alert: ${alerts.map((alert) => alert.provider.toUpperCase()).join(", ")}`,
+          html: `
+            <div style="font-family:sans-serif;max-width:560px;margin:0 auto">
+              <h2 style="color:#c0392b">Low Settlement Balance Alert</h2>
+              <p>The following provider settlement account(s) have dropped below their configured minimum threshold:</p>
+              <table style="width:100%;border-collapse:collapse;">
+                <tr style="text-align:left;">
+                  <th style="padding:6px 8px;border-bottom:2px solid #c0392b;">Provider</th>
+                  <th style="padding:6px 8px;border-bottom:2px solid #c0392b;text-align:right;">Balance</th>
+                  <th style="padding:6px 8px;border-bottom:2px solid #c0392b;text-align:right;">Threshold</th>
+                </tr>
+                ${rows}
+              </table>
+              <p style="color:#666;font-size:13px;">Generated at: ${generatedAt}</p>
+              <hr style="border:none;border-top:1px solid #eee;margin:24px 0">
+              <p style="color:#999;font-size:12px">
+                &copy; ${new Date().getFullYear()} Mobile Money. This is an automated treasury notification.
+              </p>
+            </div>
+          `,
+          text:
+            `Low Settlement Balance Alert\n\n` +
+            alerts
+              .map(
+                (alert) =>
+                  `${alert.provider.toUpperCase()}: ${alert.availableBalance.toFixed(2)} ${alert.currency} (threshold: ${alert.threshold.toFixed(2)} ${alert.currency})`,
+              )
+              .join("\n") +
+            `\n\nGenerated at: ${generatedAt}`,
+        });
+      }
+    } catch (error) {
+      logger.error("[Email] Balance alert delivery failed:", error);
     }
   }
 
@@ -203,7 +299,12 @@ export class EmailService {
     });
   }
 
-  async sendSubscriptionPaused(email: string, subscriptionId: string, attempts: number, locale = "en") {
+  async sendSubscriptionPaused(
+    email: string,
+    subscriptionId: string,
+    attempts: number,
+    locale = "en",
+  ) {
     if (process.env.NODE_ENV === "test") {
       console.log("Skipping subscription paused email in test environment");
       return;
@@ -233,7 +334,11 @@ export class EmailService {
     }
   }
 
-  async sendSubscriptionResumed(email: string, subscriptionId: string, locale = "en") {
+  async sendSubscriptionResumed(
+    email: string,
+    subscriptionId: string,
+    locale = "en",
+  ) {
     if (process.env.NODE_ENV === "test") {
       console.log("Skipping subscription resumed email in test environment");
       return;
@@ -250,7 +355,12 @@ export class EmailService {
     });
   }
 
-  async sendSubscriptionFailure(email: string, subscriptionId: string, reason: string, locale = "en") {
+  async sendSubscriptionFailure(
+    email: string,
+    subscriptionId: string,
+    reason: string,
+    locale = "en",
+  ) {
     if (process.env.NODE_ENV === "test") {
       console.log("Skipping subscription failure email in test environment");
       return;
@@ -274,7 +384,8 @@ export class EmailService {
     growth: GrowthMetrics,
   ): Promise<void> {
     const templateId = process.env.SENDGRID_MANAGEMENT_SUMMARY_TEMPLATE_ID;
-    const from = process.env.EMAIL_FROM || '"Mobile Money" <no-reply@mobilemoney.com>';
+    const from =
+      process.env.EMAIL_FROM || '"Mobile Money" <no-reply@mobilemoney.com>';
 
     if (templateId) {
       await this.sendEmail({
@@ -336,7 +447,8 @@ export class EmailService {
     report: VulnerabilityReport,
   ): Promise<void> {
     const templateId = process.env.SENDGRID_VULNERABILITY_REPORT_TEMPLATE_ID;
-    const from = process.env.EMAIL_FROM || '"Mobile Money" <no-reply@mobilemoney.com>';
+    const from =
+      process.env.EMAIL_FROM || '"Mobile Money" <no-reply@mobilemoney.com>';
 
     if (templateId) {
       await this.sendEmail({

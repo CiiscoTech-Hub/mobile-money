@@ -1,3 +1,4 @@
+import logger from "../utils/logger";
 import { Router, Request, Response } from "express";
 import {
   cancelTransactionHandler,
@@ -16,19 +17,18 @@ import {
 } from "../controllers/transactionController";
 import { validateTransaction } from "../middleware/validateTransaction";
 import { normalizeProvider } from "../middleware/normalizeProvider";
-import { validateNetworkMiddleware } from "../middleware/validateNetworkMiddleware";
 import { TimeoutPresets, haltOnTimedout } from "../middleware/timeout";
 import { authenticateToken } from "../middleware/auth";
 import { cancelTransactionRateLimiter } from "../middleware/rateLimit";
-import { checkAccountStatusStrict } from "../middleware/checkAccountStatus";
-import { geolocateMiddleware } from "../middleware/geolocate";
-import { geoFencingMiddleware } from "../middleware/geoFencing";
+import { validate2FAForWithdrawal } from "../services/twoFactorWithdrawalService";
 import { TransactionModel, TransactionStatus } from "../models/transaction";
 import { generateTransactionPdfBuffer } from "../services/pdfReceipt";
 import { generateShareToken, verifyShareToken } from "../utils/share";
 import { createExportRoutes } from "./export";
 import { ERROR_CODES } from "../constants/errorCodes";
 import { createError } from "../middleware/errorHandler";
+import { complianceMiddlewares } from "../middleware/compliance";
+import { strictIdempotency } from "../middleware/idempotency";
 
 export const transactionRoutes = Router();
 transactionRoutes.use(createExportRoutes());
@@ -52,6 +52,12 @@ transactionRoutes.get(
           error: "Transaction not found",
         });
 
+      if (transaction.userId !== req.jwtUser?.userId) {
+        throw createError(ERROR_CODES.FORBIDDEN, "Access denied", {
+          error: "You do not have permission to access this transaction",
+        });
+      }
+
       const pdf = await generateTransactionPdfBuffer(transaction);
 
       res.setHeader("Content-Type", "application/pdf");
@@ -67,7 +73,7 @@ transactionRoutes.get(
 
       res.status(200).send(pdf);
     } catch (err) {
-      console.error("Failed to generate receipt PDF:", err);
+      logger.error("Failed to generate receipt PDF:", err);
       throw createError(
         ERROR_CODES.INTERNAL_ERROR,
         "Failed to generate receipt PDF",
@@ -93,9 +99,14 @@ transactionRoutes.get(
       if (!transaction)
         return res.status(404).json({ error: "Transaction not found" });
 
+      if (transaction.userId !== req.jwtUser?.userId) {
+        return res.status(403).json({ error: "You do not have permission to access this transaction" });
+      }
+
       if (transaction.status !== TransactionStatus.Completed)
         return res.status(400).json({
-          error: "Invoice download is available only for completed transactions",
+          error:
+            "Invoice download is available only for completed transactions",
         });
 
       const pdf = await generateTransactionPdfBuffer(transaction, {
@@ -115,7 +126,7 @@ transactionRoutes.get(
 
       res.status(200).send(pdf);
     } catch (err) {
-      console.error("Failed to generate invoice PDF:", err);
+      logger.error("Failed to generate invoice PDF:", err);
       res.status(500).json({ error: "Failed to generate invoice PDF" });
     }
   },
@@ -146,7 +157,7 @@ transactionRoutes.post(
         expiresAt: Math.floor(Date.now() / 1000) + Number(expiresIn),
       });
     } catch (err) {
-      console.error("Failed to create shareable receipt URL:", err);
+      logger.error("Failed to create shareable receipt URL:", err);
       throw createError(
         ERROR_CODES.INTERNAL_ERROR,
         "Failed to create shareable receipt URL",
@@ -182,7 +193,7 @@ transactionRoutes.get(
       );
       res.status(200).send(pdf);
     } catch (err) {
-      console.error("Invalid or expired share token:", err);
+      logger.error("Invalid or expired share token:", err);
       throw createError(
         ERROR_CODES.TOKEN_EXPIRED,
         "Invalid or expired share token",
@@ -227,28 +238,25 @@ transactionRoutes.patch(
 transactionRoutes.post(
   "/deposit",
   authenticateToken,
-  checkAccountStatusStrict,
-  geoFencingMiddleware,
+  strictIdempotency,
   TimeoutPresets.long,
   haltOnTimedout,
   normalizeProvider,
   validateTransaction,
-  validateNetworkMiddleware,
-  geolocateMiddleware,
+  ...complianceMiddlewares,
   depositHandler,
 );
 
 transactionRoutes.post(
   "/withdraw",
   authenticateToken,
-  checkAccountStatusStrict,
-  geoFencingMiddleware,
+  strictIdempotency,
   TimeoutPresets.long,
   haltOnTimedout,
   normalizeProvider,
   validateTransaction,
-  validateNetworkMiddleware,
-  geolocateMiddleware,
+  ...complianceMiddlewares,
+  validate2FAForWithdrawal,
   withdrawHandler,
 );
 

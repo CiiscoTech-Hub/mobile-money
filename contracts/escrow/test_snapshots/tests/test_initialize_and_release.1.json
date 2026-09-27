@@ -83,6 +83,12 @@
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                },
+                {
+                  "vec": []
+                },
+                {
+                  "u32": 0
                 }
               ]
             }
@@ -223,10 +229,18 @@
                   "storage": [
                     {
                       "key": {
-                        "string": "ESCROW"
+                        "symbol": "ESCROW"
                       },
                       "val": {
                         "map": [
+                          {
+                            "key": {
+                              "symbol": "admin_signers"
+                            },
+                            "val": {
+                              "vec": []
+                            }
+                          },
                           {
                             "key": {
                               "symbol": "amount"
@@ -297,6 +311,14 @@
                             },
                             "val": {
                               "bool": false
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "required_admin_signatures"
+                            },
+                            "val": {
+                              "u32": 0
                             }
                           },
                           {

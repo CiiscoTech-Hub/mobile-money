@@ -1,3 +1,4 @@
+import logger from "../utils/logger";
 import { Request, Response } from "express";
 import { GDPRService } from "../services/gdprService";
 import { logAuditEvent } from "../utils/log-audit-event";
@@ -27,7 +28,7 @@ const privacyController = {
       res.setHeader("Content-Length", zipBuffer.length);
       res.send(zipBuffer);
     } catch (err) {
-      console.error("Export error: ", err);
+      logger.error("Export error: ", err);
       throw createError(ERROR_CODES.INTERNAL_ERROR, "Failed to export data.");
     }
   },
@@ -39,10 +40,14 @@ const privacyController = {
       const { confirmed } = req.body;
 
       if (!confirmed) {
-        throw createError(ERROR_CODES.INVALID_INPUT, "Erasure must be confirmed", {
-          error: "Erasure must be confirmed",
-          message: "Send { confirmed: true } to proceed with data erasure",
-        });
+        throw createError(
+          ERROR_CODES.INVALID_INPUT,
+          "Erasure must be confirmed",
+          {
+            error: "Erasure must be confirmed",
+            message: "Send { confirmed: true } to proceed with data erasure",
+          },
+        );
       }
 
       // Log the request
@@ -60,8 +65,11 @@ const privacyController = {
         },
       });
     } catch (err) {
-      console.error("Right to be forgotten error:", err);
-      throw createError(ERROR_CODES.INTERNAL_ERROR, "Failed to process erasure request");
+      logger.error("Right to be forgotten error:", err);
+      throw createError(
+        ERROR_CODES.INTERNAL_ERROR,
+        "Failed to process erasure request",
+      );
     }
   },
 };

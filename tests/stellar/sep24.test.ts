@@ -1,6 +1,6 @@
 import request from "supertest";
 import express from "express";
-import { Keypair } from "stellar-sdk";
+import { Keypair } from "@stellar/stellar-sdk";
 
 // Mock rate limiter to bypass user authentication check in tests
 jest.mock("../../src/middleware/rateLimit", () => ({

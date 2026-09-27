@@ -1,7 +1,7 @@
 import express, { Request, Response, NextFunction } from "express";
 import webhookRoutes from "./routes/webhook";
 import { config } from "./config/env";
-import logger from "./logger";
+import logger, { requestContext } from "./logger";
 
 const app = express();
 
@@ -22,9 +22,8 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 
   res.on("finish", () => {
     const durationMs = Date.now() - startMs;
-    const level = res.statusCode >= 500 ? "error"
-                : res.statusCode >= 400 ? "warn"
-                : "info";
+    const level =
+      res.statusCode >= 500 ? "error" : res.statusCode >= 400 ? "warn" : "info";
 
     logger[level](
       {
@@ -38,7 +37,12 @@ app.use((req: Request, res: Response, next: NextFunction) => {
     );
   });
 
-  next();
+  const traceId = req.headers["x-request-id"] as string | undefined;
+  if (traceId) {
+    requestContext.run({ trace_id: traceId }, () => next());
+  } else {
+    next();
+  }
 });
 
 app.get("/", (_req: Request, res: Response) => {

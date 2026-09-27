@@ -1,44 +1,104 @@
-# Dependencies
+# =============================================================================
+# .dockerignore — keep the Docker build context lean.
+# Only the files required by the builder stage need to reach the daemon:
+#   package*.json, tsconfig.json, src/, public/
+# Everything else listed here is excluded.
+# =============================================================================
+
+# ── Node / build artefacts ────────────────────────────────────────────────────
 node_modules
-npm-debug.log
-
-# Build output
 dist
-
-# Test files
 coverage
-*.test.ts
-*.test.js
-__tests__
-**/tests/
+.nyc_output
 
-# Development files
+# ── Environment / secrets ────────────────────────────────────────────────────
 .env
 .env.*
 !.env.example
-*.md
-*.log
 
-# IDE and editor files
-.vscode
-.idea
-*.swp
-*.swo
-*~
-
-# Docker files (not needed inside container)
+# ── Docker files (not needed inside the build context) ───────────────────────
 Dockerfile
 Dockerfile.*
 docker-compose*.yml
 .dockerignore
 
-# Git
+# ── Version control ───────────────────────────────────────────────────────────
 .git
 .gitignore
+.gitattributes
 
-# Documentation
+# ── Editor / IDE ──────────────────────────────────────────────────────────────
+.vscode
+.idea
+.vs
+*.swp
+*.swo
+*~
+
+# ── Documentation ─────────────────────────────────────────────────────────────
 docs/
+docs-portal/
 *.md
+CONTRIBUTING.md
+TROUBLESHOOTING.md
+LICENSE
+CHANGELOG*
 
-# Scripts not needed in production
+# ── Top-level operational scripts (dev/ops tooling, not runtime) ─────────────
 scripts/
+
+# ── Test infrastructure ───────────────────────────────────────────────────────
+tests/
+__mocks__
+pacts/
+playwright-report/
+playwright.config.ts
+jest.config.js
+jest.pact.config.js
+jest.stryker.config.js
+stryker.conf.json
+*.test.ts
+*.test.js
+*.spec.ts
+*.spec.js
+
+# ── CI/CD ────────────────────────────────────────────────────────────────────
+.github/
+
+# ── Infrastructure / deployment (not needed to build the app image) ──────────
+k8s/
+terraform/
+elk/
+logging/
+benchmarks/
+
+# ── Other sub-projects / SDKs (have their own build processes) ───────────────
+ingest-go/
+ingest-node/
+bridge-starter-node/
+sdk/
+cli/
+workers/
+extensions/
+contracts/
+examples/
+postman/
+
+# ── Miscellaneous project files ───────────────────────────────────────────────
+.husky/
+.pre-commit-config.yaml
+.prettierrc
+.prettierignore
+.markdownlint.json
+.vscode/
+.kilo/
+.pull_request/
+commitlint.config.js
+sonar-project.properties
+wrangler.toml
+openapitools.json
+sdk-config*.yaml
+redis.conf
+stellar.toml
+momo-cli
+docker-entrypoint.sh

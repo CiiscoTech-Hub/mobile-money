@@ -1,5 +1,7 @@
+import logger from "../utils/logger";
 import { AirtelService } from "../services/mobilemoney/providers/airtel";
 import { MTNProvider } from "../services/mobilemoney/providers/mtn";
+import { sendAdminBalanceAlert } from "../services/notifications";
 
 type ProviderName = "mtn" | "airtel";
 
@@ -71,7 +73,7 @@ async function fetchProviderBalance(
   const result = await fetchBalance();
 
   if (!result.success || !result.data) {
-    console.error(
+    logger.error(
       `[balances] Failed to fetch ${provider.toUpperCase()} balance: ${toErrorMessage(result.error)}`,
     );
     return null;
@@ -130,29 +132,30 @@ export async function runProviderBalanceAlertJob(): Promise<void> {
     return;
   }
 
+  await sendAdminBalanceAlert(lowBalances);
+
   const webhookUrls = resolveAlertWebhookUrls();
 
   if (webhookUrls.length === 0) {
     console.warn(
       "[balances] Low provider balances detected but no alert webhook URL is configured",
     );
-    return;
-  }
+  } else {
+    const payload: AlertPayload = {
+      alertType: "provider_balance_low",
+      severity: "warning",
+      generatedAt: new Date().toISOString(),
+      providers: lowBalances,
+    };
 
-  const payload: AlertPayload = {
-    alertType: "provider_balance_low",
-    severity: "warning",
-    generatedAt: new Date().toISOString(),
-    providers: lowBalances,
-  };
-
-  for (const webhookUrl of webhookUrls) {
-    try {
-      await postAlert(webhookUrl, payload);
-    } catch (error) {
-      console.error(
-        `[balances] Failed to send balance alert to ${webhookUrl}: ${toErrorMessage(error)}`,
-      );
+    for (const webhookUrl of webhookUrls) {
+      try {
+        await postAlert(webhookUrl, payload);
+      } catch (error) {
+        logger.error(
+          `[balances] Failed to send balance alert to ${webhookUrl}: ${toErrorMessage(error)}`,
+        );
+      }
     }
   }
 

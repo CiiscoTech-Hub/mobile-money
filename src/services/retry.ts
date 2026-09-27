@@ -3,6 +3,8 @@
  * Permanent errors (validation, insufficient funds, etc.) are not retried.
  */
 
+import { isRetryableDatabaseError } from "../config/databaseErrors";
+
 const TRANSIENT_HINTS =
   /econnreset|etimedout|econnrefused|enotfound|network|socket|timeout|temporar|unavailable|429|502|503|504|fetch failed|aborted/i;
 
@@ -11,16 +13,32 @@ const PERMANENT_HINTS =
 
 export function isTransientError(error: unknown, provider?: string): boolean {
   let innerError = error;
-  if (error && typeof error === "object" && "originalError" in error && (error as any).originalError) {
+  if (
+    error &&
+    typeof error === "object" &&
+    "originalError" in error &&
+    (error as any).originalError
+  ) {
     innerError = (error as any).originalError;
   }
 
-  if (provider && innerError && typeof innerError === "object" && "response" in innerError) {
+  if (
+    provider &&
+    innerError &&
+    typeof innerError === "object" &&
+    "response" in innerError
+  ) {
     const status = (innerError as any).response?.status;
     if (status) {
       const p = provider.toLowerCase();
       if (p === "mtn") {
-        if (status === 400 || status === 401 || status === 404 || status === 409) return false;
+        if (
+          status === 400 ||
+          status === 401 ||
+          status === 404 ||
+          status === 409
+        )
+          return false;
       } else if (p === "airtel" || p === "orange") {
         if (status === 400 || status === 401) return false;
       }
@@ -34,6 +52,7 @@ export function isTransientError(error: unknown, provider?: string): boolean {
       : String(error);
 
   if (PERMANENT_HINTS.test(msg)) return false;
+  if (isRetryableDatabaseError(error)) return true;
   return TRANSIENT_HINTS.test(msg);
 }
 

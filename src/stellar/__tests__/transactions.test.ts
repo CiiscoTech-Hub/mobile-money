@@ -1,4 +1,4 @@
-import * as StellarSdk from "stellar-sdk";
+import * as StellarSdk from "@stellar/stellar-sdk";
 import {
   buildTransactionWithFeeBump,
   calculateMaxFee,
@@ -13,10 +13,7 @@ jest.mock("../../config/stellar", () => ({
   getFeeBumpConfig: jest.fn(),
 }));
 
-import {
-  getFeeBumpConfig,
-  getStellarServer,
-} from "../../config/stellar";
+import { getFeeBumpConfig, getStellarServer } from "../../config/stellar";
 
 const mockGetStellarServer = getStellarServer as jest.Mock;
 const mockGetFeeBumpConfig = getFeeBumpConfig as jest.Mock;
@@ -32,6 +29,10 @@ function makeAccount(accountId: string, sequence = "123") {
 function makeServer(overrides: Record<string, unknown> = {}) {
   return {
     fetchBaseFee: jest.fn().mockResolvedValue(100),
+    feeStats: jest.fn().mockResolvedValue({
+      last_ledger_base_fee: "100",
+      fee_charged: { p90: "100" },
+    }),
     fetchTimebounds: jest.fn().mockResolvedValue({
       minTime: "0",
       maxTime: "1700000000",
@@ -96,7 +97,9 @@ describe("stellar fee bump transactions", () => {
     expect(parsed.innerTransaction.signatures).toHaveLength(0);
     expect(parsed.signatures).toHaveLength(1);
     expect(server.loadAccount).toHaveBeenCalledWith(sourceKeypair.publicKey());
-    expect(server.loadAccount).toHaveBeenCalledWith(feePayerKeypair.publicKey());
+    expect(server.loadAccount).toHaveBeenCalledWith(
+      feePayerKeypair.publicKey(),
+    );
     expect(getFeePayerSequence()).toBe(999);
   });
 
@@ -122,7 +125,10 @@ describe("stellar fee bump transactions", () => {
 
   it("enforces the configured fee cap for fee-bumped transactions", async () => {
     const server = makeServer({
-      fetchBaseFee: jest.fn().mockResolvedValue(300),
+      feeStats: jest.fn().mockResolvedValue({
+        last_ledger_base_fee: "300",
+        fee_charged: { p90: "300" },
+      }),
     });
     mockGetStellarServer.mockReturnValue(server);
     mockGetFeeBumpConfig.mockReturnValue({
@@ -162,27 +168,33 @@ describe("stellar fee bump transactions", () => {
     expect(server.submitTransaction).toHaveBeenCalledTimes(1);
     const submittedTx = server.submitTransaction.mock.calls[0][0];
     expect(submittedTx).toBeInstanceOf(StellarSdk.FeeBumpTransaction);
-    expect(server.loadAccount).toHaveBeenCalledWith(feePayerKeypair.publicKey());
+    expect(server.loadAccount).toHaveBeenCalledWith(
+      feePayerKeypair.publicKey(),
+    );
   });
 
   it("rejects submission when the envelope fee exceeds the configured maximum", async () => {
     const server = makeServer();
     mockGetStellarServer.mockReturnValue(server);
 
-    const overLimitEnvelope = StellarSdk.TransactionBuilder.buildFeeBumpTransaction(
-      feePayerKeypair,
-      "10000",
-      new StellarSdk.TransactionBuilder(makeAccount(sourceKeypair.publicKey(), "123"), {
-        fee: "100",
-        networkPassphrase: StellarSdk.Networks.TESTNET,
-      })
-        .addOperation(makePaymentOperation())
-        .setTimeout(30)
-        .build(),
-      StellarSdk.Networks.TESTNET,
-    )
-      .toEnvelope()
-      .toXDR("base64");
+    const overLimitEnvelope =
+      StellarSdk.TransactionBuilder.buildFeeBumpTransaction(
+        feePayerKeypair,
+        "10000",
+        new StellarSdk.TransactionBuilder(
+          makeAccount(sourceKeypair.publicKey(), "123"),
+          {
+            fee: "100",
+            networkPassphrase: StellarSdk.Networks.TESTNET,
+          },
+        )
+          .addOperation(makePaymentOperation())
+          .setTimeout(30)
+          .build(),
+        StellarSdk.Networks.TESTNET,
+      )
+        .toEnvelope()
+        .toXDR("base64");
 
     const result = await submitTransaction(overLimitEnvelope);
 

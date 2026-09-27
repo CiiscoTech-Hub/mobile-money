@@ -1,0 +1,17 @@
+-- Rollback: 20260530_create_accounting_chart_of_accounts_reconciliation_tables
+-- Drops reconciliation tables and custom types
+
+DROP TRIGGER IF EXISTS accounting_chart_of_accounts_reconciliation_discrepancies_updated_at ON accounting_chart_of_accounts_reconciliation_discrepancies;
+DROP TRIGGER IF EXISTS accounting_chart_of_accounts_reconciliation_reports_updated_at ON accounting_chart_of_accounts_reconciliation_reports;
+DROP FUNCTION IF EXISTS update_accounting_chart_of_accounts_reconciliation_discrepancies_updated_at();
+DROP FUNCTION IF EXISTS update_accounting_chart_of_accounts_reconciliation_reports_updated_at();
+DROP INDEX IF EXISTS idx_acc_recon_discrepancies_review_status;
+DROP INDEX IF EXISTS idx_acc_recon_discrepancies_type;
+DROP INDEX IF EXISTS idx_acc_recon_discrepancies_report_id;
+DROP INDEX IF EXISTS idx_acc_recon_reports_connection_date;
+DROP INDEX IF EXISTS idx_acc_recon_reports_provider_date;
+DROP TABLE IF EXISTS accounting_chart_of_accounts_reconciliation_discrepancies;
+DROP TABLE IF EXISTS accounting_chart_of_accounts_reconciliation_reports;
+DROP TYPE IF EXISTS accounting_review_status;
+DROP TYPE IF EXISTS accounting_discrepancy_type;
+DROP TYPE IF EXISTS accounting_reconciliation_status;

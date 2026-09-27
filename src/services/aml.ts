@@ -1,14 +1,30 @@
+import logger from "../utils/logger";
 import * as crypto from "crypto";
 import { pool } from "../config/database";
+import {
+  CachedAmlProfileSnapshot,
+  getCachedAmlProfileSnapshot,
+} from "./cachedTransactionService";
+import { getDistanceKm } from "./fraud";
+import { sanctionService } from "./sanctionService";
+import { currencyService, type SupportedCurrency } from "./currency";
 
 export type AMLTransactionType = "deposit" | "withdraw";
 export type AMLAlertStatus = "pending_review" | "reviewed" | "dismissed";
 export type AMLAlertSeverity = "medium" | "high";
+export type AMLRecommendedAction = "allow" | "review";
 export type AMLRule =
   | "single_transaction_threshold"
   | "daily_total_threshold"
   | "rapid_structuring"
-  | "sanction_match";
+  | "sanction_match"
+  | "dynamic_profile_score"
+  | "threshold_structuring";
+
+export interface AMLTransactionLocation {
+  lat: number;
+  lng: number;
+}
 
 export interface AMLTransactionRecord {
   id: string;
@@ -17,6 +33,10 @@ export interface AMLTransactionRecord {
   amount: number;
   createdAt: Date;
   status?: string;
+  currency?: string;
+  originalAmount?: number | null;
+  convertedAmount?: number | null;
+  locationMetadata?: Record<string, unknown> | null;
 }
 
 export interface AMLRuleHit {
@@ -47,6 +67,21 @@ export interface AMLReviewInput {
   reviewNotes?: string;
 }
 
+export interface AMLRiskProfile {
+  historicalCount: number;
+  countLastHour: number;
+  countLast24Hours: number;
+  countLast7Days: number;
+  movingAverageAmount: number;
+  amountVsAverageRatio: number;
+  hourlyVelocityRatio: number;
+  dailyVelocityRatio: number;
+  averageDailyCount: number;
+  frequencySpikeRatio: number;
+  geographicHopDistanceKm: number | null;
+  geographicHopHours: number | null;
+}
+
 export interface AMLConfig {
   singleTransactionThresholdXaf: number;
   dailyTotalThresholdXaf: number;
@@ -54,13 +89,37 @@ export interface AMLConfig {
   rapidWindowMinutes: number;
   rapidTransactionCount: number;
   structuringFloorXaf: number;
+  structuringThresholdRatio: number;
+  structuringFrequencyLimit: number;
   alertBufferSize: number;
+  profileScoreThreshold: number;
+  velocityHourlyCap: number;
+  velocityDailyCap: number;
+  movingAverageWindowDays: number;
+  amountMultiplierLimit: number;
+  frequencySpikeMultiplier: number;
+  geoHopMaxKm: number;
+  geoHopMaxHours: number;
+  highValueReportThresholdUsd: number;
+}
+
+export interface AMLHighValueAssessment {
+  qualifies: boolean;
+  thresholdUsd: number;
+  usdEquivalent: number;
+  originalCurrency: SupportedCurrency;
+  sourceAmount: number;
 }
 
 export interface AMLMonitoringResult {
   flagged: boolean;
   alert?: AMLAlert;
   ruleHits: AMLRuleHit[];
+  riskScore: number;
+  scoreThreshold: number;
+  recommendedAction: AMLRecommendedAction;
+  reasons: string[];
+  profile?: AMLRiskProfile;
 }
 
 export interface AMLReport {
@@ -95,10 +154,37 @@ const defaultConfig: AMLConfig = {
   rapidWindowMinutes: Number(process.env.AML_RAPID_WINDOW_MINUTES || 15),
   rapidTransactionCount: Number(process.env.AML_RAPID_TRANSACTION_COUNT || 3),
   structuringFloorXaf: Number(process.env.AML_STRUCTURING_FLOOR_XAF || 100_000),
+  structuringThresholdRatio: Number(
+    process.env.AML_STRUCTURING_THRESHOLD_RATIO || 0.8,
+  ),
+  structuringFrequencyLimit: Number(
+    process.env.AML_STRUCTURING_FREQUENCY_LIMIT || 3,
+  ),
   alertBufferSize: Number(process.env.AML_ALERT_BUFFER_SIZE || 5000),
+  profileScoreThreshold: Number(process.env.AML_PROFILE_SCORE_THRESHOLD || 50),
+  velocityHourlyCap: Number(process.env.AML_VELOCITY_HOURLY_CAP || 5),
+  velocityDailyCap: Number(process.env.AML_VELOCITY_DAILY_CAP || 15),
+  movingAverageWindowDays: Number(
+    process.env.AML_MOVING_AVERAGE_WINDOW_DAYS || 30,
+  ),
+  amountMultiplierLimit: Number(process.env.AML_AMOUNT_MULTIPLIER_LIMIT || 3),
+  frequencySpikeMultiplier: Number(
+    process.env.AML_FREQUENCY_SPIKE_MULTIPLIER || 3,
+  ),
+  geoHopMaxKm: Number(process.env.AML_GEO_HOP_MAX_KM || 250),
+  geoHopMaxHours: Number(process.env.AML_GEO_HOP_MAX_HOURS || 6),
+  highValueReportThresholdUsd: Number(
+    process.env.AML_HIGH_VALUE_REPORT_THRESHOLD_USD || 10_000,
+  ),
 };
 
-import { sanctionService } from "./sanctionService";
+const PROFILE_SCORE_WEIGHTS = {
+  amountAnomaly: 30,
+  hourlyVelocity: 25,
+  dailyVelocity: 25,
+  frequencySpike: 20,
+  geographicHop: 25,
+} as const;
 
 function toISODate(date: Date): string {
   return date.toISOString().slice(0, 10);
@@ -106,6 +192,49 @@ function toISODate(date: Date): string {
 
 function safeDate(value: string | Date): Date {
   return value instanceof Date ? value : new Date(value);
+}
+
+function toFiniteNumber(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+
+  if (typeof value === "string") {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  return null;
+}
+
+function normalizeLocationMetadata(
+  value: Record<string, unknown> | null | undefined,
+): AMLTransactionLocation | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const status = typeof value.status === "string" ? value.status : null;
+  if (status && status !== "resolved") {
+    return null;
+  }
+
+  const lat = toFiniteNumber(value.lat);
+  const lng = toFiniteNumber(value.lng ?? value.lon);
+  if (lat === null || lng === null) {
+    return null;
+  }
+
+  return { lat, lng };
+}
+
+function normalizeSupportedCurrency(value: string | undefined): SupportedCurrency {
+  const normalized = value?.toUpperCase();
+  if (normalized && currencyService.isSupportedCurrency(normalized)) {
+    return normalized;
+  }
+
+  return "USD";
 }
 
 export class AMLService {
@@ -130,6 +259,48 @@ export class AMLService {
     return new Date(now.getTime() - this.config.rapidWindowMinutes * 60 * 1000);
   }
 
+  assessHighValueTransaction(
+    transaction: AMLTransactionRecord,
+  ): AMLHighValueAssessment {
+    const originalCurrency = normalizeSupportedCurrency(transaction.currency);
+    const sourceAmount =
+      toFiniteNumber(transaction.originalAmount) ?? transaction.amount;
+    const storedUsdEquivalent = toFiniteNumber(transaction.convertedAmount);
+
+    let usdEquivalent = sourceAmount;
+    if (storedUsdEquivalent !== null && storedUsdEquivalent >= 0) {
+      usdEquivalent =
+        originalCurrency === "USD" ? sourceAmount : storedUsdEquivalent;
+    } else if (originalCurrency !== "USD") {
+      usdEquivalent = currencyService.convertToBase(
+        sourceAmount,
+        originalCurrency,
+      ).convertedAmount;
+    }
+
+    return {
+      qualifies: usdEquivalent > this.config.highValueReportThresholdUsd,
+      thresholdUsd: this.config.highValueReportThresholdUsd,
+      usdEquivalent,
+      originalCurrency,
+      sourceAmount,
+    };
+  }
+
+  isHighValueAlert(
+    transaction: AMLTransactionRecord,
+    alert: AMLAlert,
+  ): AMLHighValueAssessment | null {
+    if (
+      !alert.ruleHits.some((hit) => hit.rule === "single_transaction_threshold")
+    ) {
+      return null;
+    }
+
+    const assessment = this.assessHighValueTransaction(transaction);
+    return assessment.qualifies ? assessment : null;
+  }
+
   async fetchRecentTransactions(
     userId: string,
     since: Date,
@@ -142,6 +313,10 @@ export class AMLService {
         type,
         amount::text AS amount,
         status,
+        currency,
+        original_amount::text AS "originalAmount",
+        converted_amount::text AS "convertedAmount",
+        location_metadata AS "locationMetadata",
         created_at AS "createdAt"
       FROM transactions
       WHERE user_id = $1
@@ -156,6 +331,10 @@ export class AMLService {
       type: AMLTransactionType;
       amount: string;
       status: string;
+      currency: string | null;
+      originalAmount: string | null;
+      convertedAmount: string | null;
+      locationMetadata: Record<string, unknown> | null;
       createdAt: Date;
     }>(query, [userId, since, excludeTransactionId ?? null]);
 
@@ -166,6 +345,10 @@ export class AMLService {
         type: row.type,
         amount: Number(row.amount),
         status: row.status,
+        currency: row.currency ?? undefined,
+        originalAmount: toFiniteNumber(row.originalAmount),
+        convertedAmount: toFiniteNumber(row.convertedAmount),
+        locationMetadata: row.locationMetadata,
         createdAt: safeDate(row.createdAt),
       }))
       .filter((row) => Number.isFinite(row.amount) && row.amount >= 0);
@@ -179,14 +362,175 @@ export class AMLService {
       LIMIT 1
     `;
     try {
-      const result = await pool.query<{ firstName: string; lastName: string }>(query, [userId]);
+      const result = await pool.query<{ firstName: string; lastName: string }>(
+        query,
+        [userId],
+      );
       if (result.rows.length === 0) return null;
       const { firstName, lastName } = result.rows[0];
       return `${firstName || ""} ${lastName || ""}`.trim();
     } catch (error) {
-      console.error(`Failed to fetch user name for AML: ${error}`);
+      logger.error(`Failed to fetch user name for AML: ${error}`);
       return null;
     }
+  }
+
+  private buildDynamicProfileResult(
+    current: AMLTransactionRecord,
+    snapshot: CachedAmlProfileSnapshot,
+  ): AMLMonitoringResult {
+    const reasons: string[] = [];
+    let riskScore = 0;
+
+    const movingAverageAmount =
+      snapshot.movingAverageAmount > 0
+        ? snapshot.movingAverageAmount
+        : current.amount;
+    const amountVsAverageRatio =
+      movingAverageAmount > 0 ? current.amount / movingAverageAmount : 1;
+
+    const projectedHourlyCount = snapshot.countLastHour + 1;
+    const projectedDailyCount = snapshot.countLast24Hours + 1;
+    const hourlyVelocityRatio =
+      this.config.velocityHourlyCap > 0
+        ? projectedHourlyCount / this.config.velocityHourlyCap
+        : 0;
+    const dailyVelocityRatio =
+      this.config.velocityDailyCap > 0
+        ? projectedDailyCount / this.config.velocityDailyCap
+        : 0;
+
+    const averageDailyCount = snapshot.countLast7Days / 7;
+    const frequencySpikeRatio =
+      averageDailyCount > 0 ? projectedDailyCount / averageDailyCount : 0;
+
+    let geographicHopDistanceKm: number | null = null;
+    let geographicHopHours: number | null = null;
+
+    if (
+      snapshot.historicalCount >= 3 &&
+      amountVsAverageRatio >= this.config.amountMultiplierLimit
+    ) {
+      riskScore += PROFILE_SCORE_WEIGHTS.amountAnomaly;
+      reasons.push(
+        `Amount ${current.amount} XAF is ${amountVsAverageRatio.toFixed(1)}x the recent moving average of ${movingAverageAmount.toFixed(0)} XAF`,
+      );
+    }
+
+    if (
+      this.config.velocityHourlyCap > 0 &&
+      projectedHourlyCount > this.config.velocityHourlyCap
+    ) {
+      riskScore += PROFILE_SCORE_WEIGHTS.hourlyVelocity;
+      reasons.push(
+        `Projected hourly velocity ${projectedHourlyCount} exceeds AML cap ${this.config.velocityHourlyCap}`,
+      );
+    }
+
+    if (
+      this.config.velocityDailyCap > 0 &&
+      projectedDailyCount > this.config.velocityDailyCap
+    ) {
+      riskScore += PROFILE_SCORE_WEIGHTS.dailyVelocity;
+      reasons.push(
+        `Projected 24h velocity ${projectedDailyCount} exceeds AML cap ${this.config.velocityDailyCap}`,
+      );
+    }
+
+    if (
+      snapshot.historicalCount >= 5 &&
+      averageDailyCount >= 1 &&
+      frequencySpikeRatio >= this.config.frequencySpikeMultiplier
+    ) {
+      riskScore += PROFILE_SCORE_WEIGHTS.frequencySpike;
+      reasons.push(
+        `Recent transaction frequency is ${frequencySpikeRatio.toFixed(1)}x the user's 7-day daily average`,
+      );
+    }
+
+    const currentLocation = normalizeLocationMetadata(current.locationMetadata);
+    const lastLocation = normalizeLocationMetadata(
+      snapshot.lastLocationMetadata,
+    );
+    if (currentLocation && lastLocation && snapshot.lastLocationAt) {
+      geographicHopDistanceKm = getDistanceKm(lastLocation, currentLocation);
+      geographicHopHours =
+        (current.createdAt.getTime() - snapshot.lastLocationAt.getTime()) /
+        (60 * 60 * 1000);
+
+      if (
+        geographicHopDistanceKm > this.config.geoHopMaxKm &&
+        geographicHopHours <= this.config.geoHopMaxHours
+      ) {
+        riskScore += PROFILE_SCORE_WEIGHTS.geographicHop;
+        reasons.push(
+          `Geographic hop of ${geographicHopDistanceKm.toFixed(0)}km within ${geographicHopHours.toFixed(1)}h exceeds AML hop limits`,
+        );
+      }
+    }
+
+    const profile: AMLRiskProfile = {
+      historicalCount: snapshot.historicalCount,
+      countLastHour: projectedHourlyCount,
+      countLast24Hours: projectedDailyCount,
+      countLast7Days: snapshot.countLast7Days,
+      movingAverageAmount,
+      amountVsAverageRatio,
+      hourlyVelocityRatio,
+      dailyVelocityRatio,
+      averageDailyCount,
+      frequencySpikeRatio,
+      geographicHopDistanceKm,
+      geographicHopHours,
+    };
+
+    const flagged = riskScore >= this.config.profileScoreThreshold;
+    const ruleHits = flagged
+      ? [
+          {
+            rule: "dynamic_profile_score" as const,
+            message: `Dynamic AML profile score ${riskScore} exceeds threshold ${this.config.profileScoreThreshold}`,
+            observed: riskScore,
+            threshold: this.config.profileScoreThreshold,
+          },
+        ]
+      : [];
+
+    const summaryReasons = flagged
+      ? [ruleHits[0].message, ...reasons]
+      : reasons;
+
+    return {
+      flagged,
+      ruleHits,
+      riskScore,
+      scoreThreshold: this.config.profileScoreThreshold,
+      recommendedAction: flagged ? "review" : "allow",
+      reasons: summaryReasons,
+      profile,
+    };
+  }
+
+  async profileTransaction(
+    transaction: AMLTransactionRecord,
+  ): Promise<AMLMonitoringResult> {
+    const snapshot = await getCachedAmlProfileSnapshot(
+      transaction.userId,
+      transaction.createdAt,
+      {
+        excludeTransactionId: transaction.id,
+        movingAverageWindowDays: this.config.movingAverageWindowDays,
+      },
+    );
+
+    return this.buildDynamicProfileResult(transaction, snapshot);
+  }
+
+  async evaluateProfileTransaction(
+    current: AMLTransactionRecord,
+    snapshot: CachedAmlProfileSnapshot,
+  ): Promise<AMLMonitoringResult> {
+    return this.buildDynamicProfileResult(current, snapshot);
   }
 
   async evaluateTransaction(
@@ -198,6 +542,7 @@ export class AMLService {
     const windowTxs = recentTransactions.filter(
       (tx) => tx.createdAt >= lookbackStart,
     );
+    const highValueAssessment = this.assessHighValueTransaction(current);
 
     if (current.amount > this.config.singleTransactionThresholdXaf) {
       ruleHits.push({
@@ -205,6 +550,13 @@ export class AMLService {
         message: `Single transaction amount ${current.amount} XAF exceeds ${this.config.singleTransactionThresholdXaf} XAF`,
         observed: current.amount,
         threshold: this.config.singleTransactionThresholdXaf,
+      });
+    } else if (highValueAssessment.qualifies) {
+      ruleHits.push({
+        rule: "single_transaction_threshold",
+        message: `Single transaction USD-equivalent amount ${highValueAssessment.usdEquivalent.toFixed(2)} USD exceeds ${highValueAssessment.thresholdUsd} USD high-value reporting threshold`,
+        observed: highValueAssessment.usdEquivalent,
+        threshold: highValueAssessment.thresholdUsd,
       });
     }
 
@@ -220,7 +572,9 @@ export class AMLService {
     }
 
     const rapidWindowStart = this.getRapidWindowStart(current.createdAt);
-    const rapidWindowTxs = windowTxs.filter((tx) => tx.createdAt >= rapidWindowStart);
+    const rapidWindowTxs = windowTxs.filter(
+      (tx) => tx.createdAt >= rapidWindowStart,
+    );
     const rapidSet = [...rapidWindowTxs, current];
     const rapidCount = rapidSet.length;
     const hasDeposit = rapidSet.some((tx) => tx.type === "deposit");
@@ -245,14 +599,48 @@ export class AMLService {
       });
     }
 
+    // Scan user transaction frequency patterns for structuring just below KYC threshold
+    const structuringLowerBound =
+      this.config.singleTransactionThresholdXaf *
+      this.config.structuringThresholdRatio;
+    const structuringTxsJustBelowThreshold = windowTxs.filter(
+      (tx) =>
+        tx.amount >= structuringLowerBound &&
+        tx.amount < this.config.singleTransactionThresholdXaf,
+    );
+
+    const isCurrentStructuring =
+      current.amount >= structuringLowerBound &&
+      current.amount < this.config.singleTransactionThresholdXaf;
+
+    const totalStructuringCount =
+      structuringTxsJustBelowThreshold.length + (isCurrentStructuring ? 1 : 0);
+
+    if (totalStructuringCount >= this.config.structuringFrequencyLimit) {
+      ruleHits.push({
+        rule: "threshold_structuring",
+        message: `Structuring attempt detected: user submitted ${totalStructuringCount} transaction requests just below KYC threshold (${this.config.singleTransactionThresholdXaf} XAF)`,
+        observed: totalStructuringCount,
+        threshold: this.config.structuringFrequencyLimit,
+      });
+    }
+
     if (ruleHits.length === 0) {
-      return { flagged: false, ruleHits: [] };
+      return {
+        flagged: false,
+        ruleHits: [],
+        riskScore: 0,
+        scoreThreshold: this.config.profileScoreThreshold,
+        recommendedAction: "allow",
+        reasons: [],
+      };
     }
 
     const severity: AMLAlertSeverity = ruleHits.some(
       (hit) =>
         hit.rule === "single_transaction_threshold" ||
-        hit.rule === "daily_total_threshold",
+        hit.rule === "daily_total_threshold" ||
+        hit.rule === "threshold_structuring",
     )
       ? "high"
       : "medium";
@@ -273,7 +661,15 @@ export class AMLService {
     await this.recordAlert(alert);
     this.logAlert(alert, current);
 
-    return { flagged: true, alert, ruleHits };
+    return {
+      flagged: true,
+      alert,
+      ruleHits,
+      riskScore: this.config.profileScoreThreshold,
+      scoreThreshold: this.config.profileScoreThreshold,
+      recommendedAction: "review",
+      reasons: alert.reasons,
+    };
   }
 
   async monitorTransaction(
@@ -281,11 +677,7 @@ export class AMLService {
   ): Promise<AMLMonitoringResult> {
     const since = this.getLookbackWindowStart(transaction.createdAt);
     const [recent, userName] = await Promise.all([
-      this.fetchRecentTransactions(
-        transaction.userId,
-        since,
-        transaction.id,
-      ),
+      this.fetchRecentTransactions(transaction.userId, since, transaction.id),
       this.fetchUserName(transaction.userId),
     ]);
 
@@ -304,6 +696,8 @@ export class AMLService {
 
         result.flagged = true;
         result.ruleHits.push(sanctionHit);
+        result.reasons.push(sanctionHit.message);
+        result.recommendedAction = "review";
 
         if (!result.alert) {
           const nowIso = new Date().toISOString();
@@ -318,7 +712,7 @@ export class AMLService {
             createdAt: nowIso,
             updatedAt: nowIso,
           };
-          this.recordAlert(result.alert);
+          await this.recordAlert(result.alert);
         } else {
           result.alert.severity = "high";
           result.alert.ruleHits.push(sanctionHit);
@@ -388,6 +782,8 @@ export class AMLService {
       daily_total_threshold: 0,
       rapid_structuring: 0,
       sanction_match: 0,
+      dynamic_profile_score: 0,
+      threshold_structuring: 0,
     };
 
     const dailyMap = new Map<string, number>();
@@ -416,27 +812,52 @@ export class AMLService {
   }
 
   private async recordAlert(alert: AMLAlert): Promise<void> {
-    // Store in database for persistence
     try {
       const { AMLAlertModel } = await import("../models/amlAlert.js");
       const model = new AMLAlertModel();
       await model.create(alert);
 
-      // AUTOMATION: If severity is high, automatically prepare SAR draft
+      // Send alert notifications to administrators
+      try {
+        const { notificationRouter } = await import("./notificationRouter.js");
+        await notificationRouter.routeSystemNotification(
+          alert.severity === "high" ? "high" : "medium",
+          "compliance_aml_alert",
+          `Suspicious Transaction Alert: User ${alert.userId}`,
+          `Compliance alert triggered for user ${alert.userId}: ${alert.reasons.join("; ")}`,
+          {
+            alertId: alert.id,
+            userId: alert.userId,
+            transactionId: alert.transactionId,
+            ruleHits: alert.ruleHits,
+            severity: alert.severity,
+          },
+        );
+      } catch (notifyErr) {
+        logger.error("Failed to send administrator alert notification:", notifyErr);
+      }
+
       if (alert.severity === "high") {
-        console.log(`[SAR AUTO-PREPARE] High severity alert ${alert.id} detected. Preparing SAR...`);
+        console.log(
+          `[SAR AUTO-PREPARE] High severity alert ${alert.id} detected. Preparing SAR...`,
+        );
         try {
           const { generateSAR } = require("../compliance/sar");
           generateSAR(alert.userId, alert.id).catch((err: any) => {
-            console.error(`[SAR AUTO-PREPARE ERROR] Failed for alert ${alert.id}:`, err);
+            logger.error(
+              `[SAR AUTO-PREPARE ERROR] Failed for alert ${alert.id}:`,
+              err,
+            );
           });
         } catch (err) {
-          console.error(`[SAR AUTO-PREPARE ERROR] Failed to load sar service:`, err);
+          logger.error(
+            `[SAR AUTO-PREPARE ERROR] Failed to load sar service:`,
+            err,
+          );
         }
       }
     } catch (error) {
-      console.error("Failed to persist AML alert to database:", error);
-      // Fallback to in-memory storage
+      logger.error("Failed to persist AML alert to database:", error);
       this.alerts.unshift(alert);
       if (this.alerts.length > this.config.alertBufferSize) {
         this.alerts = this.alerts.slice(0, this.config.alertBufferSize);

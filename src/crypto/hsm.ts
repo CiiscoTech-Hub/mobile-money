@@ -32,7 +32,7 @@ import {
   FeeBumpTransaction,
   xdr,
   hash,
-} from "stellar-sdk";
+} from "@stellar/stellar-sdk";
 
 // ─── Configuration ───────────────────────────────────────────────────────────
 
@@ -212,13 +212,13 @@ export class KmsAsymmetricSigner implements TransactionSigner {
     const pubKeyBuffer = Buffer.from(response.PublicKey);
     if (pubKeyBuffer.length < 32) {
       throw new HsmConfigurationError(
-        `KMS GetPublicKey returned invalid buffer length: ${pubKeyBuffer.length}. Expected at least 32 bytes for Ed25519.`
+        `KMS GetPublicKey returned invalid buffer length: ${pubKeyBuffer.length}. Expected at least 32 bytes for Ed25519.`,
       );
     }
 
     const rawPublicKey = pubKeyBuffer.subarray(pubKeyBuffer.length - 32);
 
-    this._kp = new Keypair({ type: 'ed25519', publicKey: rawPublicKey });
+    this._kp = new Keypair({ type: "ed25519", publicKey: rawPublicKey });
     this._publicKey = this._kp.publicKey();
 
     return this._publicKey;
@@ -260,7 +260,7 @@ export class KmsAsymmetricSigner implements TransactionSigner {
   async signTransaction(
     tx: Transaction | FeeBumpTransaction,
   ): Promise<SignedTransactionResult> {
-    const txHash = tx.hash();
+    const txHash = Buffer.from(tx.hash());
     const { decoratedSignature } = await this.sign(txHash);
 
     appendSignature(tx, decoratedSignature);
@@ -354,7 +354,7 @@ export class KmsEnvelopeSigner implements TransactionSigner {
   async signTransaction(
     tx: Transaction | FeeBumpTransaction,
   ): Promise<SignedTransactionResult> {
-    const txHash = tx.hash();
+    const txHash = Buffer.from(tx.hash());
     const { decoratedSignature } = await this.sign(txHash);
 
     appendSignature(tx, decoratedSignature);
@@ -503,14 +503,14 @@ export class Pkcs11Signer implements TransactionSigner {
   async sign(txHash: Buffer): Promise<SignResult> {
     throw new HsmSigningError(
       "Pkcs11Signer.sign() is not implemented. To use physical HSMs, you must integrate a native PKCS#11 binding (e.g., pkcs11js or a custom NAPI-RS module). " +
-      `Module: ${this.config.modulePath}, slot: ${this.config.slotId}, key: ${this.config.keyId}`,
+        `Module: ${this.config.modulePath}, slot: ${this.config.slotId}, key: ${this.config.keyId}`,
     );
   }
 
   async signTransaction(
     tx: Transaction | FeeBumpTransaction,
   ): Promise<SignedTransactionResult> {
-    const txHash = tx.hash();
+    const txHash = Buffer.from(tx.hash());
     const { decoratedSignature } = await this.sign(txHash);
     appendSignature(tx, decoratedSignature);
     return {
@@ -557,7 +557,7 @@ export class LocalSigner implements TransactionSigner {
   async signTransaction(
     tx: Transaction | FeeBumpTransaction,
   ): Promise<SignedTransactionResult> {
-    const txHash = tx.hash();
+    const txHash = Buffer.from(tx.hash());
     const { decoratedSignature } = await this.sign(txHash);
     appendSignature(tx, decoratedSignature);
     return {
@@ -719,7 +719,7 @@ export async function signEnvelope(
   networkPassphrase: string,
   signer: TransactionSigner,
 ): Promise<string> {
-  const { TransactionBuilder } = await import("stellar-sdk");
+  const { TransactionBuilder } = await import("@stellar/stellar-sdk");
   const tx = TransactionBuilder.fromXDR(envelopeXdr, networkPassphrase);
   const result = await signer.signTransaction(tx);
   return result.envelopeXdr;

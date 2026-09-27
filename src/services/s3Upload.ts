@@ -1,12 +1,37 @@
+import fs from "fs";
+import path from "path";
+import logger from "../utils/logger";
 import { PutObjectCommand, HeadObjectCommand } from "@aws-sdk/client-s3";
 import crypto from "crypto";
 import { getS3Client, s3Config, getS3ObjectUrl } from "../config/s3";
-import { generateUniqueFilename, generateS3Key } from "../middleware/upload";
+import {
+  generateUniqueFilename,
+  generateS3Key,
+  generateComplianceS3Key,
+} from "../middleware/upload";
+import {
+  KmsFileSigner,
+  createFileSignerFromEnv,
+  FileSignature,
+} from "./stellar/hsmService";
+
+const DEV_UPLOAD_DIR = path.join(process.cwd(), "uploads", "kyc-dev");
+const DEV_COMPLIANCE_UPLOAD_DIR = path.join(
+  process.cwd(),
+  "uploads",
+  "admin-compliance-dev",
+);
+
+function maskKycFilename(originalname: string): string {
+  const ext = path.extname(originalname);
+  return crypto.randomBytes(16).toString("hex") + ext;
+}
 
 export interface UploadResult {
   success: boolean;
   fileUrl?: string;
   key?: string;
+  signature?: FileSignature;
   error?: string;
 }
 
@@ -14,41 +39,96 @@ export interface UploadOptions {
   userId: string;
   file: Express.Multer.File;
   metadata?: Record<string, string>;
+  folder?: "kyc" | "compliance";
 }
 
 /**
- * Upload file to S3 bucket
+ * Upload file to S3 bucket with automatic HSM signing.
+ *
+ * Before uploading, the file buffer's SHA-256 digest is computed locally
+ * and signed via the configured KMS asymmetric key. The signature is
+ * stored in S3 object metadata so it can be retrieved for verification
+ * on read paths.
+ *
+ * If no HSM_FILE_KMS_KEY_ID is configured (CI / local dev), signing is
+ * skipped gracefully.
  */
 export const uploadToS3 = async (
   options: UploadOptions,
 ): Promise<UploadResult> => {
   try {
-    const { userId, file, metadata = {} } = options;
+    const { userId, file, metadata = {}, folder = "kyc" } = options;
+
+    // Dev mode: write to local disk with a masked (hashed) filename instead of S3
+    if (process.env.NODE_ENV !== "production" && !s3Config.bucket) {
+      const maskedFilename = maskKycFilename(file.originalname);
+      const targetDir =
+        folder === "compliance" ? DEV_COMPLIANCE_UPLOAD_DIR : DEV_UPLOAD_DIR;
+      fs.mkdirSync(targetDir, { recursive: true });
+      const localPath = path.join(targetDir, maskedFilename);
+      fs.writeFileSync(localPath, file.buffer);
+      logger.info(
+        { userId, localPath, folder },
+        `${folder.toUpperCase()} file saved to local disk (dev mode)`,
+      );
+      return {
+        success: true,
+        fileUrl: `file://${localPath}`,
+        key: maskedFilename,
+      };
+    }
 
     // Generate unique filename and S3 key
     const uniqueFilename = generateUniqueFilename(file.originalname);
-    const key = generateS3Key(userId, uniqueFilename);
+    const key =
+      folder === "compliance"
+        ? generateComplianceS3Key(userId, uniqueFilename)
+        : generateS3Key(userId, uniqueFilename);
 
     const s3Client = getS3Client();
+
+    // ── HSM file signing ──────────────────────────────────────────────
+    const fileSigner = createFileSignerFromEnv();
+    let fileSignature: FileSignature | undefined;
+
+    if (fileSigner) {
+      try {
+        fileSignature = await fileSigner.sign(file.buffer);
+      } catch (err) {
+        console.error("HSM file signing failed (upload continues):", err);
+      }
+    }
+
+    // Build S3 metadata, appending signature fields when available
+    const s3Metadata: Record<string, string> = {
+      originalName: file.originalname,
+      uploadedBy: userId,
+      uploadedAt: new Date().toISOString(),
+      folder,
+      ...metadata,
+    };
+
+    if (fileSignature) {
+      s3Metadata["hsm-signature"] = fileSignature.signature;
+      s3Metadata["hsm-key-id"] = fileSignature.keyId;
+      s3Metadata["hsm-algorithm"] = fileSignature.algorithm;
+      s3Metadata["hsm-digest"] = fileSignature.digest;
+      s3Metadata["hsm-signed-at"] = fileSignature.signedAt;
+    }
 
     // Prepare upload command
     // Generate a random 256-bit (32-byte) key for SSE-C encryption
     const sseKey = crypto.randomBytes(32);
-    const sseKeyBase64 = sseKey.toString('base64');
-    const sseKeyMD5 = crypto.createHash('md5').update(sseKey).digest('base64');
+    const sseKeyBase64 = sseKey.toString("base64");
+    const sseKeyMD5 = crypto.createHash("md5").update(sseKey).digest("base64");
 
     const command = new PutObjectCommand({
       Bucket: s3Config.bucket,
       Key: key,
       Body: file.buffer,
       ContentType: file.mimetype,
-      Metadata: {
-        originalName: file.originalname,
-        uploadedBy: userId,
-        uploadedAt: new Date().toISOString(),
-        ...metadata,
-      },
-      SSECustomerAlgorithm: 'AES256',
+      Metadata: s3Metadata,
+      SSECustomerAlgorithm: "AES256",
       SSECustomerKey: sseKeyBase64,
       SSECustomerKeyMD5: sseKeyMD5,
       // Set appropriate ACL (private by default)
@@ -65,9 +145,10 @@ export const uploadToS3 = async (
       success: true,
       fileUrl,
       key,
+      signature: fileSignature,
     };
   } catch {
-    console.error("S3 upload error");
+    logger.error("S3 upload error");
     return {
       success: false,
       error: "Unknown upload error",

@@ -53,6 +53,8 @@ export const ERROR_CODES = {
   RATE_LIMIT: "RATE_LIMIT",
   /** Destination Stellar account has not established a trustline for the payment asset. */
   TRUSTLINE_MISSING: "TRUSTLINE_MISSING",
+  /** Compliance verification required or failed (e.g., SEP-08, KYC) */
+  COMPLIANCE_REQUIRED: "COMPLIANCE_REQUIRED",
 
   // Server errors (5000+) - HTTP 500+
   INTERNAL_ERROR: "INTERNAL_ERROR",
@@ -134,7 +136,8 @@ export const getHttpStatus = (code: string): number => {
     code === ERROR_CODES.INSUFFICIENT_BALANCE ||
     code === ERROR_CODES.INSUFFICIENT_FUNDS ||
     code === ERROR_CODES.TRANSACTION_FAILED ||
-    code === ERROR_CODES.TRUSTLINE_MISSING
+    code === ERROR_CODES.TRUSTLINE_MISSING ||
+    code === ERROR_CODES.COMPLIANCE_REQUIRED
   ) {
     return 400;
   }
@@ -144,10 +147,12 @@ export const getHttpStatus = (code: string): number => {
   if (code === ERROR_CODES.PROVIDER_ERROR) {
     return 502;
   }
+  if (code === ERROR_CODES.SERVICE_UNAVAILABLE) {
+    return 503;
+  }
   if (
     code.startsWith("500") ||
     code === ERROR_CODES.INTERNAL_ERROR ||
-    code === ERROR_CODES.SERVICE_UNAVAILABLE ||
     code === ERROR_CODES.DATABASE_ERROR
   ) {
     return 500;

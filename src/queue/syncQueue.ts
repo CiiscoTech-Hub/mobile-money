@@ -37,6 +37,15 @@ export const syncQueue = new Queue<SyncJobData, SyncJobResult>(
         type: "exponential",
         delay: 3000, // Wait 3 seconds, then 6, 12, 24, 48 seconds
       },
+      // Retention: clean up completed/failed job records to bound Redis memory
+      removeOnComplete: {
+        count: 1000,
+        age: 24 * 3600, // 24 hours
+      },
+      removeOnFail: {
+        count: 500,
+        age: 7 * 24 * 3600, // 7 days
+      },
     },
   },
 );

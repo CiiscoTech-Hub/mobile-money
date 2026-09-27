@@ -1,4 +1,9 @@
-export type MobileNetworkName = "MTN" | "AIRTEL" | "ORANGE";
+export type MobileNetworkName =
+  | "MTN"
+  | "AIRTEL"
+  | "ORANGE"
+  | "VODACOM"
+  | "TIGO";
 
 /**
  * Common network prefixes for target mobile money providers.
@@ -32,4 +37,28 @@ export const NETWORK_PREFIXES: Record<string, MobileNetworkName> = {
 
   // Senegal
   "22177": "ORANGE",
+
+  // Tanzania — Vodacom
+  "255740": "VODACOM",
+  "255762": "VODACOM",
+  "255763": "VODACOM",
+  "255764": "VODACOM",
+  "255765": "VODACOM",
+  "255766": "VODACOM",
+  "255767": "VODACOM",
+  "255768": "VODACOM",
+  "255769": "VODACOM",
+
+  // Tanzania — Tigo
+  "255713": "TIGO",
+  "255714": "TIGO",
+  "255715": "TIGO",
+  "255716": "TIGO",
+  "255717": "TIGO",
+  "255718": "TIGO",
+  "255719": "TIGO",
+  "255752": "TIGO",
+  "255753": "TIGO",
+  "255754": "TIGO",
+  "255755": "TIGO",
 };

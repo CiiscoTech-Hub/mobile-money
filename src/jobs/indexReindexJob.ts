@@ -1,3 +1,4 @@
+import logger from "../utils/logger";
 import { pool } from "../config/database";
 import {
   APP_MAINTENANCE_MODE,
@@ -80,18 +81,24 @@ export async function runIndexReindexJob(): Promise<void> {
   console.info("[index-reindex] Starting index reindex maintenance job");
 
   if (!INDEX_REINDEX_JOB_ENABLED) {
-    console.info("[index-reindex] Skipping because INDEX_REINDEX_JOB_ENABLED=false");
+    console.info(
+      "[index-reindex] Skipping because INDEX_REINDEX_JOB_ENABLED=false",
+    );
     return;
   }
 
   if (APP_MAINTENANCE_MODE) {
-    console.info("[index-reindex] Skipping because application maintenance mode is active");
+    console.info(
+      "[index-reindex] Skipping because application maintenance mode is active",
+    );
     return;
   }
 
   try {
     if (!(await isPrimaryDatabase())) {
-      console.info("[index-reindex] Skipping because this database is a replica");
+      console.info(
+        "[index-reindex] Skipping because this database is a replica",
+      );
       return;
     }
 
@@ -105,7 +112,9 @@ export async function runIndexReindexJob(): Promise<void> {
 
     const candidates = await findBloatedIndexes();
     if (candidates.length === 0) {
-      console.info("[index-reindex] No bloated indexes eligible for reindexing");
+      console.info(
+        "[index-reindex] No bloated indexes eligible for reindexing",
+      );
       return;
     }
 
@@ -127,7 +136,10 @@ export async function runIndexReindexJob(): Promise<void> {
 
     console.info("[index-reindex] Completed reindex maintenance job");
   } catch (error) {
-    console.error("[index-reindex] Failed to complete reindex maintenance:", error);
+    logger.error(
+      "[index-reindex] Failed to complete reindex maintenance:",
+      error,
+    );
     throw error;
   }
 }

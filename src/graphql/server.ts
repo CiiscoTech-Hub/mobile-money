@@ -1,10 +1,10 @@
+import logger from "../utils/logger";
 import type { Application, Request } from "express";
 import { ApolloServer } from "apollo-server-express";
 import {
   ApolloServerPluginLandingPageGraphQLPlayground,
   ApolloServerPluginLandingPageProductionDefault,
 } from "apollo-server-core";
-// @ts-expect-error ESM module
 import { makeExecutableSchema } from "@graphql-tools/schema";
 import { WebSocketServer } from "ws";
 import { useServer } from "graphql-ws/use/ws";
@@ -26,6 +26,64 @@ const mergedResolvers = {
   ...resolvers,
   ...subscriptionResolvers,
 };
+
+function persistedQueryHash(request: any): string | undefined {
+  const hash = request?.extensions?.persistedQuery?.sha256Hash;
+  return typeof hash === "string" && hash.length > 0 ? hash : undefined;
+}
+
+function hasQueryText(request: any): boolean {
+  return typeof request?.query === "string" && request.query.trim().length > 0;
+}
+
+function createAPQInstrumentationPlugin() {
+  return {
+    async requestDidStart(requestContext: any) {
+      const hash = persistedQueryHash(requestContext.request);
+      if (!hash) return {};
+
+      const requestHasQueryText = hasQueryText(requestContext.request);
+      logger.info(
+        {
+          apqHash: hash,
+          hashOnly: !requestHasQueryText,
+        },
+        "GraphQL APQ request received",
+      );
+
+      return {
+        async didResolveOperation() {
+          if (!requestHasQueryText) {
+            logger.info(
+              { apqHash: hash },
+              "GraphQL APQ hash resolved from Redis cache",
+            );
+          }
+        },
+        async didEncounterErrors(errorContext: any) {
+          const codes = (errorContext.errors || []).map(
+            (error: any) => error?.extensions?.code,
+          );
+          if (codes.includes("PERSISTED_QUERY_NOT_FOUND")) {
+            logger.info(
+              { apqHash: hash },
+              "GraphQL APQ hash not found; client should retry with full query",
+            );
+          }
+        },
+        async willSendResponse(responseContext: any) {
+          const errors = responseContext.errors || [];
+          if (requestHasQueryText && errors.length === 0) {
+            logger.info(
+              { apqHash: hash },
+              "GraphQL APQ query hash stored in Redis cache",
+            );
+          }
+        },
+      };
+    },
+  };
+}
 
 export async function startApolloServer(
   app: Application,
@@ -56,7 +114,7 @@ export async function startApolloServer(
 
     validationRules: [
       depthLimit(5),
-        // Enforce strict query complexity limit of 500 points per request
+      // Enforce strict query complexity limit of 500 points per request
       createComplexityRule({
         maximumComplexity: 500,
         estimators: [
@@ -69,6 +127,7 @@ export async function startApolloServer(
       process.env.NODE_ENV === "production"
         ? ApolloServerPluginLandingPageProductionDefault({ footer: false })
         : ApolloServerPluginLandingPageGraphQLPlayground(),
+      createAPQInstrumentationPlugin(),
       // Plugin for proper shutdown of WebSocket server
       {
         async serverWillStart() {
@@ -118,16 +177,23 @@ export async function startApolloServer(
 
         if (apiKeyRequired) {
           if (!token) {
-            console.warn("[WS] Rejected unauthenticated connection — no authToken");
+            console.warn(
+              "[WS] Rejected unauthenticated connection — no authToken",
+            );
             return false; // graphql-ws closes the connection
           }
           try {
             const claims = verifyToken(String(token));
             // Attach claims to context so subscription resolvers can access them
             ctx.extra.jwtClaims = claims;
-            console.log(`[WS] Authenticated connection for user ${claims.userId}`);
+            console.log(
+              `[WS] Authenticated connection for user ${claims.userId}`,
+            );
           } catch (err) {
-            console.warn("[WS] Rejected connection — invalid token:", (err as Error).message);
+            console.warn(
+              "[WS] Rejected connection — invalid token:",
+              (err as Error).message,
+            );
             return false;
           }
         }
@@ -138,7 +204,7 @@ export async function startApolloServer(
         console.log("WebSocket subscription disconnected");
       },
       onError: (_ctx: any, err: any) => {
-        console.error("WebSocket subscription error:", err);
+        logger.error("WebSocket subscription error:", err);
       },
     },
     wsServer,
