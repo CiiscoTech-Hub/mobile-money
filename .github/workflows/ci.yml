@@ -5,19 +5,46 @@ on:
     branches: [main, develop]
   pull_request:
     branches: [main, develop]
+  schedule:
+    - cron: "0 0 * * *" # Daily certificate check
 
 jobs:
+  cert-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Verify package-lock.json exists
+        run: |
+          if [ ! -f package-lock.json ]; then
+            npm install --package-lock-only --ignore-scripts
+          fi
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Run Certificate Expiry Check
+        run: npm run check-cert
+        continue-on-error: true
+
   security:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v4
         with:
-          node-version: "24"
+          node-version: "20"
           cache: npm
           cache-dependency-path: |
             package-lock.json
@@ -27,7 +54,7 @@ jobs:
         run: |
           if [ ! -f package-lock.json ]; then
             echo "⚠️ package-lock.json not found, generating it..."
-            npm install --package-lock-only
+            npm install --package-lock-only --ignore-scripts
           else
             echo "✅ package-lock.json found"
           fi
@@ -66,7 +93,7 @@ jobs:
         run: |
           if [ ! -f package-lock.json ]; then
             echo "⚠️ bridge-starter-node/package-lock.json not found, generating it..."
-            npm install --package-lock-only
+            npm install --package-lock-only --ignore-scripts
           else
             echo "✅ bridge-starter-node/package-lock.json found"
           fi
@@ -119,12 +146,12 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v4
         with:
-          node-version: "24"
+          node-version: "20"
           cache: npm
 
       - name: Install system dependencies
@@ -136,7 +163,7 @@ jobs:
         run: |
           if [ ! -f package-lock.json ]; then
             echo "⚠️ package-lock.json not found, generating it..."
-            npm install --package-lock-only
+            npm install --package-lock-only --ignore-scripts
           else
             echo "✅ package-lock.json found"
           fi
@@ -144,18 +171,26 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Wait for Postgres to be ready
+        run: |
+          for i in $(seq 1 30); do
+            pg_isready -h localhost -p 5432 -U test_user && break
+            echo "Waiting for Postgres... attempt $i/30"
+            sleep 1
+          done
+
       - name: Run database migrations
-        run: npm run migrate:up
-        continue-on-error: true
+        run: npm run migrate:up 2>&1
+        continue-on-error: false
         env:
           DATABASE_URL: postgresql://test_user:test_password@localhost:5432/test_db
 
       - name: Run linter
         run: npm run lint
-        continue-on-error: true
+        continue-on-error: false
 
       - name: Run tests with coverage
-        run: npm run test:coverage -- --maxWorkers=2 --forceExit
+        run: npm run test:coverage -- --maxWorkers=2 --bail --forceExit
         timeout-minutes: 10
         continue-on-error: true
         env:
@@ -163,14 +198,31 @@ jobs:
           REDIS_URL: redis://localhost:6379
           STELLAR_ISSUER_SECRET: S-DUMMY-SECRET-KEY-FOR-TESTING-PURPOSES-ONLY
           NODE_ENV: test
+          NODE_OPTIONS: --experimental-vm-modules
           CI: true
+
+      - name: Run Pact Contract Tests
+        run: npm run test:pact
+        continue-on-error: true
+        env:
+          NODE_OPTIONS: --experimental-vm-modules
+          CI: true
+
+      - name: Upload Pact files as artifacts
+        uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: pact-contracts
+          path: pacts/
+          retention-days: 30
+          if-no-files-found: ignore
 
       - name: Install Playwright browsers
         run: npx playwright install --with-deps chromium
 
       - name: Build for E2E
         run: npm run build
-        continue-on-error: true
+        continue-on-error: false
 
       - name: Start server for E2E
         run: node dist/src/index.js &
@@ -207,15 +259,55 @@ jobs:
           path: playwright-report/
           retention-days: 7
 
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v6
+  migration-dry-run:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: test_user
+          POSTGRES_PASSWORD: test_password
+          POSTGRES_DB: test_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: ./coverage/lcov.info
-          flags: unittests
-          name: codecov-umbrella
-          fail_ci_if_error: false
-          verbose: true
+          node-version: "20"
+          cache: npm
+
+      - name: Verify package-lock.json exists
+        run: |
+          if [ ! -f package-lock.json ]; then
+            npm install --package-lock-only --ignore-scripts
+          fi
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Wait for Postgres
+        run: |
+          for i in $(seq 1 30); do
+            pg_isready -h localhost -p 5432 -U test_user && break
+            echo "Waiting for Postgres... attempt $i/30"
+            sleep 1
+          done
+
+      - name: Dry-run pending migrations
+        run: npm run migrate:dry-run
+        env:
+          DATABASE_URL: postgresql://test_user:test_password@localhost:5432/test_db
+          NODE_ENV: test
 
   build:
     runs-on: ubuntu-latest
@@ -223,19 +315,19 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v4
         with:
-          node-version: "24"
+          node-version: "20"
           cache: npm
 
       - name: Verify package-lock.json exists
         run: |
           if [ ! -f package-lock.json ]; then
             echo "⚠️ package-lock.json not found, generating it..."
-            npm install --package-lock-only
+            npm install --package-lock-only --ignore-scripts
           else
             echo "✅ package-lock.json found"
           fi
@@ -245,11 +337,11 @@ jobs:
 
       - name: Build
         run: npm run build
-        continue-on-error: true
+        continue-on-error: false
 
       - name: Check build artifacts
         run: ls -la dist/
-        continue-on-error: true
+        continue-on-error: false
 
   # Docker build job - optional, only runs if secrets are configured
   # To enable: Add REGISTRY_USERNAME and REGISTRY_PASSWORD to repository secrets
@@ -261,7 +353,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4

@@ -1,8 +1,14 @@
 #!/usr/bin/env node
 import { Command } from "commander";
 import { registerAuthCommand } from "./commands/auth";
-import { registerStatusCommand } from "./commands/status";
+import { registerConfigCommand } from "./commands/config";
+import { registerProfileCommand } from "./commands/profile";
 import { registerRetryCommand } from "./commands/retry";
+import { registerStatusCommand } from "./commands/status";
+import { registerDashboardCommand } from "./commands/dashboard";
+import { registerEscrowCommand } from "./commands/escrow";
+import { registerReconcileCommand } from "./commands/reconcile";
+import { printError } from "./dashboard";
 
 const program = new Command("momo-cli")
   .version("1.0.0")
@@ -11,9 +17,14 @@ const program = new Command("momo-cli")
 registerAuthCommand(program);
 registerStatusCommand(program);
 registerRetryCommand(program);
+registerConfigCommand(program);
+registerProfileCommand(program);
+registerDashboardCommand(program);
+registerEscrowCommand(program);
+registerReconcileCommand(program);
 
 program.parseAsync(process.argv).catch((err: unknown) => {
   const msg = err instanceof Error ? err.message : String(err);
-  console.error(`✗ ${msg}`);
+  printError(msg, err instanceof Error ? err : undefined, "ERR_CLI");
   process.exit(1);
 });

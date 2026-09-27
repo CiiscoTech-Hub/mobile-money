@@ -1,9 +1,12 @@
+import logger from "../utils/logger";
 import { Request, Response } from "express";
 import { providerBalanceAlertQueue } from "./providerBalanceAlertQueue";
 import { accountMergeQueue } from "./accountMergeQueue";
 import { getQueueStats } from "./transactionQueue";
 import { redisClient } from "../config/redis";
 import { Queue } from "bullmq";
+import { ERROR_CODES } from "../constants/errorCodes";
+import { createError } from "../middleware/errorHandler";
 
 export interface QueueDepthMetrics {
   queues: {
@@ -55,7 +58,7 @@ export async function getQueueStatsAggregate(): Promise<QueueDepthMetrics> {
   ]);
 
   // Parse Redis memory info
-  const memoryMatch = redisInfo.match(/used_memory:(\d+)/);
+  const memoryMatch = String(redisInfo).match(/used_memory:(\d+)/);
   const redis_memory_bytes = memoryMatch ? parseInt(memoryMatch[1], 10) : 0;
 
   const queues = [
@@ -102,8 +105,14 @@ export async function queueDepthHandler(req: Request, res: Response) {
     const metrics = await getQueueStatsAggregate();
     res.json(metrics);
   } catch (err) {
-    console.error("Failed to fetch queue depth:", err);
-    res.status(500).json({ error: "Failed to fetch queue depth" });
+    logger.error("Failed to fetch queue depth:", err);
+    throw createError(
+      ERROR_CODES.INTERNAL_ERROR,
+      "Failed to fetch queue depth",
+      {
+        error: "Failed to fetch queue depth",
+      },
+    );
   }
 }
 
@@ -147,7 +156,7 @@ export async function queueDepthPrometheusHandler(req: Request, res: Response) {
       .set("Content-Type", "text/plain; version=0.0.4")
       .send(lines.join("\n") + "\n");
   } catch (err) {
-    console.error("Failed to expose queue depth metrics:", err);
+    logger.error("Failed to expose queue depth metrics:", err);
     res.status(500).send("# error fetching queue depth\n");
   }
 }

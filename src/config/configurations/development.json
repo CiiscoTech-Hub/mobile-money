@@ -6,7 +6,10 @@
   "redis": {
     "url": "redis://localhost:6379"
   },
-  "auth": {
+  "logging": {
     "enableSlowQueryLogging": true
+  },
+  "cors": {
+    "allowedOrigins": ["http://localhost:3000"]
   }
 }

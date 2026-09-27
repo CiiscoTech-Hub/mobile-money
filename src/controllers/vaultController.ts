@@ -1,27 +1,49 @@
+import logger from "../utils/logger";
 import { Request, Response } from "express";
 import { z } from "zod";
-import { VaultModel, CreateVaultInput, VaultTransferInput } from "../models/vault";
-import { lockManager, LockKeys } from "../utils/lock";
+import {
+  VaultModel,
+  CreateVaultInput,
+  VaultTransferInput,
+} from "../models/vault";
+import { isLockAcquisitionError, lockManager, LockKeys } from "../utils/lock";
+import { createError } from "../middleware/errorHandler";
+import { ERROR_CODES } from "../constants/errorCodes";
 
 const vaultModel = new VaultModel();
 
 // Validation schemas
 const createVaultSchema = z.object({
-  name: z.string().min(1, "Vault name is required").max(100, "Vault name too long"),
+  name: z
+    .string()
+    .min(1, "Vault name is required")
+    .max(100, "Vault name too long"),
   description: z.string().max(1000, "Description too long").optional(),
-  targetAmount: z.string().regex(/^\d+(\.\d{1,7})?$/, "Invalid target amount").optional(),
+  targetAmount: z
+    .string()
+    .regex(/^\d+(\.\d{1,7})?$/, "Invalid target amount")
+    .optional(),
 });
 
 const transferFundsSchema = z.object({
   amount: z.string().regex(/^\d+(\.\d{1,7})?$/, "Invalid amount format"),
-  type: z.enum(["deposit", "withdraw"], { message: "Type must be deposit or withdraw" }),
+  type: z.enum(["deposit", "withdraw"], {
+    message: "Type must be deposit or withdraw",
+  }),
   description: z.string().max(500, "Description too long").optional(),
 });
 
 const updateVaultSchema = z.object({
-  name: z.string().min(1, "Vault name is required").max(100, "Vault name too long").optional(),
+  name: z
+    .string()
+    .min(1, "Vault name is required")
+    .max(100, "Vault name too long")
+    .optional(),
   description: z.string().max(1000, "Description too long").optional(),
-  targetAmount: z.string().regex(/^\d+(\.\d{1,7})?$/, "Invalid target amount").optional(),
+  targetAmount: z
+    .string()
+    .regex(/^\d+(\.\d{1,7})?$/, "Invalid target amount")
+    .optional(),
   isActive: z.boolean().optional(),
 });
 
@@ -29,18 +51,26 @@ export const createVault = async (req: Request, res: Response) => {
   try {
     const userId = req.jwtUser?.userId || req.user?.id;
     if (!userId) {
-      return res.status(401).json({ error: "Authentication required" });
+      throw createError(
+        ERROR_CODES.INVALID_CREDENTIALS,
+        "Authentication is required",
+        { error: "Authentication required" },
+      );
     }
 
     const validatedData = createVaultSchema.parse(req.body);
 
     // Check for duplicate vault name
-    const existing = await vaultModel.findByUserAndName(userId, validatedData.name);
+    const existing = await vaultModel.findByUserAndName(
+      userId,
+      validatedData.name,
+    );
     if (existing) {
-      return res.status(409).json({ 
-        error: "Vault name already exists",
-        message: "You already have a vault with this name" 
-      });
+      throw createError(
+        ERROR_CODES.CONFLICT,
+        "You already have a vault with this name",
+        { error: "Vault name already exists" },
+      );
     }
 
     const vaultInput: CreateVaultInput = {
@@ -58,17 +88,19 @@ export const createVault = async (req: Request, res: Response) => {
     });
   } catch (error: any) {
     if (error instanceof z.ZodError) {
-      return res.status(400).json({
+      throw createError(ERROR_CODES.INVALID_INPUT, "Validation error", {
         error: "Validation error",
         details: error.issues.map((e: z.ZodIssue) => e.message).join(", "),
       });
     }
 
-    console.error("Create vault error:", error);
-    res.status(500).json({
-      error: "Internal server error",
-      message: error.message || "Failed to create vault",
-    });
+    logger.error("Create vault error:", error);
+
+    throw createError(
+      ERROR_CODES.INTERNAL_ERROR,
+      error.message || "Failed to create vault",
+      { error: "Internal server error" },
+    );
   }
 };
 
@@ -76,7 +108,11 @@ export const getUserVaults = async (req: Request, res: Response) => {
   try {
     const userId = req.jwtUser?.userId || req.user?.id;
     if (!userId) {
-      return res.status(401).json({ error: "Authentication required" });
+      throw createError(
+        ERROR_CODES.INVALID_CREDENTIALS,
+        "Authentication required",
+        { error: "Authentication required" },
+      );
     }
 
     const includeInactive = req.query.includeInactive === "true";
@@ -87,10 +123,10 @@ export const getUserVaults = async (req: Request, res: Response) => {
       data: vaults,
     });
   } catch (error: any) {
-    console.error("Get user vaults error:", error);
-    res.status(500).json({
+    logger.error("Get user vaults error:", error);
+
+    throw createError(ERROR_CODES.INTERNAL_ERROR, "Failed to retrieve vaults", {
       error: "Internal server error",
-      message: "Failed to retrieve vaults",
     });
   }
 };
@@ -99,19 +135,29 @@ export const getVaultById = async (req: Request, res: Response) => {
   try {
     const userId = req.jwtUser?.userId || req.user?.id;
     if (!userId) {
-      return res.status(401).json({ error: "Authentication required" });
+      throw createError(
+        ERROR_CODES.INVALID_CREDENTIALS,
+        "Authentication required",
+        {
+          error: "Authentication required",
+        },
+      );
     }
 
     const { vaultId } = req.params;
     const vault = await vaultModel.findById(vaultId);
 
     if (!vault) {
-      return res.status(404).json({ error: "Vault not found" });
+      throw createError(ERROR_CODES.NOT_FOUND, "Vault not found", {
+        error: "Vault not found",
+      });
     }
 
     // Ensure user owns the vault
     if (vault.userId !== userId) {
-      return res.status(403).json({ error: "Access denied" });
+      throw createError(ERROR_CODES.INSUFFICIENT_PERMISSIONS, "Access denied", {
+        error: "Access denied",
+      });
     }
 
     res.json({
@@ -119,10 +165,9 @@ export const getVaultById = async (req: Request, res: Response) => {
       data: vault,
     });
   } catch (error: any) {
-    console.error("Get vault error:", error);
-    res.status(500).json({
+    logger.error("Get vault error:", error);
+    throw createError(ERROR_CODES.INTERNAL_ERROR, "Failed to retrieve vault", {
       error: "Internal server error",
-      message: "Failed to retrieve vault",
     });
   }
 };
@@ -131,7 +176,13 @@ export const updateVault = async (req: Request, res: Response) => {
   try {
     const userId = req.jwtUser?.userId || req.user?.id;
     if (!userId) {
-      return res.status(401).json({ error: "Authentication required" });
+      throw createError(
+        ERROR_CODES.INVALID_CREDENTIALS,
+        "Authentication required",
+        {
+          error: "Authentication required",
+        },
+      );
     }
 
     const { vaultId } = req.params;
@@ -140,20 +191,30 @@ export const updateVault = async (req: Request, res: Response) => {
     // Check vault exists and user owns it
     const vault = await vaultModel.findById(vaultId);
     if (!vault) {
-      return res.status(404).json({ error: "Vault not found" });
+      throw createError(ERROR_CODES.RESOURCE_NOT_FOUND, "Vault not found", {
+        error: "Vault not found",
+      });
     }
     if (vault.userId !== userId) {
-      return res.status(403).json({ error: "Access denied" });
+      throw createError(ERROR_CODES.INSUFFICIENT_PERMISSIONS, "Access denied", {
+        error: "Access denied",
+      });
     }
 
     // Check for name conflicts if name is being updated
     if (validatedData.name && validatedData.name !== vault.name) {
-      const existing = await vaultModel.findByUserAndName(userId, validatedData.name);
+      const existing = await vaultModel.findByUserAndName(
+        userId,
+        validatedData.name,
+      );
       if (existing) {
-        return res.status(409).json({ 
-          error: "Vault name already exists",
-          message: "You already have a vault with this name" 
-        });
+        throw createError(
+          ERROR_CODES.CONFLICT,
+          "You already have a vault with this name",
+          {
+            error: "Vault name already exists",
+          },
+        );
       }
     }
 
@@ -165,17 +226,20 @@ export const updateVault = async (req: Request, res: Response) => {
     });
   } catch (error: any) {
     if (error instanceof z.ZodError) {
-      return res.status(400).json({
+      throw createError(ERROR_CODES.INVALID_INPUT, "Validation error", {
         error: "Validation error",
         details: error.issues.map((e: z.ZodIssue) => e.message).join(", "),
       });
     }
 
-    console.error("Update vault error:", error);
-    res.status(500).json({
-      error: "Internal server error",
-      message: error.message || "Failed to update vault",
-    });
+    logger.error("Update vault error:", error);
+    throw createError(
+      ERROR_CODES.INTERNAL_ERROR,
+      error.message || "Failed to update vault",
+      {
+        error: "Internal server error",
+      },
+    );
   }
 };
 
@@ -183,7 +247,9 @@ export const deleteVault = async (req: Request, res: Response) => {
   try {
     const userId = req.jwtUser?.userId || req.user?.id;
     if (!userId) {
-      return res.status(401).json({ error: "Authentication required" });
+      throw createError(ERROR_CODES.UNAUTHORIZED, "Authentication required", {
+        error: "Authentication required",
+      });
     }
 
     const { vaultId } = req.params;
@@ -191,18 +257,25 @@ export const deleteVault = async (req: Request, res: Response) => {
     // Check vault exists and user owns it
     const vault = await vaultModel.findById(vaultId);
     if (!vault) {
-      return res.status(404).json({ error: "Vault not found" });
+      throw createError(ERROR_CODES.NOT_FOUND, "Vault not found", {
+        error: "Vault not found",
+      });
     }
     if (vault.userId !== userId) {
-      return res.status(403).json({ error: "Access denied" });
+      throw createError(ERROR_CODES.FORBIDDEN, "Access denied", {
+        error: "Access denied",
+      });
     }
 
     const deleted = await vaultModel.delete(vaultId);
     if (!deleted) {
-      return res.status(400).json({ 
-        error: "Cannot delete vault",
-        message: "Vault may have a non-zero balance" 
-      });
+      throw createError(
+        ERROR_CODES.INSUFFICIENT_BALANCE,
+        "Vault may have a non-zero balance",
+        {
+          error: "Cannot delete vault",
+        },
+      );
     }
 
     res.json({
@@ -210,11 +283,14 @@ export const deleteVault = async (req: Request, res: Response) => {
       message: "Vault deleted successfully",
     });
   } catch (error: any) {
-    console.error("Delete vault error:", error);
-    res.status(500).json({
-      error: "Internal server error",
-      message: error.message || "Failed to delete vault",
-    });
+    logger.error("Delete vault error:", error);
+    throw createError(
+      ERROR_CODES.INTERNAL_ERROR,
+      error.message || "Failed to delete vault",
+      {
+        error: "Internal server error",
+      },
+    );
   }
 };
 
@@ -222,7 +298,9 @@ export const transferFunds = async (req: Request, res: Response) => {
   try {
     const userId = req.jwtUser?.userId || req.user?.id;
     if (!userId) {
-      return res.status(401).json({ error: "Authentication required" });
+      throw createError(ERROR_CODES.INTERNAL_ERROR, "Authentication required", {
+        error: "Authentication required",
+      });
     }
 
     const { vaultId } = req.params;
@@ -231,33 +309,44 @@ export const transferFunds = async (req: Request, res: Response) => {
     // Validate amount
     const amount = parseFloat(validatedData.amount);
     if (amount <= 0) {
-      return res.status(400).json({ 
-        error: "Invalid amount",
-        message: "Amount must be greater than 0" 
-      });
+      throw createError(
+        ERROR_CODES.INSUFFICIENT_FUNDS,
+        "Amount must be greater than 0",
+        {
+          error: "Invalid amount",
+        },
+      );
     }
 
     // Check vault exists and user owns it
     const vault = await vaultModel.findById(vaultId);
     if (!vault) {
-      return res.status(404).json({ error: "Vault not found" });
+      throw createError(ERROR_CODES.NOT_FOUND, "Vault not found", {
+        error: "Vault not found",
+      });
     }
     if (vault.userId !== userId) {
-      return res.status(403).json({ error: "Access denied" });
+      throw createError(ERROR_CODES.FORBIDDEN, "Access denied", {
+        error: "Access denied",
+      });
     }
 
     // Use distributed lock to prevent race conditions
-    const lockKey = `vault-transfer:${userId}:${vaultId}`;
-    
-    const result = await lockManager.withLock(lockKey, async () => {
-      return await vaultModel.transferFunds(
-        userId,
-        vaultId,
-        validatedData.amount,
-        validatedData.type,
-        validatedData.description,
-      );
-    }, 10000); // 10 second lock
+    const lockKey = LockKeys.vaultTransfer(userId, vaultId);
+
+    const result = await lockManager.withLock(
+      lockKey,
+      async () => {
+        return await vaultModel.transferFunds(
+          userId,
+          vaultId,
+          validatedData.amount,
+          validatedData.type,
+          validatedData.description,
+        );
+      },
+      10000,
+    ); // 10 second lock
 
     res.json({
       success: true,
@@ -268,25 +357,46 @@ export const transferFunds = async (req: Request, res: Response) => {
     });
   } catch (error: any) {
     if (error instanceof z.ZodError) {
-      return res.status(400).json({
+      throw createError(ERROR_CODES.INVALID_INPUT, "Access denied", {
         error: "Validation error",
         details: error.issues.map((e: z.ZodIssue) => e.message).join(", "),
       });
     }
 
-    console.error("Transfer funds error:", error);
-    
-    if (error.message.includes("Insufficient")) {
-      return res.status(400).json({
-        error: "Insufficient funds",
-        message: error.message,
-      });
+    logger.error("Transfer funds error:", error);
+
+    if (isLockAcquisitionError(error)) {
+      if (error.isContention) {
+        throw createError(
+          ERROR_CODES.CONFLICT,
+          "Vault transfer already in progress",
+          {
+            error: "Vault transfer already in progress",
+          },
+        );
+      }
+
+      throw createError(
+        ERROR_CODES.SERVICE_UNAVAILABLE,
+        "Vault transfer lock service unavailable",
+        {
+          error: "Vault transfer lock service unavailable",
+        },
+      );
     }
 
-    res.status(500).json({
-      error: "Internal server error",
-      message: error.message || "Failed to transfer funds",
-    });
+    if (error.message.includes("Insufficient")) {
+      throw createError(ERROR_CODES.INSUFFICIENT_FUNDS, error.message, {
+        error: "Insufficient funds",
+      });
+    }
+    throw createError(
+      ERROR_CODES.INTERNAL_ERROR,
+      error.message || "Failed to transfer funds",
+      {
+        error: "Internal server error",
+      },
+    );
   }
 };
 
@@ -294,7 +404,13 @@ export const getVaultTransactions = async (req: Request, res: Response) => {
   try {
     const userId = req.jwtUser?.userId || req.user?.id;
     if (!userId) {
-      return res.status(401).json({ error: "Authentication required" });
+      throw createError(
+        ERROR_CODES.INVALID_CREDENTIALS,
+        "Authentication required",
+        {
+          error: "Authentication required",
+        },
+      );
     }
 
     const { vaultId } = req.params;
@@ -304,13 +420,21 @@ export const getVaultTransactions = async (req: Request, res: Response) => {
     // Check vault exists and user owns it
     const vault = await vaultModel.findById(vaultId);
     if (!vault) {
-      return res.status(404).json({ error: "Vault not found" });
+      throw createError(ERROR_CODES.RESOURCE_NOT_FOUND, "Vault not found", {
+        error: "Vault not found",
+      });
     }
     if (vault.userId !== userId) {
-      return res.status(403).json({ error: "Access denied" });
+      throw createError(ERROR_CODES.FORBIDDEN, "Access denied", {
+        error: "Access denied",
+      });
     }
 
-    const transactions = await vaultModel.getVaultTransactions(vaultId, limit, offset);
+    const transactions = await vaultModel.getVaultTransactions(
+      vaultId,
+      limit,
+      offset,
+    );
 
     res.json({
       success: true,
@@ -322,11 +446,14 @@ export const getVaultTransactions = async (req: Request, res: Response) => {
       },
     });
   } catch (error: any) {
-    console.error("Get vault transactions error:", error);
-    res.status(500).json({
-      error: "Internal server error",
-      message: "Failed to retrieve vault transactions",
-    });
+    logger.error("Get vault transactions error:", error);
+    throw createError(
+      ERROR_CODES.INTERNAL_ERROR,
+      "Failed to retrieve vault transactions",
+      {
+        error: "Internal server error",
+      },
+    );
   }
 };
 
@@ -334,7 +461,13 @@ export const getUserBalanceSummary = async (req: Request, res: Response) => {
   try {
     const userId = req.jwtUser?.userId || req.user?.id;
     if (!userId) {
-      return res.status(401).json({ error: "Authentication required" });
+      throw createError(
+        ERROR_CODES.INVALID_CREDENTIALS,
+        "Authentication required",
+        {
+          error: "Authentication required",
+        },
+      );
     }
 
     const summary = await vaultModel.getUserBalanceSummary(userId);
@@ -344,10 +477,13 @@ export const getUserBalanceSummary = async (req: Request, res: Response) => {
       data: summary,
     });
   } catch (error: any) {
-    console.error("Get balance summary error:", error);
-    res.status(500).json({
-      error: "Internal server error",
-      message: "Failed to retrieve balance summary",
-    });
+    logger.error("Get balance summary error:", error);
+    throw createError(
+      ERROR_CODES.INTERNAL_ERROR,
+      "Failed to retrieve balance summary",
+      {
+        error: "INternal server error",
+      },
+    );
   }
 };

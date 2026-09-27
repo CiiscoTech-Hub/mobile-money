@@ -24,7 +24,21 @@ export interface AccountMergeJobResult {
 export const accountMergeQueue = new Queue<
   AccountMergeJobData,
   AccountMergeJobResult
->(ACCOUNT_MERGE_QUEUE_NAME, queueOptions);
+>(ACCOUNT_MERGE_QUEUE_NAME, {
+  ...queueOptions,
+  defaultJobOptions: {
+    ...queueOptions.defaultJobOptions,
+    // Retention: clean up completed/failed job records to bound Redis memory
+    removeOnComplete: {
+      count: 100,
+      age: 7 * 24 * 3600, // 7 days
+    },
+    removeOnFail: {
+      count: 200,
+      age: 30 * 24 * 3600, // 30 days
+    },
+  },
+});
 
 export async function addAccountMergeJob(
   data: AccountMergeJobData,
@@ -52,7 +66,7 @@ export async function addBatchAccountMergeJobs(
     addAccountMergeJob(data, {
       ...options,
       jobId: `account-merge-batch-${Date.now()}-${index}`,
-    })
+    }),
   );
   return await Promise.all(jobPromises);
 }

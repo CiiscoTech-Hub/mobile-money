@@ -1,34 +1,46 @@
+import logger from "../utils/logger";
 import { NextFunction, Request, Response } from "express";
 import { z } from "zod";
 import { StellarService } from "../services/stellar/stellarService";
 import { MobileMoneyService } from "../services/mobilemoney/mobileMoneyService";
 import { maskPhoneNumber } from "../utils/masking";
 import { validatePhoneProviderMatch } from "../utils/phoneUtils";
+import { VALID_STATUSES } from "../utils/transactionFilters";
 import {
   Transaction,
   TransactionModel,
   TransactionStatus,
+  TransactionListFilters,
 } from "../models/transaction";
 import { lockManager, LockKeys } from "../utils/lock";
-import { TransactionLimitService } from "../services/transactionLimit/transactionLimitService";
-import { KYCService } from "../services/kyc/kycService";
 import {
   MobileMoneyProvider,
   validateProviderLimits,
 } from "../config/providers";
 import type { TransactionJobData } from "../queue/transactionQueue";
 import { amlService } from "../services/aml";
+import {
+  generateFlaggedTransactionComplianceReport,
+  generateHighValueTransactionComplianceReport,
+} from "../services/complianceReportService";
 import { twoFactorWithdrawalService } from "../services/twoFactorWithdrawalService";
+import { totpService } from "../services/auth/totp";
 import {
   CancelTransactionResponse,
-  LimitExceededErrorResponse,
   PhoneSearchResponse,
   TransactionDetailResponse,
   TransactionResponse,
 } from "../types/api";
-import { checkDestinationTrustline, TrustlineError } from "../stellar/trustlines";
+import {
+  checkDestinationTrustline,
+  TrustlineError,
+} from "../stellar/trustlines";
 import { getConfiguredPaymentAsset } from "../services/stellar/assetService";
 import { ERROR_CODES } from "../constants/errorCodes";
+import { travelRuleService } from "../compliance/travelRule";
+import { createError } from "../middleware/errorHandler";
+import { sep08Service } from "../services/compliance/sep08";
+import { validateMemo } from "../utils/stellarValidators";
 
 const IDEMPOTENCY_TTL_HOURS = Number(
   process.env.IDEMPOTENCY_KEY_TTL_HOURS || 24,
@@ -44,11 +56,6 @@ const stellarService = new StellarService();
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 const mobileMoneyService = new MobileMoneyService();
 const transactionModel = new TransactionModel();
-const kycService = new KYCService();
-const transactionLimitService = new TransactionLimitService(
-  kycService,
-  transactionModel,
-);
 
 async function addTransactionJob(
   data: TransactionJobData,
@@ -59,12 +66,12 @@ async function addTransactionJob(
     jobId?: string;
   },
 ) {
-  const queue = await import("../queue/transactionQueue");
+  const queue = require("../queue/transactionQueue.js");
   return queue.addTransactionJob(data, options);
 }
 
 async function getJobProgress(jobId: string) {
-  const queue = await import("../queue/transactionQueue");
+  const queue = require("../queue/transactionQueue.js");
   return queue.getJobProgress(jobId);
 }
 
@@ -84,8 +91,12 @@ export const transactionSchema = z.object({
     .string()
     .max(256, { message: "Note cannot exceed 256 characters" })
     .optional(),
+  memoType: z.enum(["text", "id", "hash", "none"]).optional(),
+  memoValue: z.union([z.string(), z.number()]).optional(),
+  requireMemo: z.boolean().optional(),
   // Optional 2FA fields for withdrawals
   twoFactorToken: z.string().optional(),
+  totpCode: z.string().optional(),
   backupCode: z.string().optional(),
 });
 
@@ -95,12 +106,39 @@ export const validateTransaction = (
   next: NextFunction,
 ) => {
   try {
-    transactionSchema.parse(req.body);
+    const parsedBody = transactionSchema.parse(req.body);
+
+    const memoRes = validateMemo(parsedBody.memoType, parsedBody.memoValue);
+    if (!memoRes.valid) {
+      throw createError(
+        ERROR_CODES.INVALID_INPUT,
+        memoRes.error || "Invalid memo structure",
+        { error: memoRes.error },
+      );
+    }
+
+    if (parsedBody.requireMemo) {
+      if (
+        !parsedBody.memoType ||
+        parsedBody.memoType === "none" ||
+        parsedBody.memoValue === undefined ||
+        parsedBody.memoValue === null ||
+        parsedBody.memoValue === ""
+      ) {
+        throw createError(
+          ERROR_CODES.INVALID_INPUT,
+          "Payments without memos are rejected because destination account requires memo mapping",
+          { error: "Missing required memo" },
+        );
+      }
+    }
+
     next();
   } catch (err: any) {
+    if (err && (err as any).code) throw err;
     const message =
       err.errors?.map((e: any) => e.message).join(", ") || "Invalid input";
-    return res.status(400).json({ error: message });
+    throw createError(ERROR_CODES.MISSING_FIELD, message, { error: message });
   }
 };
 
@@ -134,9 +172,11 @@ export const getTransactionHistoryHandler = async (
 
     // Date Validation
     if (!isValidISO(startDate) || !isValidISO(endDate)) {
-      return res.status(400).json({
-        error: "Invalid date format. Please use ISO 8601 (YYYY-MM-DD)",
-      });
+      throw createError(
+        ERROR_CODES.INVALID_INPUT,
+        "Invalid date format. Please use ISO 8601 (YYYY-MM-DD)",
+        { error: "Invalid date format. Please use ISO 8601 (YYYY-MM-DD)" },
+      );
     }
 
     if (
@@ -144,9 +184,11 @@ export const getTransactionHistoryHandler = async (
       endDate &&
       new Date(startDate as string) > new Date(endDate as string)
     ) {
-      return res
-        .status(400)
-        .json({ error: "startDate cannot be greater than endDate" });
+      throw createError(
+        ERROR_CODES.INVALID_INPUT,
+        "startDate cannot be greater than endDate",
+        { error: "startDate cannot be greater than endDate" },
+      );
     }
 
     // Pagination Parsing
@@ -170,7 +212,7 @@ export const getTransactionHistoryHandler = async (
     // Database Queries
     // If using cursor-based pagination, fetch limit+1 items to determine `hasMore`.
     let transactions = [] as any[];
-    let total = 0 as number | undefined;
+    let total: number | undefined;
 
     if (before || after) {
       const rows = await transactionModel.list(
@@ -179,7 +221,10 @@ export const getTransactionHistoryHandler = async (
         startDate as string | undefined,
         endDate as string | undefined,
         filters,
-        { before: before as string | undefined, after: after as string | undefined },
+        {
+          before: before as string | undefined,
+          after: after as string | undefined,
+        },
       );
 
       // If 'before' was used we fetched ascending results; reverse to keep newest-first
@@ -194,44 +239,57 @@ export const getTransactionHistoryHandler = async (
         data: transactions,
         pagination: {
           limit: limitNum,
-          before: transactions.length ? Buffer.from(`${transactions[0].createdAt.toISOString()}|${transactions[0].id}`).toString('base64') : null,
-          after: transactions.length ? Buffer.from(`${transactions[transactions.length - 1].createdAt.toISOString()}|${transactions[transactions.length - 1].id}`).toString('base64') : null,
+          before: transactions.length
+            ? Buffer.from(
+                `${transactions[0].createdAt.toISOString()}|${transactions[0].id}`,
+              ).toString("base64")
+            : null,
+          after: transactions.length
+            ? Buffer.from(
+                `${transactions[transactions.length - 1].createdAt.toISOString()}|${transactions[transactions.length - 1].id}`,
+              ).toString("base64")
+            : null,
           hasMore,
         },
       });
     }
 
-    // Legacy offset-based pagination
-    [transactions, total] = await Promise.all([
-      transactionModel.list(
-        limitNum,
-        offsetNum,
+    const rows = await transactionModel.list(
+      limitNum + 1,
+      offsetNum,
+      startDate as string | undefined,
+      endDate as string | undefined,
+      filters,
+    );
+    const hasMore = rows.length > limitNum;
+    transactions = rows.slice(0, limitNum);
+
+    if (offsetNum === 0) {
+      total = await transactionModel.count(
         startDate as string | undefined,
         endDate as string | undefined,
         filters,
-      ),
-      transactionModel.count(
-        startDate as string | undefined,
-        endDate as string | undefined,
-        filters,
-      ),
-    ] as const);
+      );
+    }
 
     // Response
     return res.json({
       data: transactions,
       pagination: {
-        total,
+        total: total ?? null,
         limit: limitNum,
         offset: offsetNum,
-        hasMore: offsetNum + limitNum < total,
+        hasMore,
       },
     });
-  } catch (error) {
-    console.error("History Fetch Error:", error);
-    return res
-      .status(500)
-      .json({ error: "Failed to fetch transaction history from database" });
+  } catch (error: any) {
+    if (error.code) throw error;
+    logger.error("History Fetch Error:", error);
+    throw createError(
+      ERROR_CODES.INTERNAL_ERROR,
+      error instanceof Error ? error.message : "Unknown error",
+      { error: "Failed to fetch transaction history from database" },
+    );
   }
 };
 
@@ -277,6 +335,71 @@ function buildTransactionResponse(
   };
 }
 
+async function applyPreDispatchAMLProfile(
+  transaction: Transaction,
+): Promise<void> {
+  if (!transaction.userId) return;
+
+  const amount = Number(transaction.amount);
+  if (!Number.isFinite(amount) || amount < 0) return;
+
+  try {
+    const result = await amlService.profileTransaction({
+      id: transaction.id,
+      userId: transaction.userId,
+      type: transaction.type as import("../services/aml").AMLTransactionType,
+      amount,
+      createdAt:
+        transaction.createdAt instanceof Date
+          ? transaction.createdAt
+          : new Date(transaction.createdAt),
+      status: transaction.status,
+      currency: transaction.currency,
+      originalAmount:
+        transaction.originalAmount !== undefined &&
+        transaction.originalAmount !== null
+          ? Number(transaction.originalAmount)
+          : Number(transaction.amount),
+      convertedAmount:
+        transaction.convertedAmount !== undefined &&
+        transaction.convertedAmount !== null
+          ? Number(transaction.convertedAmount)
+          : null,
+      locationMetadata: transaction.locationMetadata ?? null,
+    });
+
+    if (!result.flagged) {
+      return;
+    }
+
+    await Promise.all([
+      transactionModel.addTags(transaction.id, ["aml-flagged", "aml-review"]),
+      transactionModel.patchMetadata(transaction.id, {
+        amlProfile: {
+          riskScore: result.riskScore,
+          scoreThreshold: result.scoreThreshold,
+          recommendedAction: result.recommendedAction,
+          reasons: result.reasons,
+          profile: result.profile ?? null,
+          flaggedAt: new Date().toISOString(),
+        },
+      }),
+      transactionModel.updateAdminNotes(
+        transaction.id,
+        `[AML-PROFILE:${result.riskScore}/${result.scoreThreshold}] ${result.reasons.join(" | ")}`.slice(
+          0,
+          1000,
+        ),
+      ),
+    ]);
+  } catch (error) {
+    console.error(
+      `Pre-dispatch AML profiling failed for transaction ${transaction.id}:`,
+      error,
+    );
+  }
+}
+
 async function monitorTransactionForAML(
   transaction: Transaction,
 ): Promise<void> {
@@ -289,13 +412,25 @@ async function monitorTransactionForAML(
     const result = await amlService.monitorTransaction({
       id: transaction.id,
       userId: transaction.userId,
-      type: transaction.type,
+      type: transaction.type as import("../services/aml").AMLTransactionType,
       amount,
       createdAt:
         transaction.createdAt instanceof Date
           ? transaction.createdAt
           : new Date(transaction.createdAt),
       status: transaction.status,
+      currency: transaction.currency,
+      originalAmount:
+        transaction.originalAmount !== undefined &&
+        transaction.originalAmount !== null
+          ? Number(transaction.originalAmount)
+          : Number(transaction.amount),
+      convertedAmount:
+        transaction.convertedAmount !== undefined &&
+        transaction.convertedAmount !== null
+          ? Number(transaction.convertedAmount)
+          : null,
+      locationMetadata: transaction.locationMetadata ?? null,
     });
 
     if (!result.flagged || !result.alert) {
@@ -323,8 +458,66 @@ async function monitorTransactionForAML(
         ),
       ),
     ]);
+
+    try {
+      const highValueAssessment = amlService.isHighValueAlert(
+        {
+          id: transaction.id,
+          userId: transaction.userId,
+          type: transaction.type as import("../services/aml").AMLTransactionType,
+          amount,
+          createdAt:
+            transaction.createdAt instanceof Date
+              ? transaction.createdAt
+              : new Date(transaction.createdAt),
+          status: transaction.status,
+          currency: transaction.currency,
+          originalAmount:
+            transaction.originalAmount !== undefined &&
+            transaction.originalAmount !== null
+              ? Number(transaction.originalAmount)
+              : Number(transaction.amount),
+          convertedAmount:
+            transaction.convertedAmount !== undefined &&
+            transaction.convertedAmount !== null
+              ? Number(transaction.convertedAmount)
+              : null,
+          locationMetadata: transaction.locationMetadata ?? null,
+        },
+        result.alert,
+      );
+
+      const report = highValueAssessment
+        ? await generateHighValueTransactionComplianceReport(
+            transaction,
+            result.alert,
+            highValueAssessment,
+          )
+        : await generateFlaggedTransactionComplianceReport(
+            transaction,
+            result.alert,
+          );
+
+      await transactionModel.patchMetadata(transaction.id, {
+        complianceReport: {
+          pdfUrl: report.pdfUrl,
+          storageKey: report.storageKey ?? null,
+          template: report.template,
+          source: report.source,
+          templateVersion: report.templateVersion,
+          generatedAt: new Date().toISOString(),
+          thresholdUsd: highValueAssessment?.thresholdUsd,
+          usdEquivalent: highValueAssessment?.usdEquivalent,
+        },
+      });
+    } catch (error) {
+      logger.error(
+        `Failed to generate compliance report PDF for transaction ${transaction.id}:`,
+        error,
+      );
+    }
   } catch (error) {
-    console.error(
+    logger.error(
       `AML monitoring failed for transaction ${transaction.id}:`,
       error,
     );
@@ -352,14 +545,14 @@ async function applyTravelRule(transaction: Transaction): Promise<void> {
       amount,
       currency: transaction.currency ?? "USD",
       sender: {
-        name: transaction.metadata?.senderName as string ?? "Unknown",
+        name: (transaction.metadata?.senderName as string) ?? "Unknown",
         account: transaction.phoneNumber,
         address: transaction.metadata?.senderAddress as string | undefined,
         dob: transaction.metadata?.senderDob as string | undefined,
         idNumber: transaction.metadata?.senderIdNumber as string | undefined,
       },
       receiver: {
-        name: transaction.metadata?.receiverName as string ?? "Unknown",
+        name: (transaction.metadata?.receiverName as string) ?? "Unknown",
         account: transaction.stellarAddress,
         address: transaction.metadata?.receiverAddress as string | undefined,
       },
@@ -369,8 +562,85 @@ async function applyTravelRule(transaction: Transaction): Promise<void> {
     await transactionModel.addTags(transaction.id, ["travel-rule-captured"]);
   } catch (error) {
     // Non-fatal — log and continue; compliance team can back-fill
-    console.error(
+    logger.error(
       `[travel-rule] capture failed for transaction ${transaction.id}:`,
+      error instanceof Error ? error.message : error,
+    );
+  }
+}
+
+/**
+ * Applies SEP-08 regulated asset compliance verification for deposit transactions.
+ * Verifies approval status before ledger submission per SEP-08 specification.
+ * Rejects transactions if verification returns failed status.
+ */
+async function applySEP08Verification(transaction: Transaction): Promise<void> {
+  if (transaction.type !== "deposit") return;
+
+  try {
+    const paymentAsset = getConfiguredPaymentAsset();
+    const verificationResult = await sep08Service.verifyDepositApproval(
+      transaction,
+      paymentAsset.code,
+    );
+
+    if (verificationResult.status === "failed") {
+      await transactionModel.updateStatus(
+        transaction.id,
+        TransactionStatus.Failed,
+      );
+      await transactionModel.addTags(transaction.id, ["sep08-rejected"]);
+      await transactionModel.updateAdminNotes(
+        transaction.id,
+        `[SEP-08 REJECTED] ${verificationResult.message}`,
+      );
+
+      throw createError(ERROR_CODES.COMPLIANCE_REQUIRED, null, {
+        error:
+          verificationResult.message || "SEP-08 compliance verification failed",
+        code: "SEP08_VERIFICATION_FAILED",
+        details: {
+          transactionId: transaction.id,
+          approvalServer: verificationResult.approvalServer,
+        },
+      });
+    }
+
+    if (verificationResult.status === "pending") {
+      await transactionModel.updateStatus(
+        transaction.id,
+        TransactionStatus.Failed,
+      );
+      await transactionModel.addTags(transaction.id, ["sep08-pending"]);
+      await transactionModel.updateAdminNotes(
+        transaction.id,
+        `[SEP-08 PENDING] ${verificationResult.message}`,
+      );
+
+      throw createError(ERROR_CODES.COMPLIANCE_REQUIRED, null, {
+        error: verificationResult.message || "SEP-08 approval pending",
+        code: "SEP08_APPROVAL_PENDING",
+        details: {
+          transactionId: transaction.id,
+          approvalServer: verificationResult.approvalServer,
+        },
+      });
+    }
+
+    // Verification successful - tag transaction and continue
+    await transactionModel.addTags(transaction.id, ["sep08-verified"]);
+    logger.info("[sep08] Verification passed for transaction", {
+      transactionId: transaction.id,
+    });
+  } catch (error) {
+    // If it's already a createError from our verification, re-throw it
+    if (error && typeof error === "object" && "code" in error) {
+      throw error;
+    }
+
+    // Log unexpected errors but don't fail the transaction if SEP-08 is not configured
+    logger.error(
+      `[sep08] verification error for transaction ${transaction.id}:`,
       error instanceof Error ? error.message : error,
     );
   }
@@ -402,20 +672,21 @@ async function processTransactionRequest(
       req.body.provider = req.body.provider.toLowerCase();
     }
 
-    const { amount, phoneNumber, provider, stellarAddress, userId, notes } =
-      req.body;
+    const { amount, phoneNumber, provider, stellarAddress, notes } = req.body;
 
     const requestAmount = getRequestAmount(amount);
     if (!Number.isFinite(requestAmount) || requestAmount <= 0) {
-      return res
-        .status(400)
-        .json({ error: "Amount must be a positive number" });
+      throw createError(
+        ERROR_CODES.INVALID_AMOUNT,
+        "Amount must be a positive number",
+        { error: "Amount must be a positive number" },
+      );
     }
 
     // Recipient Mobile Network Validation
     const networkMatch = validatePhoneProviderMatch(phoneNumber, provider);
     if (!networkMatch.valid) {
-      return res.status(400).json({
+      throw createError(ERROR_CODES.INVALID_INPUT, "Invalid Network Provider", {
         error: networkMatch.error,
         code: "INVALID_NETWORK_FOR_PROVIDER",
       });
@@ -431,57 +702,50 @@ async function processTransactionRequest(
       return res.status(400).json({ error: providerLimitCheck.error });
     }
 
-    const limitCheck = await transactionLimitService.checkTransactionLimit(
-      userId,
-      requestAmount,
-    );
-
-    if (!limitCheck.allowed) {
-      const body: LimitExceededErrorResponse = {
-        code: "TRANSACTION_LIMIT_EXCEEDED",
-        message: limitCheck.message || "Transaction limit exceeded",
-        message_en: "Transaction limit exceeded",
-        timestamp: new Date().toISOString(),
-        details: {
-          kycLevel: limitCheck.kycLevel,
-          dailyLimit: limitCheck.dailyLimit,
-          currentDailyTotal: limitCheck.currentDailyTotal,
-          remainingLimit: limitCheck.remainingLimit,
-          message: limitCheck.message,
-          upgradeAvailable: limitCheck.upgradeAvailable,
-        },
-      };
-
-      return res.status(400).json(body);
+    const userId = req.jwtUser?.userId;
+    if (!userId) {
+      return res.status(401).json({ error: "Unauthorized" });
     }
 
     // Check mandatory 2FA for withdrawals
     if (type === "withdraw") {
-      const requires2FA = await twoFactorWithdrawalService.requires2FAForWithdrawal(userId);
+      const requires2FA =
+        await twoFactorWithdrawalService.requires2FAForWithdrawal(userId);
       if (requires2FA) {
-        const twoFactorToken = req.body.twoFactorToken || req.headers['x-2fa-token'] as string;
+        const twoFactorToken =
+          req.body.totpCode ||
+          req.body.twoFactorToken ||
+          (req.headers["x-totp-code"] as string) ||
+          (req.headers["x-2fa-token"] as string);
         const backupCode = req.body.backupCode;
 
         if (!twoFactorToken && !backupCode) {
-          return res.status(400).json({
-            error: "2FA verification required for withdrawal",
-            code: "TWO_FACTOR_REQUIRED",
-            message: "This account requires 2FA verification for all withdrawals. Please provide a TOTP token or backup code."
-          });
+          throw createError(
+            ERROR_CODES.INVALID_INPUT,
+            "This account requires 2FA verification for all withdrawals. Please provide a TOTP token or backup code.",
+            {
+              code: "TWO_FACTOR_REQUIRED",
+              error: "2FA verification required for withdrawal",
+            },
+          );
         }
 
-        const verificationResult = await twoFactorWithdrawalService.verifyWithdrawal2FA({
-          userId,
-          token: twoFactorToken,
-          backupCode
-        });
+        const verificationResult =
+          await twoFactorWithdrawalService.verifyWithdrawal2FA({
+            userId,
+            token: twoFactorToken,
+            backupCode,
+          });
 
         if (!verificationResult.success) {
-          return res.status(401).json({
-            error: "2FA verification failed",
-            code: "TWO_FACTOR_INVALID",
-            message: verificationResult.error || "Invalid 2FA token or backup code"
-          });
+          throw createError(
+            ERROR_CODES.INVALID_INPUT,
+            verificationResult.error || "Invalid 2FA token or backup code",
+            {
+              error: "2FA verification failed",
+              code: "TWO_FACTOR_INVALID",
+            },
+          );
         }
       }
     }
@@ -494,13 +758,15 @@ async function processTransactionRequest(
         await checkDestinationTrustline(stellarAddress, paymentAsset);
       } catch (err) {
         if (err instanceof TrustlineError) {
-          return res.status(400).json({
+          throw createError(ERROR_CODES.TRUSTLINE_MISSING, null, {
             error: err.message,
-            code: ERROR_CODES.TRUSTLINE_MISSING,
           });
         }
         // Unexpected Horizon error — surface as 502 so callers can retry
-        return res.status(502).json({ error: "Failed to verify destination trustline" });
+
+        throw createError(ERROR_CODES.SERVICE_UNAVAILABLE, null, {
+          error: "Failed to verify destination trustline",
+        });
       }
     }
 
@@ -539,10 +805,16 @@ async function processTransactionRequest(
               idempotencyExpiresAt: idempotencyKey
                 ? buildIdempotencyExpiry()
                 : null,
-              locationMetadata: (req as any).geoLocation ?? null,
+              locationMetadata: (req.geoLocation as
+                | Record<string, unknown>
+                | null
+                | undefined) ?? null,
             });
+
+            await applyPreDispatchAMLProfile(transaction);
             void monitorTransactionForAML(transaction);
             void applyTravelRule(transaction);
+            await applySEP08Verification(transaction);
 
             const job = await addTransactionJob(
               {
@@ -590,23 +862,30 @@ async function processTransactionRequest(
 
     return res.status(200).json(result);
   } catch (error) {
+    if (error && typeof error === "object" && "code" in error) {
+      throw error;
+    }
+
     if (
       error instanceof Error &&
       error.message.includes("Idempotency-Key must be")
     ) {
-      return res.status(400).json({ error: error.message });
+      throw createError(ERROR_CODES.INVALID_INPUT, null, {
+        error: error.message,
+      });
     }
 
     if (
       error instanceof Error &&
       error.message.includes("Unable to acquire lock")
     ) {
-      return res.status(409).json({
+      throw createError(ERROR_CODES.TRANSACTION_EXISTS, null, {
         error: "Transaction already in progress for this resource",
       });
     }
-
-    return res.status(500).json({ error: "Transaction failed" });
+    throw createError(ERROR_CODES.INTERNAL_ERROR, null, {
+      error: "Transaction failed",
+    });
   }
 }
 
@@ -621,15 +900,21 @@ export const withdrawHandler = async (req: Request, res: Response) => {
 export const getTransactionHandler = async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
-    const transaction = await transactionModel.findById(id);
+    let transaction = await transactionModel.findById(id);
+
+    if (!transaction && typeof id === "string" && id.trim()) {
+      transaction = await transactionModel.findByReferenceNumber(id.trim());
+    }
 
     if (!transaction) {
-      return res.status(404).json({ error: "Transaction not found" });
+      throw createError(ERROR_CODES.NOT_FOUND, null, {
+        error: "Transaction not found",
+      });
     }
 
     let jobProgress = null;
     if (transaction.status === TransactionStatus.Pending) {
-      jobProgress = await getJobProgress(id);
+      jobProgress = await getJobProgress(transaction.id);
     }
 
     if (transaction.status === TransactionStatus.Pending) {
@@ -658,22 +943,39 @@ export const getTransactionHandler = async (req: Request, res: Response) => {
 
     return res.json(body);
   } catch (err) {
-    console.error("Failed to fetch transaction:", err);
-    return res.status(500).json({ error: "Failed to fetch transaction" });
+    if (err && (err as any).code) throw err;
+    logger.error("Failed to fetch transaction:", err);
+    throw createError(
+      ERROR_CODES.INTERNAL_ERROR,
+      "Failed to fetch transaction",
+      {
+        error: "Failed to fetch transaction",
+      },
+    );
   }
 };
 
 export const cancelTransactionHandler = async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
+    const userId = req.jwtUser?.userId;
 
-    const transaction = await transactionModel.findById(id);
+    if (!userId) {
+      return res.status(401).json({
+        error: "Unauthorized",
+        message: "Valid token required",
+      });
+    }
+
+    const transaction = await transactionModel.findById(id, userId);
     if (!transaction) {
-      return res.status(404).json({ error: "Transaction not found" });
+      throw createError(ERROR_CODES.NOT_FOUND, null, {
+        error: "Transaction not found",
+      });
     }
 
     if (transaction.status !== TransactionStatus.Pending) {
-      return res.status(400).json({
+      throw createError(ERROR_CODES.INVALID_INPUT, null, {
         error: `Cannot cancel transaction with status '${transaction.status}'`,
       });
     }
@@ -682,9 +984,9 @@ export const cancelTransactionHandler = async (req: Request, res: Response) => {
     const updatedTransaction = await transactionModel.findById(id);
 
     if (!updatedTransaction) {
-      return res
-        .status(500)
-        .json({ error: "Failed to load transaction after cancel" });
+      throw createError(ERROR_CODES.INTERNAL_ERROR, null, {
+        error: "Failed to load transaction after cancel",
+      });
     }
 
     if (process.env.WEBHOOK_URL) {
@@ -698,7 +1000,7 @@ export const cancelTransactionHandler = async (req: Request, res: Response) => {
           }),
         });
       } catch (webhookError) {
-        console.error("Webhook notification failed", webhookError);
+        logger.error("Webhook notification failed", webhookError);
       }
     }
 
@@ -709,8 +1011,9 @@ export const cancelTransactionHandler = async (req: Request, res: Response) => {
 
     return res.json(body);
   } catch (err) {
-    console.error("Failed to cancel transaction:", err);
-    return res.status(500).json({
+    if (err && (err as any).code) throw err;
+    logger.error("Failed to cancel transaction:", err);
+    throw createError(ERROR_CODES.INTERNAL_ERROR, null, {
       error: "Failed to cancel transaction",
     });
   }
@@ -722,23 +1025,32 @@ export const updateNotesHandler = async (req: Request, res: Response) => {
     const { notes } = req.body;
 
     if (typeof notes !== "string") {
-      return res.status(400).json({ error: "Notes must be a string" });
+      throw createError(ERROR_CODES.INVALID_INPUT, null, {
+        error: "Notes must be a string",
+      });
     }
 
     const transaction = await transactionModel.updateNotes(id, notes);
     if (!transaction)
-      return res.status(404).json({ error: "Transaction not found" });
+      throw createError(ERROR_CODES.NOT_FOUND, null, {
+        error: "Transaction not found",
+      });
 
     return res.json(transaction);
   } catch (err) {
+    if (err && (err as any).code) throw err;
     const message =
       err instanceof Error ? err.message : "Failed to update notes";
 
-    return res
-      .status(
-        err instanceof Error && err.message.includes("characters") ? 400 : 500,
-      )
-      .json({ error: message });
+    throw createError(
+      err instanceof Error && err.message.includes("characters")
+        ? ERROR_CODES.MISSING_FIELD
+        : ERROR_CODES.INTERNAL_ERROR,
+      message,
+      {
+        error: message,
+      },
+    );
   }
 };
 
@@ -748,30 +1060,40 @@ export const refundTransactionHandler = async (req: Request, res: Response) => {
 
     const transaction = await transactionModel.findById(id);
     if (!transaction) {
-      return res.status(404).json({ error: "Transaction not found" });
+      throw createError(ERROR_CODES.NOT_FOUND, null, {
+        error: "Transaction not found",
+      });
     }
 
     if (transaction.type !== "withdraw") {
-      return res.status(400).json({
+      throw createError(ERROR_CODES.INVALID_INPUT, null, {
         error: "Only withdrawal transactions can be refunded",
       });
     }
 
     if (transaction.status !== TransactionStatus.Failed) {
-      return res.status(400).json({
-        error: `Cannot refund transaction with status '${transaction.status}'. Only failed transactions are eligible.`,
-      });
+      throw createError(
+        ERROR_CODES.INVALID_INPUT,
+        `Cannot refund transaction with status '${transaction.status}'. Only failed transactions are eligible.`,
+        {
+          error: `Cannot refund transaction with status '${transaction.status}'. Only failed transactions are eligible.`,
+        },
+      );
     }
 
     const amount = parseFloat(transaction.amount);
-    const { calculateFee } = await import("../utils/fees");
+    const { calculateFee } = await import("../utils/fees.js");
     const { fee } = await calculateFee(amount);
     const refundAmount = parseFloat((amount - fee).toFixed(2));
 
     if (refundAmount <= 0) {
-      return res.status(400).json({
-        error: "Refund amount after fees is zero or negative",
-      });
+      throw createError(
+        ERROR_CODES.INVALID_INPUT,
+        "Refund amount after fees is zero or negative",
+        {
+          error: "Refund amount after fees is zero or negative",
+        },
+      );
     }
 
     await transactionModel.updateStatus(id, TransactionStatus.Completed);
@@ -784,8 +1106,11 @@ export const refundTransactionHandler = async (req: Request, res: Response) => {
       refundAmount,
     });
   } catch (err) {
-    console.error("Refund error:", err);
-    return res.status(500).json({ error: "Failed to process refund" });
+    if (err && (err as any).code) throw err;
+    logger.error("Refund error:", err);
+    throw createError(ERROR_CODES.INTERNAL_ERROR, "Failed to process refund", {
+      error: "Failed to process refund",
+    });
   }
 };
 
@@ -795,24 +1120,33 @@ export const updateAdminNotesHandler = async (req: Request, res: Response) => {
     const { admin_notes: adminNotes } = req.body;
 
     if (typeof adminNotes !== "string") {
-      return res.status(400).json({ error: "Admin notes must be a string" });
+      throw createError(ERROR_CODES.INVALID_INPUT, null, {
+        error: "Admin notes must be a string",
+      });
     }
 
     const transaction = await transactionModel.updateAdminNotes(id, adminNotes);
     if (!transaction) {
-      return res.status(404).json({ error: "Transaction not found" });
+      throw createError(ERROR_CODES.NOT_FOUND, "Transaction not found", {
+        error: "Transaction not found",
+      });
     }
 
     return res.json(transaction);
   } catch (err) {
+    if (err && (err as any).code) throw err;
     const message =
       err instanceof Error ? err.message : "Failed to update admin notes";
 
-    return res
-      .status(
-        err instanceof Error && err.message.includes("characters") ? 400 : 500,
-      )
-      .json({ error: message });
+    throw createError(
+      err instanceof Error && err.message.includes("characters")
+        ? ERROR_CODES.INVALID_INPUT
+        : ERROR_CODES.INTERNAL_ERROR,
+      message,
+      {
+        error: message,
+      },
+    );
   }
 };
 
@@ -824,15 +1158,15 @@ export const searchTransactionsHandler = async (
     const { phoneNumber, page = "1", limit = "50" } = req.query;
 
     if (!phoneNumber || typeof phoneNumber !== "string") {
-      return res
-        .status(400)
-        .json({ error: "phoneNumber query parameter is required" });
+      throw createError(ERROR_CODES.INVALID_INPUT, null, {
+        error: "phoneNumber query parameter is required",
+      });
     }
 
     const sanitized = phoneNumber.trim();
 
     if (!/^\+?\d{1,20}$/.test(sanitized)) {
-      return res.status(400).json({
+      throw createError(ERROR_CODES.INVALID_PHONE_FORMAT, null, {
         error:
           "Invalid phone number format. Use digits only, optional leading +",
       });
@@ -870,8 +1204,11 @@ export const searchTransactionsHandler = async (
 
     return res.json(body);
   } catch (error) {
-    console.error("Phone number search error:", error);
-    return res.status(500).json({ error: "Failed to search transactions" });
+    if (error && (error as any).code) throw error;
+    logger.error("Phone number search error:", error);
+    throw createError(ERROR_CODES.INTERNAL_ERROR, null, {
+      error: "Failed to search transactions",
+    });
   }
 };
 
@@ -883,29 +1220,34 @@ export const listTransactionsHandler = async (req: Request, res: Response) => {
       offset: 0,
     };
 
-    const totalCount = await transactionModel.countByStatuses(filters.statuses);
-    const transactions = await transactionModel.findByStatuses(
-      filters.statuses,
-      filters.limit,
-      filters.offset,
-    );
+    let results: any[];
+    let total: number;
 
-    // If a reference search is requested, we should probably use the list method instead
-    // or just filter the results. But wait, findByStatuses is limited.
-    // Let's use the list() method instead which is more flexible.
-    const results = await transactionModel.list(
-      filters.limit,
-      filters.offset,
-      undefined,
-      undefined,
-      {
-        tags: [], // Could be extended
+    if (filters.reference) {
+      const listFilters: TransactionListFilters = {
+        statuses: filters.statuses?.length ? filters.statuses : undefined,
         referenceNumber: filters.reference,
-      }
-    );
-    const total = filters.reference 
-      ? await transactionModel.count(undefined, undefined, { referenceNumber: filters.reference })
-      : totalCount;
+      };
+      [results, total] = await Promise.all([
+        transactionModel.list(
+          filters.limit,
+          filters.offset,
+          filters.startDate,
+          filters.endDate,
+          listFilters,
+        ),
+        transactionModel.count(filters.startDate, filters.endDate, listFilters),
+      ]);
+    } else {
+      [results, total] = await Promise.all([
+        transactionModel.findByStatuses(
+          filters.statuses,
+          filters.limit,
+          filters.offset,
+        ),
+        transactionModel.countByStatuses(filters.statuses),
+      ]);
+    }
 
     return res.json({
       data: results,
@@ -914,11 +1256,19 @@ export const listTransactionsHandler = async (req: Request, res: Response) => {
         limit: filters.limit,
         offset: filters.offset,
         hasMore: filters.offset + filters.limit < total,
+        totalPages: Math.ceil(total / filters.limit),
+        currentPage: Math.floor(filters.offset / filters.limit) + 1,
+      },
+      filters: {
+        statuses:
+          filters.statuses.length === 0 ? VALID_STATUSES : filters.statuses,
       },
     });
   } catch (err) {
-    console.error("Failed to list transactions:", err);
-    return res.status(500).json({ error: "Failed to list transactions" });
+    logger.error("Failed to list transactions:", err);
+    throw createError(ERROR_CODES.INTERNAL_ERROR, null, {
+      error: "Failed to list transactions",
+    });
   }
 };
 
@@ -941,17 +1291,14 @@ export const listAmlAlertsHandler = async (req: Request, res: Response) => {
       (parsedStart && Number.isNaN(parsedStart.getTime())) ||
       (parsedEnd && Number.isNaN(parsedEnd.getTime()))
     ) {
-      return res
-        .status(400)
-        .json({ error: "Invalid date format for startDate/endDate" });
+      throw createError(ERROR_CODES.INVALID_INPUT, null, {
+        error: "Invalid date format for startDate/endDate",
+      });
     }
 
     const alerts = amlService.getAlerts({
       status: statusFilter as
-        | "pending_review"
-        | "reviewed"
-        | "dismissed"
-        | undefined,
+        "pending_review" | "reviewed" | "dismissed" | undefined,
       userId: typeof userId === "string" ? userId : undefined,
       startDate: parsedStart,
       endDate: parsedEnd,
@@ -964,8 +1311,10 @@ export const listAmlAlertsHandler = async (req: Request, res: Response) => {
         .length,
     });
   } catch (error) {
-    console.error("Failed to list AML alerts:", error);
-    return res.status(500).json({ error: "Failed to list AML alerts" });
+    logger.error("Failed to list AML alerts:", error);
+    throw createError(ERROR_CODES.INTERNAL_ERROR, null, {
+      error: "Failed to list AML alerts",
+    });
   }
 };
 
@@ -979,17 +1328,21 @@ export const reviewAmlAlertHandler = async (req: Request, res: Response) => {
     };
 
     if (!status || !["reviewed", "dismissed"].includes(status)) {
-      return res
-        .status(400)
-        .json({ error: "status must be one of: reviewed, dismissed" });
+      throw createError(ERROR_CODES.INVALID_INPUT, null, {
+        error: "status must be one of: reviewed, dismissed",
+      });
     }
 
     if (!reviewedBy || typeof reviewedBy !== "string") {
-      return res.status(400).json({ error: "reviewedBy is required" });
+      throw createError(ERROR_CODES.INVALID_INPUT, null, {
+        error: "reviewedBy is required",
+      });
     }
 
     if (reviewNotes !== undefined && typeof reviewNotes !== "string") {
-      return res.status(400).json({ error: "reviewNotes must be a string" });
+      throw createError(ERROR_CODES.INVALID_INPUT, null, {
+        error: "reviewNotes must be a string",
+      });
     }
 
     const updated = amlService.reviewAlert(alertId, {
@@ -999,13 +1352,17 @@ export const reviewAmlAlertHandler = async (req: Request, res: Response) => {
     });
 
     if (!updated) {
-      return res.status(404).json({ error: "AML alert not found" });
+      throw createError(ERROR_CODES.NOT_FOUND, null, {
+        error: "AML alert not found",
+      });
     }
 
     return res.json(updated);
   } catch (error) {
-    console.error("Failed to review AML alert:", error);
-    return res.status(500).json({ error: "Failed to review AML alert" });
+    logger.error("Failed to review AML alert:", error);
+    throw createError(ERROR_CODES.INTERNAL_ERROR, null, {
+      error: "Failed to review AML alert",
+    });
   }
 };
 
@@ -1017,26 +1374,47 @@ export const updateMetadataHandler = async (req: Request, res: Response) => {
     const { metadata } = req.body;
 
     if (metadata === undefined || metadata === null) {
-      return res.status(400).json({ error: "metadata field is required" });
+      throw createError(
+        ERROR_CODES.INVALID_INPUT,
+        "metadata field is required",
+        {
+          error: "metadata field is required",
+        },
+      );
     }
 
     if (typeof metadata !== "object" || Array.isArray(metadata)) {
-      return res.status(400).json({ error: "metadata must be a JSON object" });
+      throw createError(
+        ERROR_CODES.INVALID_INPUT,
+        "metadata must be a JSON object",
+        {
+          error: "metadata must be a JSON object",
+        },
+      );
     }
 
     const transaction = await transactionModel.updateMetadata(id, metadata);
     if (!transaction) {
-      return res.status(404).json({ error: "Transaction not found" });
+      throw createError(ERROR_CODES.NOT_FOUND, "Transaction not found", {
+        error: "Transaction not found",
+      });
     }
 
     return res.json(transaction);
   } catch (err) {
+    if (err && (err as any).code) throw err;
     const message =
       err instanceof Error ? err.message : "Failed to update metadata";
 
-    return res
-      .status(err instanceof Error && err.message.includes("size") ? 400 : 500)
-      .json({ error: message });
+    throw createError(
+      err instanceof Error && err.message.includes("size")
+        ? ERROR_CODES.INVALID_INPUT
+        : ERROR_CODES.INTERNAL_ERROR,
+      message,
+      {
+        error: "Transaction not found",
+      },
+    );
   }
 };
 
@@ -1046,26 +1424,51 @@ export const patchMetadataHandler = async (req: Request, res: Response) => {
     const { metadata } = req.body;
 
     if (metadata === undefined || metadata === null) {
-      return res.status(400).json({ error: "metadata field is required" });
+      throw createError(
+        ERROR_CODES.INVALID_INPUT,
+        "metadata field is required",
+        {
+          error: "metadata field is required",
+        },
+      );
     }
 
     if (typeof metadata !== "object" || Array.isArray(metadata)) {
-      return res.status(400).json({ error: "metadata must be a JSON object" });
+      throw createError(
+        ERROR_CODES.INVALID_INPUT,
+        "metadata must be a JSON object",
+        {
+          error: "metadata must be a JSON object",
+        },
+      );
     }
 
     const transaction = await transactionModel.patchMetadata(id, metadata);
     if (!transaction) {
-      return res.status(404).json({ error: "Transaction not found" });
+      throw createError(
+        ERROR_CODES.NOT_FOUND,
+        "metadata must be a JSON object",
+        {
+          error: "Transaction not found",
+        },
+      );
     }
 
     return res.json(transaction);
   } catch (err) {
+    if (err && (err as any).code) throw err;
     const message =
       err instanceof Error ? err.message : "Failed to patch metadata";
 
-    return res
-      .status(err instanceof Error && err.message.includes("size") ? 400 : 500)
-      .json({ error: message });
+    throw createError(
+      err instanceof Error && err.message.includes("size")
+        ? ERROR_CODES.INVALID_INPUT
+        : ERROR_CODES.INTERNAL_ERROR,
+      message,
+      {
+        error: message,
+      },
+    );
   }
 };
 
@@ -1078,20 +1481,34 @@ export const deleteMetadataKeysHandler = async (
     const { keys } = req.body;
 
     if (!Array.isArray(keys) || !keys.every((k) => typeof k === "string")) {
-      return res
-        .status(400)
-        .json({ error: "keys must be an array of strings" });
+      throw createError(
+        ERROR_CODES.INVALID_INPUT,
+        "keys must be an array of strings",
+        {
+          error: "keys must be an array of strings",
+        },
+      );
     }
 
     const transaction = await transactionModel.removeMetadataKeys(id, keys);
     if (!transaction) {
-      return res.status(404).json({ error: "Transaction not found" });
+      throw createError(ERROR_CODES.NOT_FOUND, "Transaction not found", {
+        error: "Transaction not found",
+      });
     }
 
     return res.json(transaction);
   } catch (err) {
-    console.error("Failed to delete metadata keys:", err);
-    return res.status(500).json({ error: "Failed to delete metadata keys" });
+    if (err && (err as any).code) throw err;
+    logger.error("Failed to delete metadata keys:", err);
+
+    throw createError(
+      ERROR_CODES.INTERNAL_ERROR,
+      "Failed to delete metadata keys",
+      {
+        error: "Failed to delete metadata keys",
+      },
+    );
   }
 };
 
@@ -1105,13 +1522,26 @@ export const searchByMetadataHandler = async (req: Request, res: Response) => {
       typeof filter !== "object" ||
       Array.isArray(filter)
     ) {
-      return res.status(400).json({ error: "filter must be a JSON object" });
+      throw createError(
+        ERROR_CODES.INVALID_INPUT,
+        "filter must be a JSON object",
+        {
+          error: "filter must be a JSON object",
+        },
+      );
     }
 
     const transactions = await transactionModel.findByMetadata(filter);
     return res.json({ data: transactions, total: transactions.length });
   } catch (err) {
-    console.error("Metadata search error:", err);
-    return res.status(500).json({ error: "Failed to search by metadata" });
+    if (err && (err as any).code) throw err;
+    logger.error("Metadata search error:", err);
+    throw createError(
+      ERROR_CODES.INTERNAL_ERROR,
+      "Failed to search by metadata",
+      {
+        error: "Failed to search by metadata",
+      },
+    );
   }
 };

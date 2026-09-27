@@ -24,6 +24,8 @@ const VALID_DISPUTE_STATUSES: DisputeStatus[] = [
   "investigating",
   "resolved",
   "rejected",
+  "reversed",
+  "upheld",
 ];
 
 function formatNote(n: DisputeNote) {
@@ -562,6 +564,5 @@ export const resolvers = {
 };
 
 // Subscription resolvers backed by the Redis pubsub singleton
-export const subscriptionResolvers = createSubscriptionResolvers(
-  getRedisPubSub(),
-);
+export const subscriptionResolvers =
+  createSubscriptionResolvers(getRedisPubSub());

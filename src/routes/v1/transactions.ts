@@ -1,3 +1,4 @@
+import logger from "../../utils/logger";
 import { Router } from "express";
 import { setApiVersion, VersionedRequest } from "../../middleware/apiVersion";
 import {
@@ -14,21 +15,32 @@ import {
   deleteMetadataKeysHandler,
   searchByMetadataHandler,
 } from "../../controllers/transactionController";
+import { validateNetworkMiddleware } from "../../middleware/validateNetworkMiddleware";
 import { TimeoutPresets, haltOnTimedout } from "../../middleware/timeout";
 import { validateTransactionFilters } from "../../utils/transactionFilters";
 import { requireAuth } from "../../middleware/auth";
 import { checkAccountStatusStrict } from "../../middleware/checkAccountStatus";
 import { geolocateMiddleware } from "../../middleware/geolocate";
+import { geoFencingMiddleware } from "../../middleware/geoFencing";
 import { createExportRoutes } from "../export";
+import { TransactionModel, TransactionStatus } from "../../models/transaction";
+import { generateTransactionPdfBuffer } from "../../services/pdfReceipt";
+import { validate2FAForWithdrawal } from "../../services/twoFactorWithdrawalService";
+import { strictIdempotency } from "../../middleware/idempotency";
 
 export const transactionRoutesV1 = Router();
 transactionRoutesV1.use(createExportRoutes());
+
+const transactionModel = new TransactionModel();
 
 // Deposit transaction route
 transactionRoutesV1.post(
   "/deposit",
   requireAuth,
+  strictIdempotency,
   checkAccountStatusStrict,
+  geoFencingMiddleware,
+  validateNetworkMiddleware,
   TimeoutPresets.long,
   haltOnTimedout,
   setApiVersion("v1"),
@@ -40,11 +52,15 @@ transactionRoutesV1.post(
 transactionRoutesV1.post(
   "/withdraw",
   requireAuth,
+  strictIdempotency,
   checkAccountStatusStrict,
+  geoFencingMiddleware,
+  validateNetworkMiddleware,
   TimeoutPresets.long,
   haltOnTimedout,
   setApiVersion("v1"),
   geolocateMiddleware,
+  validate2FAForWithdrawal,
   withdrawHandler,
 );
 
@@ -90,6 +106,54 @@ transactionRoutesV1.get(
   haltOnTimedout,
   setApiVersion("v1"),
   getTransactionHandler,
+);
+
+transactionRoutesV1.get(
+  "/:id/invoice",
+  TimeoutPresets.quick,
+  haltOnTimedout,
+  requireAuth,
+  setApiVersion("v1"),
+  async (req: VersionedRequest, res) => {
+    try {
+      const { id } = req.params;
+      const { download } = req.query;
+
+      const transaction = await transactionModel.findById(id);
+      if (!transaction)
+        return res.status(404).json({ error: "Transaction not found" });
+
+      if (transaction.userId !== req.jwtUser?.userId && req.user?.role !== "admin") {
+        return res.status(403).json({ error: "You do not have permission to access this transaction" });
+      }
+
+      if (transaction.status !== TransactionStatus.Completed)
+        return res.status(400).json({
+          error:
+            "Invoice download is available only for completed transactions",
+        });
+
+      const pdf = await generateTransactionPdfBuffer(transaction, {
+        title: "Invoice",
+      });
+
+      res.setHeader("Content-Type", "application/pdf");
+      const filename = `invoice-${transaction.referenceNumber}.pdf`;
+      if (download && String(download) === "0") {
+        res.setHeader("Content-Disposition", `inline; filename="${filename}"`);
+      } else {
+        res.setHeader(
+          "Content-Disposition",
+          `attachment; filename="${filename}"`,
+        );
+      }
+
+      res.status(200).send(pdf);
+    } catch (err) {
+      logger.error("Failed to generate invoice PDF:", err);
+      res.status(500).json({ error: "Failed to generate invoice PDF" });
+    }
+  },
 );
 
 // Update transaction notes
