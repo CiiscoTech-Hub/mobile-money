@@ -8,9 +8,9 @@ import {
   STELLAR_NETWORKS,
 } from "../config/stellar";
 import { ERROR_CODES } from "../constants/errorCodes";
+import { TransactionModel } from "../models/transaction";
 import { createError } from "../middleware/errorHandler";
 import { enqueueSepWebhook } from "../services/stellar/webhooks";
-import { TransactionModel } from "../models/transaction";
 
 function isValidStellarPublicKey(key: string): boolean {
   try {
