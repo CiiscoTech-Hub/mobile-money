@@ -1,6 +1,14 @@
+import logger from "../utils/logger";
 import { Router, Request, Response } from "express";
-import { Sep10Service, getSep10Config, Sep10ChallengeResponse, Sep10TokenResponse } from "./sep10";
+import {
+  Sep10Service,
+  getSep10Config,
+  Sep10ChallengeResponse,
+  Sep10TokenResponse,
+} from "./sep10";
 import { adminStellarKeyModel } from "../models/adminStellarKey";
+import { ERROR_CODES } from "../constants/errorCodes";
+import { createError } from "../middleware/errorHandler";
 
 /**
  * Admin SEP-10 Authentication Service
@@ -28,22 +36,28 @@ export class AdminSep10Service extends Sep10Service {
    */
   async verifyAdminChallenge(
     transactionXDR: string,
-    clientAccountID?: string
+    clientAccountID?: string,
   ): Promise<AdminSep10TokenResponse> {
-    // First verify the standard SEP-10 challenge
-    const baseToken = this.verifyChallenge(transactionXDR, clientAccountID);
+    // First verify the standard SEP-10 challenge (now async)
+    const baseToken = await this.verifyChallenge(
+      transactionXDR,
+      clientAccountID,
+    );
 
     // Extract the client public key from the transaction
-    const transaction = require("stellar-sdk").TransactionBuilder.fromXDR(
+    const transaction = require("@stellar/stellar-sdk").TransactionBuilder.fromXDR(
       transactionXDR,
-      this.config.networkPassphrase
+      this.config.networkPassphrase,
     ) as any;
 
-    const clientPublicKey = transaction.operations[0].source || transaction.source;
+    const clientPublicKey =
+      transaction.operations[0].source || transaction.source;
 
     // Check if this public key is authorized for admin access
     const isAdmin = await adminStellarKeyModel.isAdminKey(clientPublicKey);
-    const adminKey = isAdmin ? await adminStellarKeyModel.findByPublicKey(clientPublicKey) : null;
+    const adminKey = isAdmin
+      ? await adminStellarKeyModel.findByPublicKey(clientPublicKey)
+      : null;
 
     return {
       ...baseToken,
@@ -82,27 +96,33 @@ export function createAdminSep10Router(): Router {
       const { account } = req.query;
 
       if (!account || typeof account !== "string") {
-        return res.status(400).json({
-          error: "account parameter is required",
-        });
+        throw createError(
+          ERROR_CODES.INVALID_INPUT,
+          "account parameter is required",
+          {
+            error: "account parameter is required",
+          },
+        );
       }
 
       // Generate the challenge transaction
-      const challenge: Sep10ChallengeResponse = service.generateChallenge(account);
+      const challenge: Sep10ChallengeResponse =
+        service.generateChallenge(account);
 
       return res.json(challenge);
     } catch (error) {
-      console.error("[Admin SEP-10] Error generating challenge:", error);
+      logger.error("[Admin SEP-10] Error generating challenge:", error);
 
       if (error instanceof Error) {
-        return res.status(400).json({
+        throw createError(ERROR_CODES.INVALID_INPUT, error.message, {
           error: error.message,
         });
       }
 
-      return res.status(500).json({
-        error: "Failed to generate challenge transaction",
-      });
+      throw createError(
+        ERROR_CODES.INTERNAL_ERROR,
+        "Failed to generate challenge transaction",
+      );
     }
   });
 
@@ -116,34 +136,40 @@ export function createAdminSep10Router(): Router {
       const { transaction } = req.body;
 
       if (!transaction || typeof transaction !== "string") {
-        return res.status(400).json({
-          error: "transaction parameter is required",
-        });
+        throw createError(
+          ERROR_CODES.INVALID_INPUT,
+          "transaction parameter is required",
+          {
+            error: "transaction parameter is required",
+          },
+        );
       }
 
       // Verify the challenge and check admin authorization
       const tokenResponse = await service.verifyAdminChallenge(transaction);
 
       if (!tokenResponse.isAdmin) {
-        return res.status(403).json({
+        throw createError(ERROR_CODES.FORBIDDEN, "Unauthorized", {
           error: "Unauthorized",
-          message: "The provided Stellar public key is not authorized for admin access",
+          message:
+            "The provided Stellar public key is not authorized for admin access",
         });
       }
 
       return res.json(tokenResponse);
     } catch (error) {
-      console.error("[Admin SEP-10] Error verifying challenge:", error);
+      logger.error("[Admin SEP-10] Error verifying challenge:", error);
 
       if (error instanceof Error) {
-        return res.status(400).json({
+        throw createError(ERROR_CODES.INVALID_INPUT, error.message, {
           error: error.message,
         });
       }
 
-      return res.status(500).json({
-        error: "Failed to verify challenge transaction",
-      });
+      throw createError(
+        ERROR_CODES.INTERNAL_ERROR,
+        "Failed to verify challenge transaction",
+      );
     }
   });
 

@@ -42,9 +42,92 @@ export interface TravelRuleRecord {
   receiver: TravelRuleParty;
   originatingVasp?: string;
   beneficiaryVasp?: string;
+  ivms101Payload?: Record<string, any>;
   createdAt: Date;
   exportedAt?: Date;
   exportedBy?: string;
+}
+
+/**
+ * Build IVMS101 compliant metadata block structure (FATF Recommendation 16) (#1563).
+ */
+export function buildIvms101Payload(
+  sender: TravelRuleParty,
+  receiver: TravelRuleParty,
+  amount: number,
+  currency: string = "USD",
+): Record<string, any> {
+  return {
+    originator: {
+      originatorPersons: [
+        {
+          naturalPerson: {
+            name: {
+              nameIdentifier: [{ primaryIdentifier: sender.name, nameIdentifierType: "LEGL" }],
+            },
+            geographicAddress: sender.address
+              ? [{ addressType: "HOME", addressLine: [sender.address] }]
+              : undefined,
+            dateAndPlaceOfBirth: sender.dob ? { dateOfBirth: sender.dob } : undefined,
+            nationalIdentification: sender.idNumber
+              ? { nationalIdentifier: sender.idNumber, nationalIdentifierType: "NATIONAL_ID" }
+              : undefined,
+          },
+        },
+      ],
+      accountNumber: [sender.account],
+    },
+    beneficiary: {
+      beneficiaryPersons: [
+        {
+          naturalPerson: {
+            name: {
+              nameIdentifier: [{ primaryIdentifier: receiver.name, nameIdentifierType: "LEGL" }],
+            },
+            geographicAddress: receiver.address
+              ? [{ addressType: "HOME", addressLine: [receiver.address] }]
+              : undefined,
+          },
+        },
+      ],
+      accountNumber: [receiver.account],
+    },
+    transferHeader: {
+      transferType: "CROSS_BORDER",
+      amount: amount.toString(),
+      currency,
+    },
+  };
+}
+
+/**
+ * Validate IVMS101 compliance metadata block format (#1563).
+ */
+export function validateIvms101Payload(payload: any): { valid: boolean; errors: string[] } {
+  const errors: string[] = [];
+  if (!payload || typeof payload !== "object") {
+    return { valid: false, errors: ["Missing IVMS101 payload object"] };
+  }
+
+  const originator = payload.originator;
+  if (!originator || !Array.isArray(originator.accountNumber) || originator.accountNumber.length === 0) {
+    errors.push("IVMS101 originator must include accountNumber");
+  }
+  const origPerson = originator?.originatorPersons?.[0]?.naturalPerson;
+  if (!origPerson?.name?.nameIdentifier?.[0]?.primaryIdentifier) {
+    errors.push("IVMS101 originator must include valid primaryIdentifier name");
+  }
+
+  const beneficiary = payload.beneficiary;
+  if (!beneficiary || !Array.isArray(beneficiary.accountNumber) || beneficiary.accountNumber.length === 0) {
+    errors.push("IVMS101 beneficiary must include accountNumber");
+  }
+  const benPerson = beneficiary?.beneficiaryPersons?.[0]?.naturalPerson;
+  if (!benPerson?.name?.nameIdentifier?.[0]?.primaryIdentifier) {
+    errors.push("IVMS101 beneficiary must include valid primaryIdentifier name");
+  }
+
+  return { valid: errors.length === 0, errors };
 }
 
 // ---------------------------------------------------------------------------
@@ -76,9 +159,13 @@ function decryptParty(row: {
   return {
     name: (decrypt(row.name) as string) ?? row.name,
     account: (decrypt(row.account) as string) ?? row.account,
-    address: row.address ? ((decrypt(row.address) as string) ?? undefined) : undefined,
+    address: row.address
+      ? ((decrypt(row.address) as string) ?? undefined)
+      : undefined,
     dob: row.dob ? ((decrypt(row.dob) as string) ?? undefined) : undefined,
-    idNumber: row.id_number ? ((decrypt(row.id_number) as string) ?? undefined) : undefined,
+    idNumber: row.id_number
+      ? ((decrypt(row.id_number) as string) ?? undefined)
+      : undefined,
   };
 }
 
@@ -116,6 +203,28 @@ export class TravelRuleService {
   /** Returns true when the Travel Rule applies to this USD amount. */
   applies(amountUsd: number): boolean {
     return amountUsd >= TRAVEL_RULE_THRESHOLD_USD;
+  }
+
+  /**
+   * Enforce Travel Rule IVMS101 compliance on outbound transactions (#1563).
+   * Blocks qualifying transactions (amount >= $1000) failing compliance formatting.
+   */
+  enforceCompliance(input: TravelRuleInput): { compliant: boolean; ivms101Payload?: Record<string, any>; error?: string } {
+    if (!this.applies(input.amount)) {
+      return { compliant: true };
+    }
+
+    const ivms101Payload = buildIvms101Payload(input.sender, input.receiver, input.amount, input.currency);
+    const validation = validateIvms101Payload(ivms101Payload);
+
+    if (!validation.valid) {
+      return {
+        compliant: false,
+        error: `Travel Rule compliance check failed: ${validation.errors.join("; ")}`,
+      };
+    }
+
+    return { compliant: true, ivms101Payload };
   }
 
   /**
@@ -178,7 +287,9 @@ export class TravelRuleService {
   }
 
   /** Fetch a single record by transaction ID (decrypted). */
-  async findByTransactionId(transactionId: string): Promise<TravelRuleRecord | null> {
+  async findByTransactionId(
+    transactionId: string,
+  ): Promise<TravelRuleRecord | null> {
     const result = await pool.query(
       `SELECT * FROM travel_rule_records WHERE transaction_id = $1`,
       [transactionId],
@@ -198,7 +309,8 @@ export class TravelRuleService {
     onlyUnexported?: boolean;
   }): Promise<TravelRuleRecord[]> {
     const to = options.to ?? new Date();
-    const from = options.from ?? new Date(to.getTime() - 90 * 24 * 60 * 60 * 1000);
+    const from =
+      options.from ?? new Date(to.getTime() - 90 * 24 * 60 * 60 * 1000);
 
     const whereClauses = ["created_at >= $1", "created_at <= $2"];
     const values: unknown[] = [from, to];

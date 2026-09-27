@@ -1,5 +1,6 @@
+import logger from "../utils/logger";
 import { Worker, Job } from "bullmq";
-import * as StellarSdk from "stellar-sdk";
+import * as StellarSdk from "@stellar/stellar-sdk";
 import { queueOptions } from "./config";
 import {
   AccountMergeJobData,
@@ -158,7 +159,8 @@ export const accountMergeWorker = new Worker<
 >(
   ACCOUNT_MERGE_QUEUE_NAME,
   async (job: Job<AccountMergeJobData, AccountMergeJobResult>) => {
-    const { sourceSecret, destinationPublicKey, inactivityDays, dryRun } = job.data;
+    const { sourceSecret, destinationPublicKey, inactivityDays, dryRun } =
+      job.data;
     const server = getStellarServer();
 
     await job.updateProgress(10);
@@ -275,8 +277,9 @@ export const accountMergeWorker = new Worker<
         };
       }
 
-      const errorMessage = error instanceof Error ? error.message : "Unknown error";
-      console.error(
+      const errorMessage =
+        error instanceof Error ? error.message : "Unknown error";
+      logger.error(
         `${ACCOUNT_MERGE_PREFIX} Failed to merge ${sourcePublicKey}:`,
         error,
       );
@@ -301,14 +304,14 @@ accountMergeWorker.on("completed", (job) => {
 });
 
 accountMergeWorker.on("failed", (job, error) => {
-  console.error(
+  logger.error(
     `${ACCOUNT_MERGE_PREFIX} Job ${job?.id} failed after ${job?.attemptsMade} attempts:`,
     error.message,
   );
 
   if (job) {
     capturePersistentFailure(job).catch((err) =>
-      console.error("[DLQ] Error capturing failure:", err),
+      logger.error("[DLQ] Error capturing failure:", err),
     );
   }
 });

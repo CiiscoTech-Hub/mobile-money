@@ -41,10 +41,10 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v4
         with:
           node-version: "20"
           cache: "npm"
@@ -52,14 +52,27 @@ jobs:
       - name: Verify package-lock.json exists
         run: |
           if [ ! -f package-lock.json ]; then
-            npm install --package-lock-only
+            npm install --package-lock-only --ignore-scripts
           fi
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvips-dev libjpeg-dev libpng-dev libtiff-dev libgif-dev librsvg2-dev libpoppler-cpp-dev libcairo2-dev libpango1.0-dev libjpeg8-dev build-essential
 
       - name: Install dependencies
         run: npm ci
 
+      - name: Wait for Postgres to be ready
+        run: |
+          for i in $(seq 1 30); do
+            pg_isready -h localhost -p 5432 -U test_user && break
+            echo "Waiting for Postgres... attempt $i/30"
+            sleep 1
+          done
+
       - name: Run database migrations
-        run: npm run migrate:up
+        run: npm run migrate:up 2>&1
         continue-on-error: true
         env:
           DATABASE_URL: postgresql://test_user:test_password@localhost:5432/test_db
@@ -67,16 +80,18 @@ jobs:
       - name: Run tests with coverage
         id: coverage
         run: |
-          npm run test:coverage -- --coverageReporters=json-summary --coverageReporters=text --coverageReporters=lcov --maxWorkers=2 --forceExit 2>&1 | tee coverage-output.txt
+          npm run test:coverage -- --coverageReporters=json-summary --coverageReporters=text --coverageReporters=lcov --maxWorkers=2 --bail --forceExit 2>&1 | tee coverage-output.txt
           EXIT_CODE=${PIPESTATUS[0]}
           echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
-          exit 0
+          exit $EXIT_CODE
         timeout-minutes: 10
+        continue-on-error: true
         env:
           DATABASE_URL: postgresql://test_user:test_password@localhost:5432/test_db
           REDIS_URL: redis://localhost:6379
           STELLAR_ISSUER_SECRET: S-DUMMY-SECRET-KEY-FOR-TESTING-PURPOSES-ONLY
           NODE_ENV: test
+          NODE_OPTIONS: --experimental-vm-modules
           CI: true
 
       - name: Extract coverage metrics
@@ -99,10 +114,10 @@ jobs:
           echo "lines=$LINES" >> "$GITHUB_OUTPUT"
 
           # Thresholds — keep in sync with jest.config.js
-          THRESHOLD_STMTS=20
-          THRESHOLD_BRANCHES=15
-          THRESHOLD_FUNCS=25
-          THRESHOLD_LINES=20
+          THRESHOLD_STMTS=70
+          THRESHOLD_BRANCHES=70
+          THRESHOLD_FUNCS=70
+          THRESHOLD_LINES=70
 
           PASSED=true
           if [ "$STMTS" != "N/A" ]; then
@@ -120,7 +135,7 @@ jobs:
       - name: Comment coverage on PR
         if: github.event_name == 'pull_request'
         continue-on-error: true
-        uses: actions/github-script@v8
+        uses: actions/github-script@v7
         with:
           script: |
             const stmts = '${{ steps.metrics.outputs.statements }}';
@@ -173,31 +188,8 @@ jobs:
               });
             }
 
-      - name: Check if Codecov is configured
-        id: check_codecov
-        run: |
-          if [ -n "${{ secrets.CODECOV_TOKEN }}" ]; then
-            echo "codecov_available=true" >> $GITHUB_OUTPUT
-          else
-            echo "codecov_available=false" >> $GITHUB_OUTPUT
-            echo "⚠️ CODECOV_TOKEN not configured. Skipping Codecov upload."
-            echo "To enable Codecov integration, add CODECOV_TOKEN secret."
-          fi
-
-      - name: Upload coverage to Codecov
-        if: steps.check_codecov.outputs.codecov_available == 'true'
-        uses: codecov/codecov-action@v6
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: ./coverage/lcov.info
-          flags: unittests
-          name: codecov-umbrella
-          fail_ci_if_error: false
-          verbose: true
-
       - name: Enforce coverage thresholds
         if: steps.metrics.outputs.passed == 'false'
-        continue-on-error: true
         run: |
           echo "⚠️ Coverage is below the required thresholds."
           echo ""

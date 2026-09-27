@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { printError } from "../utils/cli";
 /**
  * Migration Runner (Issue #45)
  *
@@ -30,7 +31,9 @@ dotenv.config();
 // ---------------------------------------------------------------------------
 
 const isSandbox = process.env.IS_SANDBOX === "true";
-const dbUrl = isSandbox ? (process.env.SANDBOX_DATABASE_URL || process.env.DATABASE_URL) : process.env.DATABASE_URL;
+const dbUrl = isSandbox
+  ? process.env.SANDBOX_DATABASE_URL || process.env.DATABASE_URL
+  : process.env.DATABASE_URL;
 
 const pool = new Pool({
   connectionString: dbUrl,
@@ -194,7 +197,7 @@ async function migrateUp(): Promise<void> {
       console.log(`  Applied: ${migration.name}`);
     } catch (err) {
       await client.query("ROLLBACK");
-      console.error(`  Failed to apply ${migration.name}:`, err);
+      printError(`  Failed to apply ${migration.name}:`, err);
       throw err;
     } finally {
       client.release();
@@ -221,12 +224,12 @@ async function migrateDown(): Promise<void> {
   const migration = all.find((m) => m.version === lastVersion);
 
   if (!migration) {
-    console.error(`Could not find migration file for version: ${lastVersion}`);
+    printError(`Could not find migration file for version: ${lastVersion}`);
     process.exit(1);
   }
 
   if (!migration.downPath) {
-    console.error(
+    printError(
       `No rollback file found for ${migration.name}. Expected: ${migration.version}_*.down.sql`,
     );
     process.exit(1);
@@ -246,11 +249,78 @@ async function migrateDown(): Promise<void> {
     console.log(`  Rolled back: ${migration.name}`);
   } catch (err) {
     await client.query("ROLLBACK");
-    console.error(`  Failed to roll back ${migration.name}:`, err);
+    printError(`  Failed to roll back ${migration.name}:`, err);
     throw err;
   } finally {
     client.release();
   }
+}
+
+async function migrateDryRun(): Promise<void> {
+  await ensureMigrationsTable();
+  const all = discoverMigrations();
+  await normalizeLegacyAppliedVersions(all);
+  const applied = await getAppliedVersions();
+  const pending = all.filter((m) => !applied.has(m.version));
+
+  if (pending.length === 0) {
+    console.log("No pending migrations to validate.");
+    return;
+  }
+
+  let errors = 0;
+  const appliedInDryRun: typeof pending = [];
+
+  for (const migration of pending) {
+    const sql = fs.readFileSync(migration.upPath, "utf-8");
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(sql);
+      await client.query(
+        "INSERT INTO schema_migrations (version) VALUES ($1)",
+        [migration.version],
+      );
+      await client.query("COMMIT");
+      appliedInDryRun.push(migration);
+      console.log(`  [VALID] ${migration.name}`);
+    } catch (err) {
+      await client.query("ROLLBACK");
+      printError(`  [INVALID] ${migration.name}:`, err);
+      errors++;
+      client.release();
+      break;
+    } finally {
+      client.release();
+    }
+  }
+
+  // Roll back all migrations applied during dry-run in reverse order if downPath exists
+  for (const migration of appliedInDryRun.reverse()) {
+    if (migration.downPath) {
+      const client = await pool.connect();
+      try {
+        const sql = fs.readFileSync(migration.downPath, "utf-8");
+        await client.query("BEGIN");
+        await client.query(sql);
+        await client.query(
+          "DELETE FROM schema_migrations WHERE version = $1",
+          [migration.version],
+        );
+        await client.query("COMMIT");
+      } catch (_) {
+        await client.query("ROLLBACK");
+      } finally {
+        client.release();
+      }
+    }
+  }
+
+  if (errors > 0) {
+    printError(`\n${errors} migration(s) failed validation.`);
+    process.exit(1);
+  }
+  console.log(`\nAll ${pending.length} pending migration(s) valid.`);
 }
 
 async function migrateStatus(): Promise<void> {
@@ -292,14 +362,17 @@ const command = process.argv[2];
       case "status":
         await migrateStatus();
         break;
+      case "dry-run":
+        await migrateDryRun();
+        break;
       default:
-        console.error(
-          `Unknown command: ${command ?? "(none)"}.\nUsage: migrate <up|down|status>`,
+        printError(
+          `Unknown command: ${command ?? "(none)"}.\nUsage: migrate <up|down|status|dry-run>`,
         );
         process.exit(1);
     }
   } catch (err) {
-    console.error("Migration runner error:", err);
+    printError("Migration runner error:", err);
     process.exit(1);
   } finally {
     await pool.end();

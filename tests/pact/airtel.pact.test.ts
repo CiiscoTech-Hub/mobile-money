@@ -65,14 +65,14 @@ describe("Airtel Money API Contract", () => {
     });
   });
 
-  describe("POST /merchant/v1/payments/ — request payment (collection)", () => {
+  describe("POST /ng/merchant/v1/payments/ — request payment (collection)", () => {
     it("accepts a valid collection request and returns success", async () => {
       await provider
         .given("Airtel collection service is available")
         .uponReceiving("a request to collect payment from a subscriber")
         .withRequest({
           method: "POST",
-          path: "/merchant/v1/payments/",
+          path: "/ng/merchant/v1/payments/",
           headers: {
             Authorization: regex(`^Bearer .+$`, `Bearer ${BEARER_TOKEN}`),
             "X-Country": like("NG"),
@@ -112,11 +112,20 @@ describe("Airtel Money API Contract", () => {
         })
         .executeTest(async (mockServer) => {
           const res = await axios.post(
-            `${mockServer.url}/merchant/v1/payments/`,
+            `${mockServer.url}/ng/merchant/v1/payments/`,
             {
               reference: REFERENCE,
-              subscriber: { country: "NG", currency: "NGN", msisdn: "2348012345678" },
-              transaction: { amount: 100, country: "NG", currency: "NGN", id: REFERENCE },
+              subscriber: {
+                country: "NG",
+                currency: "NGN",
+                msisdn: "2348012345678",
+              },
+              transaction: {
+                amount: 100,
+                country: "NG",
+                currency: "NGN",
+                id: REFERENCE,
+              },
             },
             {
               headers: {
@@ -133,14 +142,14 @@ describe("Airtel Money API Contract", () => {
     });
   });
 
-  describe("GET /standard/v1/payments/:reference — check transaction status", () => {
+  describe("GET /ng/standard/v1/payments/:reference — check transaction status", () => {
     it("returns TS (success) status for a completed transaction", async () => {
       await provider
         .given("Airtel transaction is successful")
         .uponReceiving("a request to check a successful transaction status")
         .withRequest({
           method: "GET",
-          path: `/standard/v1/payments/${REFERENCE}`,
+          path: `/ng/standard/v1/payments/${REFERENCE}`,
           headers: {
             Authorization: regex(`^Bearer .+$`, `Bearer ${BEARER_TOKEN}`),
             "X-Country": like("NG"),
@@ -166,7 +175,7 @@ describe("Airtel Money API Contract", () => {
         })
         .executeTest(async (mockServer) => {
           const res = await axios.get(
-            `${mockServer.url}/standard/v1/payments/${REFERENCE}`,
+            `${mockServer.url}/ng/standard/v1/payments/${REFERENCE}`,
             {
               headers: {
                 Authorization: `Bearer ${BEARER_TOKEN}`,
@@ -186,7 +195,7 @@ describe("Airtel Money API Contract", () => {
         .uponReceiving("a request to check a failed transaction status")
         .withRequest({
           method: "GET",
-          path: `/standard/v1/payments/${REFERENCE}`,
+          path: `/ng/standard/v1/payments/${REFERENCE}`,
           headers: {
             Authorization: regex(`^Bearer .+$`, `Bearer ${BEARER_TOKEN}`),
             "X-Country": like("NG"),
@@ -212,7 +221,7 @@ describe("Airtel Money API Contract", () => {
         })
         .executeTest(async (mockServer) => {
           const res = await axios.get(
-            `${mockServer.url}/standard/v1/payments/${REFERENCE}`,
+            `${mockServer.url}/ng/standard/v1/payments/${REFERENCE}`,
             {
               headers: {
                 Authorization: `Bearer ${BEARER_TOKEN}`,
@@ -227,7 +236,7 @@ describe("Airtel Money API Contract", () => {
     });
   });
 
-  describe("POST /standard/v1/disbursements/ — send payout", () => {
+  describe("POST /ng/standard/v1/disbursements/ — send payout", () => {
     it("accepts a valid disbursement request and returns success", async () => {
       const payoutRef = "AIRTEL-PAYOUT-1700000000000";
 
@@ -236,7 +245,7 @@ describe("Airtel Money API Contract", () => {
         .uponReceiving("a request to disburse funds to a subscriber")
         .withRequest({
           method: "POST",
-          path: "/standard/v1/disbursements/",
+          path: "/ng/standard/v1/disbursements/",
           headers: {
             Authorization: regex(`^Bearer .+$`, `Bearer ${BEARER_TOKEN}`),
             "X-Country": like("NG"),
@@ -272,7 +281,7 @@ describe("Airtel Money API Contract", () => {
         })
         .executeTest(async (mockServer) => {
           const res = await axios.post(
-            `${mockServer.url}/standard/v1/disbursements/`,
+            `${mockServer.url}/ng/standard/v1/disbursements/`,
             {
               reference: payoutRef,
               payee: { msisdn: "2348012345678" },
@@ -293,14 +302,14 @@ describe("Airtel Money API Contract", () => {
     });
   });
 
-  describe("GET /standard/v1/users/balance — get operational balance", () => {
+  describe("GET /ng/standard/v1/users/balance — get operational balance", () => {
     it("returns available balance", async () => {
       await provider
         .given("Airtel account has funds")
         .uponReceiving("a request for the Airtel operational balance")
         .withRequest({
           method: "GET",
-          path: "/standard/v1/users/balance",
+          path: "/ng/standard/v1/users/balance",
           headers: {
             Authorization: regex(`^Bearer .+$`, `Bearer ${BEARER_TOKEN}`),
             "X-Country": like("NG"),
@@ -319,7 +328,7 @@ describe("Airtel Money API Contract", () => {
         })
         .executeTest(async (mockServer) => {
           const res = await axios.get(
-            `${mockServer.url}/standard/v1/users/balance`,
+            `${mockServer.url}/ng/standard/v1/users/balance`,
             {
               headers: {
                 Authorization: `Bearer ${BEARER_TOKEN}`,

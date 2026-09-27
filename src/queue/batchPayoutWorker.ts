@@ -1,5 +1,10 @@
+import logger from "../utils/logger";
 import { TransactionModel, TransactionStatus } from "../models/transaction";
-import { MobileMoneyService, BatchPayoutItem, BatchPayoutResult } from "../services/mobilemoney/mobileMoneyService";
+import {
+  MobileMoneyService,
+  BatchPayoutItem,
+  BatchPayoutResult,
+} from "../services/mobilemoney/mobileMoneyService";
 import { rabbitMQManager, EXCHANGES, ROUTING_KEYS } from "./rabbitmq";
 import { EmailService } from "../services/email";
 import { UserModel } from "../models/users";
@@ -21,8 +26,11 @@ const smsService = new SmsService();
 const webhookService = new WebhookService();
 const pushService = pushNotificationService;
 
-const BATCH_SIZE = 50;
-const BATCH_INTERVAL_MS = parseInt(process.env.BATCH_PAYOUT_INTERVAL_MS || "5000", 10);
+const BATCH_SIZE = 100;
+const BATCH_INTERVAL_MS = parseInt(
+  process.env.BATCH_PAYOUT_INTERVAL_MS || "5000",
+  10,
+);
 const SUPPORTED_PROVIDERS = ["mtn"];
 
 interface PendingPayout {
@@ -46,11 +54,15 @@ async function sendTransactionEmail(transactionId: string): Promise<void> {
       user.email,
       transaction,
       user.preferredLanguage,
+      user.displayName,
     );
   }
 }
 
-async function sendFailureEmail(transactionId: string, reason: string): Promise<void> {
+async function sendFailureEmail(
+  transactionId: string,
+  reason: string,
+): Promise<void> {
   const transaction = await transactionModel.findById(transactionId);
   if (!transaction?.userId) return;
 
@@ -61,6 +73,7 @@ async function sendFailureEmail(transactionId: string, reason: string): Promise<
       transaction,
       reason,
       user.preferredLanguage,
+      user.displayName,
     );
   }
 }
@@ -94,7 +107,7 @@ async function sendTransactionPush(
       });
     }
   } catch (pushError) {
-    console.error(`[${transactionId}] Push notification failed:`, pushError);
+    logger.error(`[${transactionId}] Push notification failed:`, pushError);
   }
 }
 
@@ -112,7 +125,9 @@ async function sendTxnSms(
 
     const user = await userModel.findById(txRow.userId);
     if (user?.smsOptOut) {
-      console.log(`[${transactionId}] SMS notifications skipped (User Opted Out)`);
+      console.log(
+        `[${transactionId}] SMS notifications skipped (User Opted Out)`,
+      );
       return;
     }
 
@@ -124,9 +139,10 @@ async function sendTxnSms(
       provider,
       kind,
       errorMessage,
+      locale: user.preferredLanguage,
     });
   } catch (smsErr) {
-    console.error(`[${transactionId}] SMS notification error`, smsErr);
+    logger.error(`[${transactionId}] SMS notification error`, smsErr);
   }
 }
 
@@ -141,7 +157,7 @@ async function fetchPendingPayouts(provider: string): Promise<PendingPayout[]> {
     BATCH_SIZE,
   );
 
-  return result.map(tx => ({
+  return result.map((tx) => ({
     transactionId: tx.id,
     phoneNumber: tx.phoneNumber,
     amount: String(tx.amount),
@@ -156,13 +172,13 @@ async function processBatchResults(
   results: BatchPayoutResult[],
   payouts: PendingPayout[],
 ): Promise<void> {
-  const resultMap = new Map(results.map(r => [r.referenceId, r]));
+  const resultMap = new Map(results.map((r) => [r.referenceId, r]));
 
   for (const payout of payouts) {
     const result = resultMap.get(payout.transactionId);
 
     if (!result) {
-      console.error(`[${payout.transactionId}] No result returned from batch`);
+      logger.error(`[${payout.transactionId}] No result returned from batch`);
       await transactionModel.updateStatus(
         payout.transactionId,
         TransactionStatus.Failed,
@@ -170,6 +186,14 @@ async function processBatchResults(
       await transactionModel.patchMetadata(payout.transactionId, {
         batchError: "No result returned from batch processing",
       });
+      await sendTxnSms(
+        payout.transactionId,
+        payout.phoneNumber,
+        payout.amount,
+        payout.provider,
+        "transaction_failed",
+        "No result returned from batch processing",
+      );
       continue;
     }
 
@@ -185,10 +209,14 @@ async function processBatchResults(
         });
       }
 
-      await notifyTransactionWebhook(payout.transactionId, "transaction.completed", {
-        transactionModel,
-        webhookService,
-      });
+      await notifyTransactionWebhook(
+        payout.transactionId,
+        "transaction.completed",
+        {
+          transactionModel,
+          webhookService,
+        },
+      );
       await sendTransactionEmail(payout.transactionId);
       await sendTransactionPush(payout.transactionId, "completed");
       await sendTxnSms(
@@ -205,10 +233,12 @@ async function processBatchResults(
         { transactionId: payout.transactionId, status: "completed" },
       );
 
-      console.log(`[${payout.transactionId}] Batch payout completed successfully`);
+      console.log(
+        `[${payout.transactionId}] Batch payout completed successfully`,
+      );
     } else {
       const errorMsg = result.error || "Batch payout failed";
-      
+
       await transactionModel.updateStatus(
         payout.transactionId,
         TransactionStatus.Failed,
@@ -217,10 +247,14 @@ async function processBatchResults(
         batchError: errorMsg,
       });
 
-      await notifyTransactionWebhook(payout.transactionId, "transaction.failed", {
-        transactionModel,
-        webhookService,
-      });
+      await notifyTransactionWebhook(
+        payout.transactionId,
+        "transaction.failed",
+        {
+          transactionModel,
+          webhookService,
+        },
+      );
       await sendFailureEmail(payout.transactionId, errorMsg);
       await sendTransactionPush(payout.transactionId, "failed", errorMsg);
       await sendTxnSms(
@@ -235,7 +269,11 @@ async function processBatchResults(
       await rabbitMQManager.publish(
         EXCHANGES.TRANSACTIONS,
         ROUTING_KEYS.TRANSACTION_FAILED,
-        { transactionId: payout.transactionId, status: "failed", error: errorMsg },
+        {
+          transactionId: payout.transactionId,
+          status: "failed",
+          error: errorMsg,
+        },
       );
 
       console.log(`[${payout.transactionId}] Batch payout failed: ${errorMsg}`);
@@ -253,9 +291,11 @@ async function processBatch(provider: string): Promise<void> {
     return;
   }
 
-  console.log(`[BatchPayoutWorker] Processing ${payouts.length} pending ${provider} payouts`);
+  console.log(
+    `[BatchPayoutWorker] Processing ${payouts.length} pending ${provider} payouts`,
+  );
 
-  const batchItems: BatchPayoutItem[] = payouts.map(p => ({
+  const batchItems: BatchPayoutItem[] = payouts.map((p) => ({
     referenceId: p.transactionId,
     phoneNumber: p.phoneNumber,
     amount: p.amount,
@@ -266,10 +306,13 @@ async function processBatch(provider: string): Promise<void> {
   const durationMs = Date.now() - startTime;
 
   // Record metrics
-  const successCount = result.results.filter(r => r.success).length;
-  const failureCount = result.results.filter(r => !r.success).length;
+  const successCount = result.results.filter((r) => r.success).length;
+  const failureCount = result.results.filter((r) => !r.success).length;
 
-  batchPayoutTotal.inc({ provider, status: result.success ? "success" : "partial" });
+  batchPayoutTotal.inc({
+    provider,
+    status: result.success ? "success" : "partial",
+  });
   batchPayoutItemsTotal.inc({ provider, status: "success" }, successCount);
   batchPayoutItemsTotal.inc({ provider, status: "failed" }, failureCount);
   batchPayoutDurationSeconds.observe({ provider }, durationMs / 1000);
@@ -300,7 +343,7 @@ async function runBatchCycle(): Promise<void> {
       await processBatch(provider);
     }
   } catch (error) {
-    console.error("[BatchPayoutWorker] Error in batch cycle:", error);
+    logger.error("[BatchPayoutWorker] Error in batch cycle:", error);
   } finally {
     isRunning = false;
   }
@@ -312,17 +355,19 @@ export function startBatchPayoutWorker(): void {
     return;
   }
 
-  console.log(`[BatchPayoutWorker] Starting with interval ${BATCH_INTERVAL_MS}ms`);
-  
+  console.log(
+    `[BatchPayoutWorker] Starting with interval ${BATCH_INTERVAL_MS}ms`,
+  );
+
   // Run immediately on start
-  runBatchCycle().catch(err => 
-    console.error("[BatchPayoutWorker] Initial cycle error:", err)
+  runBatchCycle().catch((err) =>
+    logger.error("[BatchPayoutWorker] Initial cycle error:", err),
   );
 
   // Then run on interval
   intervalId = setInterval(() => {
-    runBatchCycle().catch(err =>
-      console.error("[BatchPayoutWorker] Interval cycle error:", err)
+    runBatchCycle().catch((err) =>
+      logger.error("[BatchPayoutWorker] Interval cycle error:", err),
     );
   }, BATCH_INTERVAL_MS);
 }

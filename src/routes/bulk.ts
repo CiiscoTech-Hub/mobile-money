@@ -1,3 +1,4 @@
+import logger from "../utils/logger";
 import { Router, Request, Response, NextFunction } from "express";
 import { authenticateToken } from "../middleware/auth";
 import multer, { MulterError } from "multer";
@@ -9,8 +10,11 @@ import { MobileMoneyService } from "../services/mobilemoney/mobileMoneyService";
 import { StellarService } from "../services/stellar/stellarService";
 import { notifyTransactionWebhook, WebhookService } from "../services/webhook";
 import { checkAccountStatusStrict } from "../middleware/checkAccountStatus";
-import highThroughputService, { PaymentOptions } from "../services/stellar/highThroughputService";
-
+import highThroughputService, {
+  PaymentOptions,
+} from "../services/stellar/highThroughputService";
+import { createError } from "../middleware/errorHandler";
+import { ERROR_CODES } from "../constants/errorCodes";
 
 interface CsvRow {
   amount: string;
@@ -140,9 +144,16 @@ async function processJob(jobId: string, rows: CsvRow[]): Promise<void> {
       let failedAlreadyHandled = false;
 
       try {
-        const CORE_FIELDS = new Set(["amount", "phoneNumber", "provider", "stellarAddress"]);
+        const CORE_FIELDS = new Set([
+          "amount",
+          "phoneNumber",
+          "provider",
+          "stellarAddress",
+        ]);
         const metadata = Object.fromEntries(
-          Object.entries(row).filter(([k]) => !CORE_FIELDS.has(k) && row[k] !== ""),
+          Object.entries(row).filter(
+            ([k]) => !CORE_FIELDS.has(k) && row[k] !== "",
+          ),
         );
         const transaction = await transactionModel.create({
           type: "deposit",
@@ -151,8 +162,8 @@ async function processJob(jobId: string, rows: CsvRow[]): Promise<void> {
           provider: row.provider.toUpperCase(),
           stellarAddress: row.stellarAddress,
           status: TransactionStatus.Pending,
-          tags: [],
-          ...(Object.keys(metadata).length > 0 && { metadata }),
+          tags: [jobId],
+          metadata: { batchId: jobId },
         });
         transactionId = transaction.id;
 
@@ -212,7 +223,7 @@ async function processJob(jobId: string, rows: CsvRow[]): Promise<void> {
       }
     }
   } catch (error) {
-    console.error("[BulkImport] Fatal error in processJob:", error);
+    logger.error("[BulkImport] Fatal error in processJob:", error);
   } finally {
     job.status = "completed";
     job.completedAt = new Date();
@@ -245,25 +256,30 @@ bulkRoutes.post(
   upload.single("file"),
   async (req: Request, res: Response) => {
     if (!req.file) {
-      return res.status(400).json({
-        error: "No file uploaded",
-        message:
-          'Send a CSV file using multipart/form-data with field name "file"',
-      });
+      throw createError(
+        ERROR_CODES.INVALID_INPUT,
+        'Send a CSV file using multipart/form-data with field name "file"',
+        { error: "No file uploaded" },
+      );
     }
 
     let rows: CsvRow[];
     try {
       rows = await parseCsv(req.file.buffer);
     } catch (err) {
-      return res.status(400).json({
-        error: "Failed to parse CSV",
-        message: err instanceof Error ? err.message : "Unknown parse error",
-      });
+      throw createError(
+        ERROR_CODES.INVALID_INPUT,
+        err instanceof Error ? err.message : "Unknown parse error",
+        { error: "Failed to parse CSV" },
+      );
     }
 
     if (rows.length === 0) {
-      return res.status(400).json({ error: "CSV file contains no data rows" });
+      throw createError(
+        ERROR_CODES.INVALID_INPUT,
+        "CSV file contains no data rows",
+        { error: "CSV file contains no data rows" },
+      );
     }
 
     const validationErrors: ValidationError[] = [];
@@ -272,11 +288,11 @@ bulkRoutes.post(
     });
 
     if (validationErrors.length > 0) {
-      return res.status(422).json({
-        error: "CSV validation failed - no transactions were processed",
-        totalErrors: validationErrors.length,
-        validationErrors,
-      });
+      throw createError(
+        ERROR_CODES.UNPROCESSABLE_CONTENT,
+        "CSV validation failed - no transactions were processed",
+        { error: "CSV validation failed - no transactions were processed" },
+      );
     }
 
     const jobId = crypto.randomUUID();
@@ -311,7 +327,9 @@ bulkRoutes.use(
     }
 
     if (err instanceof Error) {
-      return res.status(400).json({ error: err.message });
+      throw createError(ERROR_CODES.INVALID_INPUT, err.message, {
+        error: err.message,
+      });
     }
 
     next(err);
@@ -322,7 +340,9 @@ bulkRoutes.get("/:jobId", (req: Request, res: Response) => {
   const job = jobs.get(req.params.jobId);
 
   if (!job) {
-    return res.status(404).json({ error: "Job not found" });
+    throw createError(ERROR_CODES.NOT_FOUND, "Job not found", {
+      error: "Job not found",
+    });
   }
 
   return res.json({
@@ -339,3 +359,22 @@ bulkRoutes.get("/:jobId", (req: Request, res: Response) => {
     ...(job.completedAt && { completedAt: job.completedAt }),
   });
 });
+
+bulkRoutes.post(
+  "/batch-payout/trigger",
+  authenticateToken,
+  async (req: Request, res: Response) => {
+    const { executeProviderBatchPayout } = await import(
+      "../queue/payoutBatchWorker.js"
+    );
+    const provider = (req.body?.provider || "mtn").toLowerCase();
+    const result = await executeProviderBatchPayout(provider);
+
+    return res.status(200).json({
+      success: result.success,
+      provider,
+      totalProcessed: result.totalProcessed,
+      triggeredAt: new Date().toISOString(),
+    });
+  },
+);

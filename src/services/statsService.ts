@@ -1,5 +1,9 @@
+import logger from "../utils/logger";
 import { pool } from "../config/database";
-import { calculateStellarReserve, ReserveInfo } from "../utils/stellarReserveCalculator";
+import {
+  calculateStellarReserve,
+  ReserveInfo,
+} from "../utils/stellarReserveCalculator";
 
 export interface GeneralStats {
   totalTransactions: number;
@@ -160,7 +164,7 @@ export class StatsService {
     const stellarReserves = await Promise.all(
       keys.map((k) =>
         calculateStellarReserve(k).catch((err) => {
-          console.error(`Failed to calculate reserve for ${k}:`, err);
+          logger.error(`Failed to calculate reserve for ${k}:`, err);
           return {
             publicKey: k,
             baseReserve: 0,
@@ -170,8 +174,8 @@ export class StatsService {
             availableBalance: 0,
             isBelowThreshold: true,
           };
-        })
-      )
+        }),
+      ),
     );
 
     return { stellarReserves };

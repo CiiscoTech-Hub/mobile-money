@@ -1,9 +1,13 @@
+import logger from "../utils/logger";
 import { Request, Response, NextFunction } from "express";
 import { verifyOAuthAccessToken } from "../auth/oauth";
 import { verifyToken, JWTPayload } from "../auth/jwt";
 import { ADMIN_API_KEY } from "../config/env";
 import { redisClient } from "../config/redis";
 import { getAdminSep10Service } from "../stellar/adminSep10";
+import { evaluateGeoLoginAccess } from "../auth/geo";
+import { queryRead } from "../config/database";
+import { ScopeGroup } from "../auth/apikeys";
 
 type RequestUser = {
   id: string;
@@ -71,24 +75,88 @@ declare module "express-serve-static-core" {
 
 /**
  * Middleware to require a valid administrative API key, OAuth token, or admin SEP-10 token.
+ *
+ * API key resolution order:
+ *  1. Match against DB `api_keys` table — attaches the key's real `permissions` bitmask.
+ *  2. Fall back to ADMIN_API_KEY env var (system key) — grants ScopeGroup.FULL_ACCESS.
  */
-export const requireAuth = (
+export const requireAuth = async (
   req: Request,
   res: Response,
   next: NextFunction,
 ) => {
   const apiKey = req.header("X-API-Key");
-  const adminKey = ADMIN_API_KEY;
 
-  if (apiKey && apiKey === adminKey) {
-    (req as AuthRequest).user = {
-      id: "admin-system",
-      role: "admin",
-    };
-    // Issue #518: Admin keys get full permissions
-    (req as any).apiKeyPermissions = 0x0f; // ApiKeyPermission.ALL
+  if (apiKey) {
+    // 1. Look up from the database first (scoped keys)
+    try {
+      const result = await queryRead(
+        `SELECT permissions, is_active, expires_at, client_cert_cn, client_cert_fingerprint
+           FROM api_keys
+          WHERE key = $1
+          LIMIT 1`,
+        [apiKey],
+      );
 
-    return next();
+      if (result.rows.length > 0) {
+        const row = result.rows[0];
+        if (!row.is_active) {
+          return res
+            .status(401)
+            .json({ error: "Unauthorized", message: "API key is inactive" });
+        }
+        if (row.expires_at && new Date(row.expires_at) < new Date()) {
+          return res
+            .status(401)
+            .json({ error: "Unauthorized", message: "API key has expired" });
+        }
+
+        // Validate client certificate if mTLS is configured for this key
+        if (row.client_cert_cn || row.client_cert_fingerprint) {
+          const cert = (req.socket as any).getPeerCertificate?.();
+
+          if (!cert || Object.keys(cert).length === 0) {
+            return res.status(401).json({
+              error: "Unauthorized",
+              message: "mTLS validation failed: Client certificate is required for enterprise partner",
+            });
+          }
+
+          if (row.client_cert_cn && cert.subject?.CN !== row.client_cert_cn) {
+            return res.status(401).json({
+              error: "Unauthorized",
+              message: "mTLS validation failed: Client certificate Common Name (CN) mismatch",
+            });
+          }
+
+          if (row.client_cert_fingerprint && cert.fingerprint !== row.client_cert_fingerprint) {
+            return res.status(401).json({
+              error: "Unauthorized",
+              message: "mTLS validation failed: Client certificate fingerprint mismatch",
+            });
+          }
+        }
+
+        (req as AuthRequest).user = { id: "api-key-user", role: "admin" };
+        (req as any).apiKeyPermissions = row.permissions;
+        return next();
+      }
+    } catch (err) {
+      // DB lookup failure — fall through to env-var check so a DB outage doesn't
+      // lock out the system admin key.
+      logger.error("[requireAuth] DB api_keys lookup failed:", err);
+    }
+
+    // 2. Fall back to system ADMIN_API_KEY env var
+    if (apiKey === ADMIN_API_KEY) {
+      (req as AuthRequest).user = { id: "admin-system", role: "admin" };
+      (req as any).apiKeyPermissions = ScopeGroup.FULL_ACCESS;
+      return next();
+    }
+
+    return res
+      .status(401)
+      .json({ error: "Unauthorized", message: "Invalid API key" });
   }
 
   const authorization = req.header("Authorization");
@@ -104,18 +172,15 @@ export const requireAuth = (
         clientId: claims.client_id,
         scopes: claims.scope.split(/\s+/).filter(Boolean),
       };
-
       return next();
     } catch {
       // If OAuth fails, try admin SEP-10 token
       try {
         const adminSep10Service = getAdminSep10Service();
         const decoded = adminSep10Service.verifyToken(bearerToken);
-
-        // Verify this is an admin token (should have isAdmin flag, but we'll check the key)
         if (decoded.sub) {
           (req as AuthRequest).user = {
-            id: decoded.sub, // Stellar public key
+            id: decoded.sub,
             role: "admin",
             stellarPublicKey: decoded.sub,
           };
@@ -141,12 +206,13 @@ export const requireAuth = (
 /**
  * JWT Authentication middleware that verifies JWT tokens
  * and attaches user information to the request object
+ * Includes IP geofencing validation for operational regions
  */
-export function authenticateToken(
+export async function authenticateToken(
   req: Request,
   res: Response,
   next: NextFunction,
-): void {
+): Promise<void> {
   const authHeader = req.headers.authorization;
   const token = authHeader && authHeader.split(" ")[1]; // Bearer TOKEN
 
@@ -163,6 +229,17 @@ export function authenticateToken(
     if (rejectMutationDuringImpersonation(req, res, decoded)) {
       return;
     }
+
+    // IP Geofencing validation
+    const geoAccess = await evaluateGeoLoginAccess(req);
+    if (!geoAccess.allowed) {
+      res.status(403).json({
+        error: "Access denied",
+        message: geoAccess.reason || "Access from this region is not permitted",
+      });
+      return;
+    }
+
     req.jwtUser = decoded;
     next();
   } catch (error) {
@@ -226,15 +303,17 @@ export function optionalAuthentication(
 export async function verifyTokenStateful(token: string): Promise<JWTPayload> {
   // Run standard cryptographic verification
   const decoded = verifyToken(token);
-  
+
   // Fast Redis check to ensure token wasn't issued before a password change
   if (redisClient.isOpen && decoded.userId && decoded.iat) {
-    const invalidatedAtRaw = await redisClient.get(`user:${decoded.userId}:jwt_invalidated_at`);
+    const invalidatedAtRaw = await redisClient.get(
+      `user:${decoded.userId}:jwt_invalidated_at`,
+    );
     const invalidatedAt = invalidatedAtRaw ? String(invalidatedAtRaw) : null;
     if (invalidatedAt && decoded.iat <= parseInt(invalidatedAt, 10)) {
       throw new Error("Token has been revoked due to password change");
     }
   }
-  
+
   return decoded;
 }

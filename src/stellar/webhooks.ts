@@ -1,15 +1,28 @@
+import logger from "../utils/logger";
 import { Router, Request, Response } from "express";
-import { createHmac, timingSafeEqual } from "crypto";
+import { createHmac, timingSafeEqual, verify, createPublicKey } from "crypto";
+import { Keypair } from "@stellar/stellar-sdk";
 import { z } from "zod";
 import { TransactionModel, TransactionStatus } from "../models/transaction";
 import { notifyTransactionWebhook, WebhookEvent } from "../services/webhook";
+import { notifyReceivingAnchorStatus } from "../services/webhookService";
+import { ingestRateLimiter } from "../middleware/ingestRateLimit";
 
 const router = Router();
 const transactionModel = new TransactionModel();
 
+// Rate-limit ingest traffic before signature verification and DB writes.
+router.use(ingestRateLimiter);
+
 interface RawBodyRequest extends Request {
   rawBody?: Buffer;
 }
+
+const memoSchema = z.union([
+  z.object({ type: z.literal("text"), value: z.string() }),
+  z.object({ type: z.literal("id"), value: z.string() }),
+  z.object({ type: z.literal("hash"), value: z.string() }),
+]);
 
 const stellarWebhookSchema = z.object({
   transaction_hash: z.string().min(1),
@@ -19,39 +32,70 @@ const stellarWebhookSchema = z.object({
   source_account: z.string().optional(),
   destination_account: z.string().optional(),
   amount: z.string().optional(),
+  memo: memoSchema.optional(),
 });
 
 export type StellarWebhookPayload = z.infer<typeof stellarWebhookSchema>;
+
+/** Extract a plain string reference from any memo type. */
+function parseMemoValue(memo: z.infer<typeof memoSchema>): string {
+  return memo.value;
+}
 
 function verifyWebhookSignature(
   payload: string,
   signature: string | undefined,
   secret: string,
 ): boolean {
-  if (!signature || !signature.startsWith("sha256=")) {
-    return false;
+  if (!signature) return false;
+
+  if (signature.startsWith("ed25519=")) {
+    const expectedSignature = signature.substring(8);
+    try {
+      if (secret.startsWith("G") && secret.length === 56) {
+        const kp = Keypair.fromPublicKey(secret);
+        return kp.verify(
+          Buffer.from(payload),
+          Buffer.from(expectedSignature, "hex"),
+        );
+      } else {
+        const key = createPublicKey(secret);
+        return verify(
+          null,
+          Buffer.from(payload),
+          key,
+          Buffer.from(expectedSignature, "hex"),
+        );
+      }
+    } catch (e) {
+      return false;
+    }
   }
 
-  const expectedSignature = signature.substring(7);
-  const computedSignature = createHmac("sha256", secret)
-    .update(payload)
-    .digest("hex");
+  if (signature.startsWith("sha256=")) {
+    const expectedSignature = signature.substring(7);
+    const computedSignature = createHmac("sha256", secret)
+      .update(payload)
+      .digest("hex");
 
-  if (expectedSignature.length !== computedSignature.length) {
-    return false;
+    if (expectedSignature.length !== computedSignature.length) {
+      return false;
+    }
+
+    return timingSafeEqual(
+      Buffer.from(expectedSignature),
+      Buffer.from(computedSignature),
+    );
   }
 
-  return timingSafeEqual(
-    Buffer.from(expectedSignature),
-    Buffer.from(computedSignature),
-  );
+  return false;
 }
 
 router.post("/webhook", async (req: RawBodyRequest, res: Response) => {
   const webhookSecret = process.env.STELLAR_WEBHOOK_SECRET;
 
   if (!webhookSecret) {
-    console.error("[stellar-webhook] STELLAR_WEBHOOK_SECRET not configured");
+    logger.error("[stellar-webhook] STELLAR_WEBHOOK_SECRET not configured");
     return res.status(500).json({ error: "Webhook processing not configured" });
   }
 
@@ -65,7 +109,10 @@ router.post("/webhook", async (req: RawBodyRequest, res: Response) => {
 
   const parseResult = stellarWebhookSchema.safeParse(req.body);
   if (!parseResult.success) {
-    console.warn("[stellar-webhook] Validation failed", parseResult.error.issues);
+    console.warn(
+      "[stellar-webhook] Validation failed",
+      parseResult.error.issues,
+    );
     return res.status(400).json({
       error: "Validation failed",
       details: parseResult.error.issues,
@@ -80,9 +127,22 @@ router.post("/webhook", async (req: RawBodyRequest, res: Response) => {
       : TransactionStatus.Failed;
 
   try {
-    const transactions = await transactionModel.findByMetadata({
+    let transactions = await transactionModel.findByMetadata({
       stellar_hash: payload.transaction_hash,
     });
+
+    // Fall back to memo-based lookup if no match by hash
+    if (transactions.length === 0 && payload.memo) {
+      const memoValue = parseMemoValue(payload.memo);
+      const tx = await transactionModel.findByReferenceNumber(memoValue);
+      transactions = tx ? [tx] : [];
+
+      if (transactions.length === 0) {
+        transactions = await transactionModel.findByMetadata({
+          memo: memoValue,
+        });
+      }
+    }
 
     if (transactions.length === 0) {
       console.warn(
@@ -111,6 +171,7 @@ router.post("/webhook", async (req: RawBodyRequest, res: Response) => {
 
       await transactionModel.patchMetadata(transaction.id, {
         stellar_ledger: payload.ledger,
+        stellar_hash: payload.transaction_hash,
         webhook_processed_at: new Date().toISOString(),
       });
 
@@ -122,6 +183,19 @@ router.post("/webhook", async (req: RawBodyRequest, res: Response) => {
       await notifyTransactionWebhook(transaction.id, webhookEvent, {
         transactionModel,
       });
+
+      // Notify the receiving anchor only for SEP-31 terminal status changes.
+      const sep31Meta = (transaction.metadata as any)?.sep31;
+      if (sep31Meta) {
+        const newSep31Status =
+          newStatus === TransactionStatus.Completed ? "completed" : "error";
+        await notifyReceivingAnchorStatus(transaction, newSep31Status, {
+          ...transaction.metadata,
+          sep31: { ...sep31Meta, transactionHash: payload.transaction_hash },
+        }).catch((err) =>
+          logger.error(err, "[sep31-webhook] Error enqueuing webhook"),
+        );
+      }
 
       console.log(
         `[stellar-webhook] Updated transaction ${transaction.id} to ${newStatus}`,
@@ -135,7 +209,7 @@ router.post("/webhook", async (req: RawBodyRequest, res: Response) => {
       updated,
     });
   } catch (error) {
-    console.error("[stellar-webhook] Processing error", error);
+    logger.error(error, "[stellar-webhook] Processing error");
     return res.status(500).json({ error: "Internal server error" });
   }
 });

@@ -10,6 +10,21 @@ const mockComplianceDocumentModel = {
   getFacets: jest.fn(),
 };
 
+jest.mock("@stellar/stellar-sdk", () => ({
+  Networks: {
+    TESTNET: "Test SDF Network ; September 2015",
+    PUBLIC: "Public Global Stellar Network ; September 2015",
+  },
+  Keypair: {
+    fromSecret: jest.fn(),
+    random: jest.fn(),
+  },
+  Horizon: {
+    Server: jest.fn().mockImplementation(() => ({})),
+  },
+  Server: jest.fn().mockImplementation(() => ({})),
+}));
+
 jest.mock("../../models/complianceDocument", () => ({
   ComplianceDocumentModel: jest
     .fn()
@@ -83,6 +98,7 @@ jest.mock("../../models/transaction", () => ({
 }));
 
 const { adminRoutes } = require("../admin");
+const { errorHandler } = require("../../middleware/errorHandler");
 
 const documentFixture = {
   id: "doc-123",
@@ -108,6 +124,7 @@ const buildApp = (role = "admin") => {
     next();
   });
   app.use("/api/admin", adminRoutes);
+  app.use(errorHandler);
   return app;
 };
 

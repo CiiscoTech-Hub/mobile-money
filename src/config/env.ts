@@ -1,5 +1,5 @@
 import dotenv from "dotenv";
-import { cleanEnv, str, bool } from "envalid";
+import { cleanEnv, str, bool, num } from "envalid";
 
 // Load environment variables first
 dotenv.config();
@@ -22,9 +22,63 @@ export const env = cleanEnv(process.env, {
     desc: "Whether the application is running in sandbox mode",
     default: false,
   }),
+  DR_DATABASE_URL: str({
+    desc: "PostgreSQL connection string for disaster recovery / read-replica",
+    example: "postgresql://user:password@dr-host:5432/dbname",
+    default: "",
+  }),
   APP_MAINTENANCE_MODE: bool({
     desc: "Whether the application is in maintenance mode (read-only)",
     default: false,
+  }),
+  DB_MAX_CONNECTIONS: num({
+    desc: "Maximum number of connections in each database pool",
+    default: 50,
+  }),
+  DB_POOL_MAX_USES: num({
+    desc: "Maximum number of uses for a pool connection before it is closed and replaced (0 = unlimited)",
+    default: 0,
+  }),
+  DB_POOL_ALLOW_EXIT_ON_IDLE: bool({
+    desc: "Allow idle pool connections to exit when not in use",
+    default: false,
+  }),
+  DB_POOL_IDLE_TIMEOUT_MS: num({
+    desc: "Idle timeout in milliseconds for primary pool connections",
+    default: 15000,
+  }),
+  DB_POOL_CONNECTION_TIMEOUT_MS: num({
+    desc: "Connection timeout in milliseconds for primary pool connections",
+    default: 5000,
+  }),
+  DB_REPLICA_IDLE_TIMEOUT_MS: num({
+    desc: "Idle timeout in milliseconds for replica pool connections",
+    default: 30000,
+  }),
+  DB_REPLICA_CONNECTION_TIMEOUT_MS: num({
+    desc: "Connection timeout in milliseconds for replica pool connections",
+    default: 500,
+  }),
+  INDEX_REINDEX_JOB_ENABLED: bool({
+    default: true,
+    desc: "Whether the automated index reindex maintenance job should run",
+  }),
+  INDEX_REINDEX_CRON: str({
+    default: "0 3 * * *",
+    desc: "Cron schedule for the automated index reindex maintenance job",
+    example: "0 3 * * *",
+  }),
+  INDEX_REINDEX_MIN_SIZE_MB: num({
+    default: 100,
+    desc: "Minimum size in MB for an index to be eligible for automatic reindexing",
+  }),
+  INDEX_REINDEX_MAX_SCAN_COUNT: num({
+    default: 50,
+    desc: "Maximum scan count for an index to still be eligible for automatic reindexing",
+  }),
+  INDEX_REINDEX_MAX_ACTIVE_CONNECTIONS: num({
+    default: 5,
+    desc: "Maximum active queries allowed in the database before the automatic index reindex job is skipped",
   }),
   STELLAR_ISSUER_SECRET: str({
     desc: "Stellar secret key for the issuer account",
@@ -36,7 +90,7 @@ export const env = cleanEnv(process.env, {
   }),
   STELLAR_HORIZON_URL: str({
     default: "https://horizon-testnet.stellar.org",
-    desc: "Stellar Horizon server URL",
+    desc: "Stellar Horizon server URL, or a comma-separated list of URLs (primary first, then fallbacks) for automatic node rotation/failover",
   }),
   STELLAR_NETWORK: str({
     default: "testnet",
@@ -89,6 +143,54 @@ export const env = cleanEnv(process.env, {
     desc: "API key for third-party AML/sanction screening provider (e.g. Elliptic, Chainalysis)",
     example: "ell_live_xxxxxxxxxxxx",
   }),
+  QUICKBOOKS_CLIENT_ID: str({
+    default: "",
+    desc: "QuickBooks Online OAuth 2.0 Client ID",
+  }),
+  QUICKBOOKS_CLIENT_SECRET: str({
+    default: "",
+    desc: "QuickBooks Online OAuth 2.0 Client Secret",
+  }),
+  QUICKBOOKS_REDIRECT_URI: str({
+    default: "http://localhost:3000/api/accounting/quickbooks/callback",
+    desc: "QuickBooks Online OAuth 2.0 Redirect URI",
+  }),
+  XERO_CLIENT_ID: str({
+    default: "",
+    desc: "Xero OAuth 2.0 Client ID",
+  }),
+  XERO_CLIENT_SECRET: str({
+    default: "",
+    desc: "Xero OAuth 2.0 Client Secret",
+  }),
+  XERO_REDIRECT_URI: str({
+    default: "http://localhost:3000/api/accounting/xero/callback",
+    desc: "Xero OAuth 2.0 Redirect URI",
+  }),
+  TRANSACTION_WORKER_CONCURRENCY: num({
+    default: 50,
+    desc: "Transaction worker concurrency limit for parallel job processing",
+  }),
+  SYNC_WORKER_CONCURRENCY: num({
+    default: 20,
+    desc: "Accounting sync worker concurrency limit",
+  }),
+  WEBHOOK_RETRY_WORKER_CONCURRENCY: num({
+    default: 10,
+    desc: "Webhook retry worker concurrency limit",
+  }),
+  ACCOUNTING_RETRY_WORKER_CONCURRENCY: num({
+    default: 5,
+    desc: "Accounting retry worker concurrency limit",
+  }),
+  ACCOUNTING_TOKEN_REFRESH_WORKER_CONCURRENCY: num({
+    default: 3,
+    desc: "Accounting token refresh worker concurrency limit",
+  }),
+  PROVIDER_BALANCE_ALERT_WORKER_CONCURRENCY: num({
+    default: 1,
+    desc: "Provider balance alert worker concurrency limit (default 1 – sequential to prevent duplicate alerts)",
+  }),
 });
 
 // Re-export specific values for convenience
@@ -96,6 +198,7 @@ export const {
   DATABASE_URL,
   SANDBOX_DATABASE_URL,
   IS_SANDBOX,
+  DR_DATABASE_URL,
   STELLAR_ISSUER_SECRET,
   REDIS_URL,
   STELLAR_HORIZON_URL,
@@ -106,4 +209,21 @@ export const {
   PAGERDUTY_DEDUP_KEY,
   ADMIN_API_KEY,
   APP_MAINTENANCE_MODE,
+  INDEX_REINDEX_JOB_ENABLED,
+  INDEX_REINDEX_CRON,
+  INDEX_REINDEX_MIN_SIZE_MB,
+  INDEX_REINDEX_MAX_SCAN_COUNT,
+  INDEX_REINDEX_MAX_ACTIVE_CONNECTIONS,
+  QUICKBOOKS_CLIENT_ID,
+  QUICKBOOKS_CLIENT_SECRET,
+  QUICKBOOKS_REDIRECT_URI,
+  XERO_CLIENT_ID,
+  XERO_CLIENT_SECRET,
+  XERO_REDIRECT_URI,
+  TRANSACTION_WORKER_CONCURRENCY,
+  SYNC_WORKER_CONCURRENCY,
+  WEBHOOK_RETRY_WORKER_CONCURRENCY,
+  ACCOUNTING_RETRY_WORKER_CONCURRENCY,
+  ACCOUNTING_TOKEN_REFRESH_WORKER_CONCURRENCY,
+  PROVIDER_BALANCE_ALERT_WORKER_CONCURRENCY,
 } = env;

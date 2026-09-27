@@ -1,0 +1,2087 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Mobile Money Bridge API",
+    "version": "1.0.0",
+    "description": "API for bridging mobile money providers (MTN MoMo, Airtel Money, Orange Money) with the Stellar blockchain network.\n\nEnables low-cost cross-border payments and remittances across Africa by connecting mobile money wallets to Stellar's decentralized network.\n\n## Authentication\n\nMost endpoints require a JWT bearer token obtained via `POST /api/auth/login`:\n```\nAuthorization: Bearer <token>\n```\n\nAdmin endpoints require an API key:\n```\nX-API-Key: <key>\n```\n\n## Key Concepts\n\n- **Deposit**: Mobile money fiat (XAF, XOF, etc.) → Stellar tokens (USDC, XLM)\n- **Withdraw**: Stellar tokens → Mobile money fiat in the destination country\n- **Settlement**: Stellar network handles cross-border settlement in ~5 seconds at minimal cost\n- **KYC**: Tiered identity verification (Unverified, Basic, Full) determines daily transaction limits",
+    "contact": {
+      "name": "API Support",
+      "url": "https://github.com/sublime247/mobile-money/issues"
+    },
+    "license": {
+      "name": "MIT",
+      "url": "https://opensource.org/licenses/MIT"
+    }
+  },
+  "servers": [
+    {
+      "url": "http://localhost:3000",
+      "description": "Local development server"
+    },
+    {
+      "url": "https://api.mobile-money-bridge.com",
+      "description": "Production server"
+    }
+  ],
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+        "description": "JWT Bearer token obtained via `POST /api/auth/login`.\n\nInclude as: `Authorization: Bearer <token>`\n\nTokens expire after 24 hours. Use `POST /api/auth/refresh` with a valid refresh token to obtain a new access token without re-authenticating."
+      },
+      "apiKey": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-API-Key",
+        "description": "API key for admin-level operations.\n\nInclude as: `X-API-Key: <key>`\n\nAdmin API keys are generated via the admin dashboard. They grant full access to admin endpoints including user management, system configuration, and transaction oversight."
+      }
+    },
+    "schemas": {
+      "ErrorResponse": {
+        "type": "object",
+        "description": "Standard error envelope returned on failed API requests.",
+        "properties": {
+          "error": {
+            "type": "string",
+            "description": "Machine-readable error code or short description.",
+            "example": "Validation failed"
+          },
+          "message": {
+            "type": "string",
+            "description": "Human-readable error message with details.",
+            "example": "Amount must be a positive number"
+          }
+        }
+      },
+      "Pagination": {
+        "type": "object",
+        "description": "Pagination metadata for list endpoints.",
+        "properties": {
+          "limit": {
+            "type": "integer",
+            "description": "Maximum number of results per page.",
+            "example": 50
+          },
+          "offset": {
+            "type": "integer",
+            "description": "Offset from the start of the result set.",
+            "example": 0
+          },
+          "total": {
+            "type": "integer",
+            "description": "Total number of items matching the query (for offset pagination).",
+            "example": 120
+          },
+          "hasMore": {
+            "type": "boolean",
+            "description": "Whether more results are available (for cursor pagination).",
+            "example": false
+          }
+        }
+      },
+      "TransactionRequest": {
+        "type": "object",
+        "description": "Request payload to initiate a mobile money deposit or withdrawal.\n\nAmount is in the local fiat currency (XAF). Provider must match the phone number's network.",
+        "required": ["amount", "phoneNumber", "provider", "stellarAddress", "userId"],
+        "properties": {
+          "amount": {
+            "type": "number",
+            "description": "Transaction amount in the smallest currency unit (e.g., XAF — no decimals).\n\nMinimum: 100 XAF (anti-spam)\nMaximum: 1,000,000 XAF per transaction (fraud prevention)",
+            "example": 5000
+          },
+          "phoneNumber": {
+            "type": "string",
+            "pattern": "^\\+?\\d{10,15}$",
+            "description": "Mobile money phone number in E.164 format (+237670000000) or local format. Must match the selected provider's network.",
+            "example": "+237670000000"
+          },
+          "provider": {
+            "type": "string",
+            "enum": ["mtn", "airtel", "orange"],
+            "description": "Target mobile money provider.\n\n- **mtn**: MTN MoMo (Cameroon, Ivory Coast, Ghana, etc.)\n- **airtel**: Airtel Money (Kenya, Uganda, Tanzania, etc.)\n- **orange**: Orange Money (Guinea, Madagascar, etc.)",
+            "example": "mtn"
+          },
+          "stellarAddress": {
+            "type": "string",
+            "pattern": "^G[A-Z2-7]{55}$",
+            "description": "Destination Stellar public key (starts with 'G'). Must be a valid ed25519 Stellar account. The user must trust the anchor's issued asset before receiving tokens.",
+            "example": "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN"
+          },
+          "userId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The authenticated user's UUID. Inferred from the JWT token for standard requests; may be explicitly set for admin-initiated transactions.",
+            "example": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+          },
+          "notes": {
+            "type": "string",
+            "maxLength": 256,
+            "description": "Optional human-readable memo or reference for the transaction. Appears in transaction history and invoice. Max 256 characters.",
+            "example": "School fees payment"
+          }
+        }
+      },
+      "TransactionResponse": {
+        "type": "object",
+        "description": "Response returned after successfully initiating a deposit or withdrawal request.",
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "description": "Indicates whether the request was accepted for processing. 'true' means the transaction has been queued.",
+            "example": true
+          },
+          "transactionId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Unique transaction identifier (UUID v4). Use this ID with GET /api/transactions/{id} to check status.",
+            "example": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+          },
+          "referenceNumber": {
+            "type": "string",
+            "description": "Human-readable reference number for customer support.\n\nFormat: TXN-YYYYMMDD-NNN (deposits), WTH-YYYYMMDD-NNN (withdrawals).",
+            "example": "TXN-20240425-001"
+          },
+          "status": {
+            "type": "string",
+            "enum": ["pending", "processing", "completed", "failed", "cancelled", "review", "dispute", "reversed", "clawed_back"],
+            "description": "Initial status. New transactions start as 'pending' and advance to 'processing' once submitted to the mobile money provider.",
+            "example": "pending"
+          },
+          "amount": {
+            "type": "number",
+            "description": "The transaction amount as submitted.",
+            "example": 5000
+          },
+          "provider": {
+            "type": "string",
+            "description": "Mobile money provider handling this transaction.",
+            "example": "mtn"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "ISO 8601 timestamp of when the transaction was created on the server.",
+            "example": "2024-04-25T10:00:00.000Z"
+          }
+        }
+      },
+      "TransactionDetail": {
+        "type": "object",
+        "description": "Full detail of a single transaction, including Stellar on-chain reference when the transaction completes.",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Unique transaction identifier (UUID v4).",
+            "example": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+          },
+          "referenceNumber": {
+            "type": "string",
+            "description": "Human-readable reference number assigned by the system upon creation.",
+            "example": "TXN-20240425-001"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["deposit", "withdraw"],
+            "description": "Direction of the transaction relative to Stellar.\n\n- **deposit**: Mobile money fiat → Stellar tokens (user sends mobile money, receives Stellar assets)\n- **withdraw**: Stellar tokens → Mobile money fiat (user sends Stellar assets, receives mobile money)",
+            "example": "deposit"
+          },
+          "status": {
+            "type": "string",
+            "enum": ["pending", "processing", "completed", "failed", "cancelled", "review", "dispute", "reversed", "clawed_back"],
+            "description": "Current lifecycle status. Terminal (final) states: completed, failed, cancelled.",
+            "example": "completed"
+          },
+          "amount": {
+            "type": "number",
+            "description": "Transaction amount in the local currency.",
+            "example": 5000
+          },
+          "fee": {
+            "type": "number",
+            "description": "Processing fee deducted from the amount. Populated after fee calculation. Fee varies by provider, KYC tier, and VIP status.",
+            "example": 50
+          },
+          "provider": {
+            "type": "string",
+            "description": "Mobile money provider handling this transaction.",
+            "example": "mtn"
+          },
+          "phoneNumber": {
+            "type": "string",
+            "description": "Mobile money phone number associated with the transaction.",
+            "example": "+237670000000"
+          },
+          "stellarAddress": {
+            "type": "string",
+            "description": "Stellar account address involved in the transfer.",
+            "example": "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN"
+          },
+          "stellarTransactionHash": {
+            "type": "string",
+            "description": "Stellar network transaction hash (64 hex chars). Populated once the on-chain Stellar operation completes. Use this to look up the transaction on Stellar Explorer.",
+            "example": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+          },
+          "notes": {
+            "type": "string",
+            "description": "User-provided memo or reference attached to this transaction.",
+            "example": "School fees payment"
+          },
+          "metadata": {
+            "type": "object",
+            "description": "Arbitrary key-value metadata attached by the caller. Common use cases: internal reference IDs, category tagging, invoice linking.",
+            "example": { "category": "utilities", "invoiceId": "INV-001" }
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "ISO 8601 timestamp of when the transaction was created.",
+            "example": "2024-04-25T10:00:00.000Z"
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "ISO 8601 timestamp of the most recent status update.",
+            "example": "2024-04-25T10:05:00.000Z"
+          }
+        }
+      },
+      "TransactionListResponse": {
+        "type": "object",
+        "description": "Paginated list of transactions.",
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "example": true
+          },
+          "data": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/TransactionDetail" }
+          },
+          "pagination": {
+            "$ref": "#/components/schemas/Pagination"
+          }
+        }
+      },
+      "RegisterRequest": {
+        "type": "object",
+        "description": "Registration payload for a new user account.",
+        "required": ["phone_number", "password"],
+        "properties": {
+          "phone_number": {
+            "type": "string",
+            "description": "Phone number in E.164 format. This will serve as the user's login identifier.",
+            "example": "+237670000000"
+          },
+          "password": {
+            "type": "string",
+            "description": "Password with strong security requirements.\n\nMinimum 12 characters. Must include at least one uppercase letter, one lowercase letter, and one special character. Will be hashed with bcrypt before storage.",
+            "example": "Str0ng!Pass#2024",
+            "minLength": 12
+          }
+        }
+      },
+      "LoginRequest": {
+        "type": "object",
+        "description": "Login credentials. Returns JWT access token + refresh token on success.",
+        "required": ["phone_number", "password"],
+        "properties": {
+          "phone_number": {
+            "type": "string",
+            "description": "Registered phone number (E.164 format).",
+            "example": "+237670000000"
+          },
+          "password": {
+            "type": "string",
+            "description": "Account password.",
+            "example": "Str0ng!Pass#2024"
+          }
+        }
+      },
+      "LoginResponse": {
+        "type": "object",
+        "description": "Successful authentication response containing JWT tokens.",
+        "properties": {
+          "message": {
+            "type": "string",
+            "example": "Login successful"
+          },
+          "token": {
+            "type": "string",
+            "description": "JWT access token. Valid for 24 hours. Include in subsequent requests as: Authorization: Bearer <token>",
+            "example": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+          },
+          "refreshToken": {
+            "type": "string",
+            "description": "Refresh token for obtaining new access tokens without re-authenticating. Valid for 30 days. Store securely.",
+            "example": "dGhpcyBpcyBhIHJlZnJlc2ggdG9rZW4..."
+          },
+          "user": {
+            "type": "object",
+            "properties": {
+              "userId": {
+                "type": "string",
+                "format": "uuid",
+                "example": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+              },
+              "email": {
+                "type": "string",
+                "description": "User's phone number (used as email-like identifier).",
+                "example": "+237670000000"
+              },
+              "role": {
+                "type": "string",
+                "description": "RBAC role assigned to this user.",
+                "example": "user"
+              },
+              "permissions": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Array of permission strings for fine-grained access control.",
+                "example": ["read:transactions"]
+              }
+            }
+          }
+        }
+      },
+      "CreateVaultRequest": {
+        "type": "object",
+        "description": "Request to create a new savings vault. Vaults hold Stellar assets and earn yield.",
+        "required": ["name", "targetCurrency"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "User-defined name for the vault (e.g., \"Education Fund\", \"Emergency Savings\"). Must be unique per user.",
+            "example": "Education Fund"
+          },
+          "targetCurrency": {
+            "type": "string",
+            "description": "Target Stellar asset for the vault. Common values: USDC (stablecoin), XLM (native).",
+            "example": "USDC"
+          },
+          "goalAmount": {
+            "type": "number",
+            "description": "Optional savings goal amount. Used for progress tracking in the UI.",
+            "example": 1000000
+          }
+        }
+      },
+      "VaultTransferRequest": {
+        "type": "object",
+        "description": "Request to deposit funds into or withdraw funds from a savings vault.",
+        "required": ["amount", "direction"],
+        "properties": {
+          "amount": {
+            "type": "number",
+            "description": "Amount to transfer. Must be positive. Cannot exceed vault balance for withdrawals.",
+            "example": 50000
+          },
+          "direction": {
+            "type": "string",
+            "enum": ["deposit", "withdraw"],
+            "description": "Direction of the transfer relative to the vault.\n\n- **deposit**: Move funds from the user's main balance into the vault\n- **withdraw**: Move funds from the vault back to the user's main balance",
+            "example": "deposit"
+          }
+        }
+      },
+      "SubmitKycSchema": {
+        "type": "object",
+        "description": "KYC document submission payload. Accepts document images for identity verification.",
+        "required": ["documentType", "documentNumber"],
+        "properties": {
+          "documentType": {
+            "type": "string",
+            "enum": ["national_id", "passport", "drivers_license", "proof_of_address"],
+            "description": "Type of identity document being submitted.",
+            "example": "national_id"
+          },
+          "documentNumber": {
+            "type": "string",
+            "description": "Document identification number.",
+            "example": "CM-12345678"
+          },
+          "country": {
+            "type": "string",
+            "description": "ISO 3166-1 alpha-2 country code of document issuance.",
+            "example": "CM"
+          }
+        }
+      },
+      "WebhookPayload": {
+        "type": "object",
+        "description": "Payload delivered to registered webhook endpoints when transaction events occur.\n\nWebhooks are sent via POST with HMAC-SHA256 signature in the X-Webhook-Signature header for verification.",
+        "properties": {
+          "event_id": {
+            "type": "string",
+            "description": "Unique event identifier for deduplication.",
+            "example": "evt_1234567890"
+          },
+          "event_type": {
+            "type": "string",
+            "enum": ["transaction.completed", "transaction.failed", "transaction.pending", "transaction.cancelled"],
+            "description": "The type of event that triggered this webhook.",
+            "example": "transaction.completed"
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time",
+            "description": "ISO 8601 timestamp of when the event occurred.",
+            "example": "2026-03-27T11:46:00.000Z"
+          },
+          "transaction_id": {
+            "type": "string",
+            "description": "Internal transaction ID.",
+            "example": "txn_abc123def456"
+          },
+          "reference_number": {
+            "type": "string",
+            "description": "Human-readable reference number.",
+            "example": "REF-20260327-001"
+          },
+          "transaction_type": {
+            "type": "string",
+            "enum": ["deposit", "withdraw"],
+            "example": "deposit"
+          },
+          "amount": {
+            "type": "string",
+            "description": "Transaction amount as a decimal string.",
+            "example": "100.00"
+          },
+          "currency": {
+            "type": "string",
+            "description": "Currency code (e.g., USD, XAF, EUR).",
+            "example": "USD"
+          },
+          "phone_number": {
+            "type": "string",
+            "description": "Mobile money phone number involved.",
+            "example": "+237670000000"
+          },
+          "provider": {
+            "type": "string",
+            "description": "Mobile money provider.",
+            "example": "mtn"
+          },
+          "stellar_address": {
+            "type": "string",
+            "description": "Related Stellar account address.",
+            "example": "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN"
+          },
+          "status": {
+            "type": "string",
+            "enum": ["pending", "completed", "failed", "cancelled"],
+            "example": "completed"
+          }
+        }
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "Health",
+      "description": "Server health, readiness, and load balancer checks"
+    },
+    {
+      "name": "Auth",
+      "description": "Authentication, registration, login, token management, and 2FA"
+    },
+    {
+      "name": "Transactions",
+      "description": "Mobile money ↔ Stellar deposits and withdrawals. Initiate, list, inspect, cancel, and manage transaction metadata."
+    },
+    {
+      "name": "Vaults",
+      "description": "Savings vaults for goal-based asset storage with deposit/withdraw capabilities"
+    },
+    {
+      "name": "Contacts",
+      "description": "Saved payment contacts for quick transfers to frequently-used recipients"
+    },
+    {
+      "name": "Fees",
+      "description": "Fee configuration, estimates, and dynamic fee strategy engine with VIP tiers"
+    },
+    {
+      "name": "KYC",
+      "description": "Know Your Customer identity verification with tiered limits (Unverified, Basic, Full)"
+    },
+    {
+      "name": "KYC Tier Upgrades",
+      "description": "KYC tier upgrade requests, reviews, and approval workflow"
+    },
+    {
+      "name": "Disputes",
+      "description": "Transaction dispute management with evidence attachments, SLA tracking, and resolution workflow"
+    },
+    {
+      "name": "Webhooks",
+      "description": "Outgoing webhook configuration for receiving real-time transaction event notifications"
+    },
+    {
+      "name": "Users",
+      "description": "User profile management, settings, 2FA configuration, and GDPR data operations"
+    },
+    {
+      "name": "Admin",
+      "description": "Administrative operations: user management, system config, queue monitoring, and transaction oversight"
+    },
+    {
+      "name": "Reports",
+      "description": "Transaction reports, monthly statements (PDF), and data export"
+    },
+    {
+      "name": "Stellar",
+      "description": "Stellar blockchain data: account balances, transaction history, and network information"
+    },
+    {
+      "name": "HTLC",
+      "description": "Hash Time-Locked Contracts for atomic cross-chain swaps and conditional payments"
+    },
+    {
+      "name": "Prices",
+      "description": "Historical price data and exchange rate information"
+    },
+    {
+      "name": "SEP-38 Quotes",
+      "description": "SEP-38 Quote & Price Stream protocol — firm quotes locked in Redis for Stellar asset conversions"
+    },
+    {
+      "name": "SEP-30 Key Recovery",
+      "description": "SEP-30 Multi-Sig Key Recovery — M-of-N cryptographic recovery sessions with full audit trail"
+    },
+    {
+      "name": "SEP-10 Web Auth",
+      "description": "Stellar SEP-10 Web Authentication — challenge-response authentication for anchors and wallets"
+    },
+    {
+      "name": "SEP-12 KYC",
+      "description": "Stellar SEP-12 Customer KYC API — send and receive KYC data via Stellar protocol"
+    },
+    {
+      "name": "SEP-24 Interactive",
+      "description": "Stellar SEP-24 Interactive Anchor — hosted deposit and withdrawal flow"
+    },
+    {
+      "name": "SEP-31 Cross-Border",
+      "description": "Stellar SEP-31 Cross-Border Payment — send-side anchor for direct payments"
+    },
+    {
+      "name": "Compliance",
+      "description": "AML monitoring, Travel Rule (FATF) compliance, sanctions screening, and GDPR/privacy endpoints"
+    },
+    {
+      "name": "Merchants",
+      "description": "Merchant management, payment links, and settlement configuration"
+    },
+    {
+      "name": "Bulk Operations",
+      "description": "Batch transaction processing and bulk status queries"
+    }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "tags": ["Health"],
+        "summary": "Liveness probe",
+        "description": "Returns 200 OK if the server process is alive. Does NOT check database or Redis connectivity. Use /ready for a full dependency check.",
+        "operationId": "healthCheck",
+        "responses": {
+          "200": {
+            "description": "Server is alive",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "example": "ok"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/ready": {
+      "get": {
+        "tags": ["Health"],
+        "summary": "Readiness probe (DB + Redis)",
+        "description": "Returns 200 OK only when PostgreSQL and Redis connections are healthy. Returns 503 if any dependency is unreachable.",
+        "operationId": "readinessCheck",
+        "responses": {
+          "200": {
+            "description": "All dependencies healthy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "example": "ok"
+                    },
+                    "database": {
+                      "type": "string",
+                      "example": "connected"
+                    },
+                    "redis": {
+                      "type": "string",
+                      "example": "connected"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "One or more dependencies unavailable"
+          }
+        }
+      }
+    },
+    "/health/lb": {
+      "get": {
+        "tags": ["Health"],
+        "summary": "Load balancer health check",
+        "description": "Lightweight health check for load balancers. Returns plain text 'ok' with minimal overhead. No database queries.",
+        "operationId": "loadBalancerHealth",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string",
+                  "example": "ok"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/auth/register": {
+      "post": {
+        "tags": ["Auth"],
+        "summary": "Register a new user account",
+        "description": "Creates a new user account with phone number and password. The phone number must be unique. After registration, the user can log in via POST /api/auth/login to receive JWT tokens.",
+        "operationId": "registerUser",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RegisterRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "User registered successfully. The userId will be used to identify the user in subsequent operations.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "message": {
+                      "type": "string",
+                      "example": "User registered successfully"
+                    },
+                    "userId": {
+                      "type": "string",
+                      "format": "uuid",
+                      "example": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Validation error — invalid phone number format, weak password, or missing required fields.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflict — phone number is already registered.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/auth/login": {
+      "post": {
+        "tags": ["Auth"],
+        "summary": "Authenticate and receive JWT tokens",
+        "description": "Authenticates with phone number and password. Returns a JWT access token and a refresh token on success.\n\nThe access token must be included in subsequent requests as: `Authorization: Bearer <token>`\n\nAccess tokens expire after 24 hours. Use POST /api/auth/refresh with the refresh token to obtain a new access token.",
+        "operationId": "loginUser",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LoginRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Login successful. Returns JWT tokens and user info.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LoginResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid credentials — phone number not found or password incorrect.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Account locked due to too many consecutive failed login attempts. Try again later or contact support.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/auth/refresh": {
+      "post": {
+        "tags": ["Auth"],
+        "summary": "Rotate refresh token and issue new access token",
+        "description": "Uses a valid refresh token to obtain a new JWT access token and a new refresh token. This allows long-lived sessions without requiring the user to re-enter credentials.\n\nThe old refresh token is invalidated after successful rotation (token rotation pattern). Refresh tokens expire after 30 days of inactivity.",
+        "operationId": "refreshToken",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["refreshToken"],
+                "properties": {
+                  "refreshToken": {
+                    "type": "string",
+                    "description": "The refresh token received from POST /api/auth/login or a previous POST /api/auth/refresh call.",
+                    "example": "dGhpcyBpcyBhIHJlZnJlc2ggdG9rZW4..."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Token rotation successful. Returns new access token and refresh token.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "message": {
+                      "type": "string",
+                      "example": "Token rotation successful"
+                    },
+                    "token": {
+                      "type": "string",
+                      "description": "New JWT access token (valid for 24 hours)."
+                    },
+                    "refreshToken": {
+                      "type": "string",
+                      "description": "New refresh token (previous one is invalidated)."
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid or expired refresh token.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/auth/me": {
+      "get": {
+        "tags": ["Auth"],
+        "summary": "Get current authenticated user profile and balance",
+        "description": "Returns the authenticated user's profile information including their role, permissions, and current balance. Requires a valid JWT bearer token.",
+        "operationId": "getCurrentUser",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Current user info retrieved successfully.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "user": {
+                      "type": "object",
+                      "properties": {
+                        "userId": { "type": "string", "format": "uuid" },
+                        "email": { "type": "string" },
+                        "role": { "type": "string", "description": "RBAC role: user, admin, support, etc." },
+                        "permissions": {
+                          "type": "array",
+                          "items": { "type": "string" }
+                        },
+                        "total_deposited": {
+                          "type": "string",
+                          "description": "Lifetime total deposited amount as a decimal string.",
+                          "example": "250000.00"
+                        },
+                        "total_withdrawn": {
+                          "type": "string",
+                          "description": "Lifetime total withdrawn amount as a decimal string.",
+                          "example": "100000.00"
+                        },
+                        "current_balance": {
+                          "type": "string",
+                          "description": "Current available balance as a decimal string.",
+                          "example": "150000.00"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized — missing or invalid JWT token.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/transactions/deposit": {
+      "post": {
+        "tags": ["Transactions"],
+        "summary": "Initiate a mobile money deposit to Stellar",
+        "description": "Converts mobile money fiat (XAF, XOF, etc.) into Stellar tokens (USDC, XLM). The user sends mobile money from their phone, and the equivalent value in Stellar assets is credited to their Stellar account.\n\nTransaction limits depend on the user's KYC tier:\n- Unverified: 10,000 XAF/day\n- Basic (ID + selfie): 100,000 XAF/day\n- Full (proof of address + video): 1,000,000 XAF/day",
+        "operationId": "deposit",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TransactionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Deposit request accepted for processing.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TransactionResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Validation error, provider limit exceeded, or insufficient KYC tier.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized — missing or invalid JWT token.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/transactions/withdraw": {
+      "post": {
+        "tags": ["Transactions"],
+        "summary": "Initiate a Stellar withdrawal to mobile money",
+        "description": "Converts Stellar tokens (USDC, XLM) back into mobile money fiat. The user's Stellar balance is debited and the equivalent value is sent to their mobile money wallet.\n\nThis operation requires 2FA (TOTP) to be enabled on the account.",
+        "operationId": "withdraw",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TransactionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Withdrawal request accepted for processing.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TransactionResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Validation error, insufficient balance, or limit exceeded.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized — missing or invalid JWT token.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/transactions": {
+      "get": {
+        "tags": ["Transactions"],
+        "summary": "List transactions with pagination and filters",
+        "description": "Returns a paginated list of transactions for the authenticated user. Supports cursor-based and offset-based pagination. Filterable by status, type, provider, and date range.",
+        "operationId": "listTransactions",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Maximum number of transactions to return (1-100).",
+            "schema": { "type": "integer", "maximum": 100, "example": 20 }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "description": "Number of transactions to skip (offset-based pagination).",
+            "schema": { "type": "integer", "minimum": 0, "example": 0 }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "description": "Filter by transaction status.",
+            "schema": {
+              "type": "string",
+              "enum": ["pending", "processing", "completed", "failed", "cancelled"]
+            }
+          },
+          {
+            "name": "type",
+            "in": "query",
+            "description": "Filter by transaction type.",
+            "schema": {
+              "type": "string",
+              "enum": ["deposit", "withdraw"]
+            }
+          },
+          {
+            "name": "provider",
+            "in": "query",
+            "description": "Filter by mobile money provider.",
+            "schema": {
+              "type": "string",
+              "enum": ["mtn", "airtel", "orange"]
+            }
+          },
+          {
+            "name": "before",
+            "in": "query",
+            "description": "Cursor for backward pagination. Returns transactions created before this cursor ID.",
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "description": "Cursor for forward pagination. Returns transactions created after this cursor ID.",
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Paginated list of transactions.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TransactionListResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized — missing or invalid JWT token.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/transactions/{id}": {
+      "get": {
+        "tags": ["Transactions"],
+        "summary": "Get a single transaction by ID",
+        "description": "Returns full details of a specific transaction, including its current status, Stellar transaction hash (if completed), and any associated metadata.",
+        "operationId": "getTransaction",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Transaction UUID (v4).",
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "example": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Transaction details retrieved successfully.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TransactionDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Transaction not found or does not belong to the authenticated user.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/transactions/{id}/invoice": {
+      "get": {
+        "tags": ["Transactions"],
+        "summary": "Download a completed transaction invoice as PDF",
+        "description": "Generates and downloads a PDF invoice for a completed transaction. The invoice includes transaction details, fees, exchange rate, and a QR code for verification.\n\nOnly available for transactions with status 'completed'. Returns 400 for transactions in any other state.",
+        "operationId": "downloadInvoice",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "example": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+            }
+          },
+          {
+            "name": "download",
+            "in": "query",
+            "description": "Set to '0' to display the PDF inline in the browser instead of triggering a download.",
+            "schema": { "type": "string", "example": "1" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "PDF invoice generated successfully.",
+            "content": {
+              "application/pdf": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invoice only available for completed transactions.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Transaction not found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/transactions/{id}/cancel": {
+      "post": {
+        "tags": ["Transactions"],
+        "summary": "Cancel a pending transaction",
+        "description": "Cancels a transaction that is still in 'pending' status. Cannot cancel transactions already in 'processing', 'completed', or other terminal states.",
+        "operationId": "cancelTransaction",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "example": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Transaction cancelled successfully.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": { "type": "boolean", "example": true }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Cannot cancel transaction in current state.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Transaction not found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/transactions/{id}/dispute": {
+      "post": {
+        "tags": ["Disputes"],
+        "summary": "Open a dispute for a transaction",
+        "description": "Opens a formal dispute for a completed transaction. Disputes are reviewed by support agents and may result in a reversal or uphold decision.\n\nRequired: The transaction must be in 'completed' status and the dispute must be opened within 90 days of completion.",
+        "operationId": "openDispute",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "example": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["reason"],
+                "properties": {
+                  "reason": {
+                    "type": "string",
+                    "description": "The reason for opening the dispute.",
+                    "example": "Amount not credited to mobile money wallet"
+                  },
+                  "category": {
+                    "type": "string",
+                    "description": "Dispute category for routing.",
+                    "enum": ["amount_mismatch", "not_received", "duplicate", "other"]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Dispute opened successfully. A support agent will review the case."
+          },
+          "400": {
+            "description": "Transaction cannot be disputed (not completed, or outside dispute window).",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          },
+          "404": {
+            "description": "Transaction not found.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/transactions/{id}/notes": {
+      "patch": {
+        "tags": ["Transactions"],
+        "summary": "Update transaction notes",
+        "description": "Updates the notes/memo attached to a transaction. Replaces any existing notes. Max 256 characters.",
+        "operationId": "updateTransactionNotes",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "example": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["notes"],
+                "properties": {
+                  "notes": {
+                    "type": "string",
+                    "maxLength": 256,
+                    "description": "New notes text. Overwrites any existing notes.",
+                    "example": "Updated payment note: rent for March"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Notes updated successfully."
+          },
+          "404": {
+            "description": "Transaction not found.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/transactions/{id}/metadata": {
+      "put": {
+        "tags": ["Transactions"],
+        "summary": "Replace transaction metadata",
+        "description": "Replaces all metadata on a transaction with the provided key-value pairs. Existing metadata is completely overwritten.",
+        "operationId": "replaceMetadata",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "example": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["metadata"],
+                "properties": {
+                  "metadata": {
+                    "type": "object",
+                    "description": "New metadata to attach. All existing keys will be removed.",
+                    "example": { "category": "utilities", "invoiceId": "INV-001" }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Metadata replaced." },
+          "404": {
+            "description": "Transaction not found.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "tags": ["Transactions"],
+        "summary": "Merge transaction metadata keys",
+        "description": "Merges the provided metadata into the transaction's existing metadata. New keys are added, existing keys are overwritten, and keys not in the request are preserved.",
+        "operationId": "mergeMetadata",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "example": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["metadata"],
+                "properties": {
+                  "metadata": {
+                    "type": "object",
+                    "description": "Key-value pairs to merge into existing metadata.",
+                    "example": { "invoiceId": "INV-002", "paidBy": "john_doe" }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Metadata merged." },
+          "404": {
+            "description": "Transaction not found.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": ["Transactions"],
+        "summary": "Delete specific metadata keys from a transaction",
+        "description": "Removes specific keys from the transaction's metadata. Keys that do not exist are silently ignored.",
+        "operationId": "deleteMetadataKeys",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "example": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["keys"],
+                "properties": {
+                  "keys": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "minItems": 1,
+                    "description": "Array of metadata key names to remove.",
+                    "example": ["category", "invoiceId"]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Metadata keys deleted." },
+          "404": {
+            "description": "Transaction not found.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/vaults": {
+      "post": {
+        "tags": ["Vaults"],
+        "summary": "Create a new savings vault",
+        "description": "Creates a new goal-based savings vault. Vaults hold Stellar assets and allow users to set savings goals, track progress, and earn yield on deposited funds.",
+        "operationId": "createVault",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CreateVaultRequest" }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Vault created successfully.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": { "type": "boolean", "example": true },
+                    "data": {
+                      "type": "object",
+                      "properties": {
+                        "id": { "type": "string", "format": "uuid" },
+                        "name": { "type": "string" },
+                        "targetCurrency": { "type": "string" },
+                        "balance": { "type": "string", "example": "0.00" }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Validation error.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
+          },
+          "401": {
+            "description": "Unauthorized.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
+          },
+          "409": {
+            "description": "A vault with this name already exists.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
+          }
+        }
+      },
+      "get": {
+        "tags": ["Vaults"],
+        "summary": "List all vaults for the authenticated user",
+        "description": "Returns all savings vaults belonging to the authenticated user, with current balances and goal progress.",
+        "operationId": "listVaults",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "includeInactive",
+            "in": "query",
+            "description": "If 'true', includes vaults that have been deactivated or fully withdrawn.",
+            "schema": { "type": "string", "enum": ["true", "false"], "example": "false" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of vaults.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": { "type": "boolean", "example": true },
+                    "data": {
+                      "type": "array",
+                      "items": { "type": "object" }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
+          }
+        }
+      }
+    },
+    "/api/v1/vaults/balance-summary": {
+      "get": {
+        "tags": ["Vaults"],
+        "summary": "Get aggregated balance summary across all vaults",
+        "description": "Returns the total balance and vault count aggregated across all of the user's savings vaults.",
+        "operationId": "getVaultBalanceSummary",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Aggregated vault balance summary.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": { "type": "boolean", "example": true },
+                    "data": {
+                      "type": "object",
+                      "properties": {
+                        "totalBalance": { "type": "string", "example": "1500.00" },
+                        "vaultCount": { "type": "integer", "example": 3 }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
+          }
+        }
+      }
+    },
+    "/api/v1/vaults/{vaultId}/transfer": {
+      "post": {
+        "tags": ["Vaults"],
+        "summary": "Deposit or withdraw funds from a vault",
+        "description": "Moves funds between the user's main balance and a savings vault. Deposits add funds to the vault; withdrawals move funds back to the main balance.",
+        "operationId": "vaultTransfer",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "vaultId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "example": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/VaultTransferRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Transfer completed successfully." },
+          "400": {
+            "description": "Insufficient funds or validation error.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
+          },
+          "403": {
+            "description": "Access denied — vault does not belong to the authenticated user.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
+          },
+          "404": {
+            "description": "Vault not found.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
+          }
+        }
+      }
+    },
+    "/api/auth/2fa/enable": {
+      "post": {
+        "tags": ["Auth"],
+        "summary": "Enable TOTP 2FA for the authenticated user",
+        "description": "Enables time-based one-time password (TOTP) two-factor authentication using the Speakeasy library. Returns a QR code URI that the user can scan with any authenticator app (Google Authenticator, Authy, etc.).\n\nOnce enabled, 2FA is required for all withdrawal operations.",
+        "operationId": "enable2FA",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "2FA setup initiated. Returns the TOTP secret and QR code URI.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "secret": { "type": "string", "description": "TOTP shared secret." },
+                    "qrCodeUri": { "type": "string", "description": "otpauth:// URI for QR code generation." }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
+          }
+        }
+      }
+    },
+    "/api/kyc/submit": {
+      "post": {
+        "tags": ["KYC"],
+        "summary": "Submit KYC documents for identity verification",
+        "description": "Submits identity documents for KYC verification. The uploaded documents are stored securely in S3 and forwarded to the verification provider (Entrust).\n\nKYC tiers:\n- Basic: National ID or Passport + selfie\n- Full: Proof of address + video verification\n\nHigher KYC tiers unlock higher daily transaction limits.",
+        "operationId": "submitKyc",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "documentType": {
+                    "type": "string",
+                    "enum": ["national_id", "passport", "drivers_license", "proof_of_address"],
+                    "description": "Type of identity document."
+                  },
+                  "documentNumber": {
+                    "type": "string",
+                    "description": "Document identification number."
+                  },
+                  "documentImage": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "Image file of the document (JPEG, PNG, or PDF)."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "KYC documents submitted. Verification in progress.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": { "type": "boolean", "example": true },
+                    "status": { "type": "string", "example": "pending_review" }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid document or missing required fields.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
+          },
+          "401": {
+            "description": "Unauthorized.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
+          }
+        }
+      }
+    },
+    "/api/kyc/status": {
+      "get": {
+        "tags": ["KYC"],
+        "summary": "Check KYC verification status",
+        "description": "Returns the current KYC verification status and tier level for the authenticated user.",
+        "operationId": "getKycStatus",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "KYC status retrieved.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "tier": {
+                      "type": "string",
+                      "enum": ["unverified", "basic", "full"],
+                      "description": "Current KYC tier."
+                    },
+                    "status": {
+                      "type": "string",
+                      "enum": ["not_submitted", "pending", "approved", "rejected"],
+                      "description": "Verification status."
+                    },
+                    "dailyLimit": {
+                      "type": "string",
+                      "description": "Current daily transaction limit.",
+                      "example": "10000"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
+          }
+        }
+      }
+    },
+    "/api/stellar/balance/{address}": {
+      "get": {
+        "tags": ["Stellar"],
+        "summary": "Get Stellar account balance",
+        "description": "Returns the native XLM balance and all asset balances for a Stellar account. Results are cached for 5 minutes to reduce Horizon load.",
+        "operationId": "getStellarBalance",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "address",
+            "in": "path",
+            "required": true,
+            "description": "Stellar public key (G...).",
+            "schema": {
+              "type": "string",
+              "pattern": "^G[A-Z2-7]{55}$",
+              "example": "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Account balance retrieved.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "address": { "type": "string" },
+                    "balance": { "type": "string", "description": "XLM balance as a decimal string." },
+                    "balanceStroops": { "type": "string", "description": "XLM balance in stroops (1 XLM = 10^7 stroops)." },
+                    "assets": {
+                      "type": "array",
+                      "description": "Non-native asset balances.",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "asset_code": { "type": "string" },
+                          "asset_issuer": { "type": "string" },
+                          "balance": { "type": "string" }
+                        }
+                      }
+                    },
+                    "cached": { "type": "boolean", "description": "Whether the result was served from cache." }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid Stellar address format.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
+          },
+          "404": {
+            "description": "Stellar account not found on the network or not yet funded.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
+          }
+        }
+      }
+    },
+    "/graphql": {
+      "post": {
+        "tags": ["GraphQL"],
+        "summary": "GraphQL API endpoint",
+        "description": "GraphQL endpoint supporting queries, mutations, and real-time subscriptions.\n\nSee the GraphQL playground at /graphql in development mode for schema exploration and interactive query building.",
+        "operationId": "graphql",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["query"],
+                "properties": {
+                  "query": { "type": "string", "description": "GraphQL query string." },
+                  "variables": { "type": "object", "description": "Optional query variables." },
+                  "operationName": { "type": "string", "description": "Optional operation name." }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "GraphQL response (may contain errors or data).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": { "type": "object" },
+                    "errors": { "type": "array", "items": { "type": "object" } }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/metrics": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "Prometheus metrics endpoint",
+        "description": "Exposes application metrics in Prometheus text format. Includes transaction counts, response times, queue depths, error rates, and provider availability metrics.",
+        "operationId": "getMetrics",
+        "security": [{ "apiKey": [] }],
+        "responses": {
+          "200": {
+            "description": "Prometheus metrics in plain text format.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/admin/queues": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "BullMQ queue monitoring dashboard",
+        "description": "Access the BullMQ admin dashboard for monitoring job queues, retrying failed jobs, and inspecting queue metrics. Requires admin API key.",
+        "operationId": "adminQueues",
+        "security": [{ "apiKey": [] }],
+        "responses": {
+          "200": {
+            "description": "Queue dashboard HTML."
+          },
+          "401": {
+            "description": "Unauthorized — valid API key required.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
+          }
+        }
+      }
+    },
+    "/api/reconciliation": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "Provider reconciliation report",
+        "description": "Returns reconciliation data comparing internal transaction records with mobile money provider statements. Used for financial auditing and discrepancy detection.",
+        "operationId": "getReconciliation",
+        "security": [{ "apiKey": [] }],
+        "responses": {
+          "200": {
+            "description": "Reconciliation report.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": { "type": "boolean" },
+                    "data": { "type": "object" }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
+          }
+        }
+      }
+    },
+    "/api/stats": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "Transaction statistics",
+        "description": "Returns aggregate transaction statistics including volume, counts by status, provider breakdowns, and time-series data.",
+        "operationId": "getStats",
+        "security": [{ "apiKey": [] }],
+        "responses": {
+          "200": {
+            "description": "Statistics data.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": { "type": "boolean" },
+                    "data": { "type": "object" }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
+          }
+        }
+      }
+    },
+    "/api/gdpr/export": {
+      "get": {
+        "tags": ["Compliance"],
+        "summary": "GDPR data export",
+        "description": "Exports all personal data associated with the authenticated user in a machine-readable JSON format. Complies with GDPR Article 20 (right to data portability).",
+        "operationId": "gdprExport",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Personal data export in JSON format.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
+          }
+        }
+      }
+    },
+    "/api/gdpr/delete": {
+      "delete": {
+        "tags": ["Compliance"],
+        "summary": "Right to be forgotten",
+        "description": "Permanently deletes the authenticated user's account and all associated personal data. Complies with GDPR Article 17 (right to erasure).\n\nThis action is irreversible. Transaction records are anonymized (not deleted) to maintain financial audit trails.",
+        "operationId": "gdprDelete",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Account and personal data deletion initiated.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": { "type": "boolean", "example": true },
+                    "message": { "type": "string", "example": "Account deletion initiated. Data will be fully removed within 30 days." }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
+          }
+        }
+      }
+    }
+  }
+}

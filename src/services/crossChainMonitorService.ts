@@ -4,6 +4,9 @@ import {
   crossChainBalanceGauge,
   crossChainAnomalyTotal,
 } from "../utils/metrics";
+import logger from "../utils/logger";
+import { MTNProvider } from "./mobilemoney/providers/mtn";
+import { AirtelService } from "./mobilemoney/providers/airtel";
 
 export interface ChainAssetSnapshot {
   chain: "stellar" | "mtn" | "airtel" | "orange";
@@ -13,15 +16,61 @@ export interface ChainAssetSnapshot {
   capturedAt: Date;
 }
 
-// TODO: Wire real provider balance APIs when available
+/**
+ * Fetches the operational balance from a mobile money provider
+ * @param provider - The mobile money provider (MTN, Airtel, Orange)
+ * @param currency - The currency code (e.g., XAF, NGN)
+ * @returns The current balance as a string
+ */
 async function getProviderBalance(
   provider: MobileMoneyProvider,
   currency: string,
 ): Promise<string> {
-  console.log(
-    `[cross-chain-monitor] TODO: fetch real balance for ${provider}/${currency}`,
-  );
-  return "0";
+  try {
+    let result;
+
+    switch (provider) {
+      case MobileMoneyProvider.MTN:
+        const mtnProvider = new MTNProvider();
+        result = await mtnProvider.getOperationalBalance();
+        break;
+
+      case MobileMoneyProvider.AIRTEL:
+        const airtelService = new AirtelService();
+        result = await airtelService.getOperationalBalance();
+        break;
+
+      case MobileMoneyProvider.ORANGE:
+        logger.warn(
+          { provider, currency },
+          "Orange balance checks are not implemented",
+        );
+        return "0";
+
+      default:
+        logger.warn(
+          { provider, currency },
+          "Unknown provider for balance check",
+        );
+        return "0";
+    }
+
+    if (result.success && result.data) {
+      return result.data.availableBalance.toString();
+    } else {
+      logger.error(
+        { provider, currency, error: result.error },
+        "Failed to fetch provider balance",
+      );
+      return "0";
+    }
+  } catch (error) {
+    logger.error(
+      { error, provider, currency },
+      "Error fetching provider balance",
+    );
+    return "0";
+  }
 }
 
 function getStellarAddresses(): string[] {
@@ -33,9 +82,7 @@ function getStellarAddresses(): string[] {
 }
 
 function getDropThreshold(): number {
-  const val = parseFloat(
-    process.env.CROSS_CHAIN_DROP_THRESHOLD_PCT || "20",
-  );
+  const val = parseFloat(process.env.CROSS_CHAIN_DROP_THRESHOLD_PCT || "20");
   return isNaN(val) ? 20 : val;
 }
 
@@ -76,10 +123,7 @@ export class CrossChainMonitorService {
           });
         }
       } catch (err) {
-        console.error(
-          `[cross-chain-monitor] Failed to load Stellar account ${address}:`,
-          err,
-        );
+        logger.error({ error: err, address }, "Failed to load Stellar account");
       }
     }
 
@@ -90,8 +134,16 @@ export class CrossChainMonitorService {
       currency: string;
     }> = [
       { provider: MobileMoneyProvider.MTN, chain: "mtn", currency: "XAF" },
-      { provider: MobileMoneyProvider.AIRTEL, chain: "airtel", currency: "XAF" },
-      { provider: MobileMoneyProvider.ORANGE, chain: "orange", currency: "XAF" },
+      {
+        provider: MobileMoneyProvider.AIRTEL,
+        chain: "airtel",
+        currency: "XAF",
+      },
+      {
+        provider: MobileMoneyProvider.ORANGE,
+        chain: "orange",
+        currency: "XAF",
+      },
     ];
 
     for (const { provider, chain, currency } of providerCurrencyMap) {
@@ -133,11 +185,8 @@ export class CrossChainMonitorService {
               asset: snap.asset,
               reason,
             });
-            console.warn(
-              JSON.stringify({
-                level: "WARN",
-                timestamp: capturedAt.toISOString(),
-                message: "Cross-chain balance anomaly detected",
+            logger.warn(
+              {
                 chain: snap.chain,
                 asset: snap.asset,
                 address: snap.address,
@@ -146,7 +195,8 @@ export class CrossChainMonitorService {
                 dropPct: dropPct.toFixed(2),
                 thresholdPct: threshold,
                 reason,
-              }),
+              },
+              "Cross-chain balance anomaly detected",
             );
           }
         }
