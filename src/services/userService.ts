@@ -1,8 +1,13 @@
+import logger from "../utils/logger";
 import { Pool, PoolClient } from "pg";
 import { pool } from "../config/database";
 import { encrypt, decrypt } from "../utils/encryption";
 import { flushUserSessions } from "../config/redis";
 import { UserModel } from "../models/users";
+import {
+  isValidMerchantMCC,
+  requireValidMerchantMCC,
+} from "../utils/merchantMcc";
 
 export interface User {
   id: string;
@@ -10,6 +15,8 @@ export interface User {
   kyc_level: string;
   role_id?: string;
   role_name?: string;
+  display_name?: string | null;
+  mcc?: string | null;
   two_factor_secret?: string | null;
   two_factor_enabled?: boolean;
   two_factor_verified?: boolean;
@@ -22,6 +29,8 @@ export interface CreateUserRequest {
   phone_number: string;
   kyc_level?: string;
   role_name?: string;
+  mcc?: string;
+  display_name?: string | null;
 }
 
 export interface LoginRequest {
@@ -42,6 +51,8 @@ export async function getUserByPhoneNumber(
       u.phone_number,
       u.kyc_level,
       u.role_id,
+      u.display_name,
+      u.mcc,
       u.two_factor_secret,
       u.two_factor_enabled,
       u.two_factor_verified,
@@ -56,7 +67,7 @@ export async function getUserByPhoneNumber(
 
   const result = await pool.query(query, [encryptedPhone]);
   if (result.rows.length === 0) return null;
-  
+
   const row = result.rows[0];
   return {
     ...row,
@@ -75,6 +86,8 @@ export async function getUserById(userId: string): Promise<User | null> {
       u.phone_number,
       u.kyc_level,
       u.role_id,
+      u.display_name,
+      u.mcc,
       u.two_factor_secret,
       u.two_factor_enabled,
       u.two_factor_verified,
@@ -107,7 +120,20 @@ export async function createUser(userData: CreateUserRequest): Promise<User> {
     phone_number,
     kyc_level = "unverified",
     role_name = "user",
+    mcc,
+    display_name = null,
   } = userData;
+
+  const merchantMcc =
+    role_name === "merchant"
+      ? requireValidMerchantMCC(mcc)
+      : mcc
+        ? isValidMerchantMCC(mcc)
+          ? mcc.trim()
+          : (() => {
+              throw new Error(`Invalid Merchant MCC code '${mcc}'.`);
+            })()
+        : null;
 
   // Get role ID
   const roleQuery = "SELECT id FROM roles WHERE name = $1";
@@ -120,20 +146,28 @@ export async function createUser(userData: CreateUserRequest): Promise<User> {
   const roleId = roleResult.rows[0].id;
 
   const query = `
-    INSERT INTO users (phone_number, kyc_level, role_id)
-    VALUES ($1, $2, $3)
-    RETURNING id, phone_number, kyc_level, role_id, two_factor_secret, two_factor_enabled, two_factor_verified, backup_codes, created_at, updated_at
+    INSERT INTO users (phone_number, kyc_level, role_id, mcc, display_name)
+    VALUES ($1, $2, $3, $4, $5)
+    RETURNING id, phone_number, kyc_level, role_id, display_name, mcc, two_factor_secret, two_factor_enabled, two_factor_verified, backup_codes, created_at, updated_at
   `;
 
   const encryptedPhone = encrypt(phone_number, true);
-  const result = await pool.query(query, [encryptedPhone, kyc_level, roleId]);
+  const result = await pool.query(query, [
+    encryptedPhone,
+    kyc_level,
+    roleId,
+    merchantMcc,
+    display_name,
+  ]);
   const row = result.rows[0];
 
   const user = {
     ...row,
     phone_number: decrypt(row.phone_number) as string,
     two_factor_secret: decrypt(row.two_factor_secret),
-    role_name
+    role_name,
+    display_name: row.display_name ?? null,
+    mcc: row.mcc ?? null,
   };
 
   return user;
@@ -174,7 +208,7 @@ export async function updateUserRole(
     ...row,
     phone_number: decrypt(row.phone_number) as string,
     two_factor_secret: decrypt(row.two_factor_secret),
-    role_name: roleName
+    role_name: roleName,
   };
 
   return user;
@@ -187,7 +221,13 @@ export async function updateUserById(
   userId: string,
   userUpdate: Partial<User>,
 ): Promise<User> {
-  const allowedKeys = ["name", "email", "phone_number"] as const;
+  const allowedKeys = [
+    "name",
+    "email",
+    "phone_number",
+    "mcc",
+    "display_name",
+  ] as const;
   const keys = Object.keys(userUpdate).filter((k) =>
     allowedKeys.includes(k as any),
   ) as (keyof typeof userUpdate)[];
@@ -198,6 +238,13 @@ export async function updateUserById(
 
   const setClause = keys.map((k, i) => `${k} = ($${i + 1})`).join(", ");
   const values = keys.map((k) => userUpdate[k]);
+
+  if (userUpdate.mcc !== undefined && userUpdate.mcc !== null) {
+    if (!isValidMerchantMCC(userUpdate.mcc)) {
+      throw new Error(`Invalid Merchant MCC code '${userUpdate.mcc}'.`);
+    }
+    userUpdate.mcc = userUpdate.mcc.trim();
+  }
 
   const query = `UPDATE users
                 SET ${setClause}, updated_at = CURRENT_TIMESTAMP
@@ -213,7 +260,7 @@ export async function updateUserById(
 
     return result.rows[0];
   } catch (err) {
-    console.error("updateUser", err);
+    logger.error("updateUser", err);
     throw err;
   }
 }
@@ -288,7 +335,7 @@ export async function deactivateUserAccount(userId: string, dbPool?: Pool) {
     if (client) {
       await client.query("ROLLBACK");
     }
-    console.error("deactivateUserAccount error:", err);
+    logger.error("deactivateUserAccount error:", err);
     throw err;
   } finally {
     if (client) client.release();
@@ -309,7 +356,7 @@ export async function authenticateUser(
     try {
       return await createUser({ phone_number: phoneNumber });
     } catch (error) {
-      console.error("Failed to create user:", error);
+      logger.error("Failed to create user:", error);
       return null;
     }
   }
@@ -340,7 +387,7 @@ export async function getAllUsers(): Promise<User[]> {
   `;
 
   const result = await pool.query(query);
-  return result.rows.map(row => ({
+  return result.rows.map((row) => ({
     ...row,
     phone_number: decrypt(row.phone_number) as string,
     two_factor_secret: decrypt(row.two_factor_secret),
@@ -363,24 +410,68 @@ export async function getUserPermissions(userId: string): Promise<string[]> {
   return result.rows.map((row) => row.permission_name);
 }
 
-export async function invalidateUserOnPasswordChange(userId: string): Promise<void> {
+export async function invalidateUserOnPasswordChange(
+  userId: string,
+): Promise<void> {
   const userModel = new UserModel();
-  
+
   // 1. Increment DB token version (persisted invalidation)
   try {
     await userModel.incrementTokenVersion(userId);
   } catch (error: any) {
     // Graceful fallback: Ignore missing column error if the DB migration hasn't run yet
-    if (error.code !== '42703') throw error; 
+    if (error.code !== "42703") throw error;
   }
 
   // 2. Revoke all refresh token families
   try {
-    await pool.query(`UPDATE refresh_token_families SET is_revoked = true WHERE user_id = $1`, [userId]);
+    await pool.query(
+      `UPDATE refresh_token_families SET is_revoked = true WHERE user_id = $1`,
+      [userId],
+    );
   } catch (error) {
-    console.error("Failed to revoke refresh tokens:", error);
+    logger.error("Failed to revoke refresh tokens:", error);
   }
 
   // 3. Flush Redis express-sessions and flag active stateless JWTs
   await flushUserSessions(userId);
+}
+
+export interface GdprExportData {
+  profile: Partial<User>;
+  billing: any[];
+  logs: any[];
+  exportedAt: string;
+}
+
+/**
+ * Aggregates all data associated with a user profile for GDPR export,
+ * cleaning out internal metadata and sensitive secrets.
+ */
+export async function exportUserData(userId: string): Promise<GdprExportData> {
+  const user = await getUserById(userId);
+  if (!user) {
+    throw new Error(`User with ID ${userId} not found`);
+  }
+
+  // Strip sensitive secrets/metadata
+  const { two_factor_secret, backup_codes, ...sanitizedProfile } = user;
+
+  // Fetch billing records and application/activity logs
+  const billingRes = await pool.query(
+    `SELECT id, amount, currency, status, created_at FROM billing_records WHERE user_id = $1`,
+    [userId]
+  );
+
+  const logsRes = await pool.query(
+    `SELECT id, action, details, created_at FROM audit_logs WHERE user_id = $1`,
+    [userId]
+  );
+
+  return {
+    profile: sanitizedProfile,
+    billing: billingRes.rows || [],
+    logs: logsRes.rows || [],
+    exportedAt: new Date().toISOString(),
+  };
 }

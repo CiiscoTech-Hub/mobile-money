@@ -1,9 +1,11 @@
+import logger from "./logger";
 import CircuitBreaker, { CircuitBreakerOptions } from "opossum";
 import {
   providerCircuitBreakerState,
   providerCircuitBreakerTransitionsTotal,
 } from "./metrics";
 import { checkMobileMoneyHealth } from "../services/mobilemoney/providers/healthCheck";
+import { providerSettingsService } from "../services/providerSettingsService";
 
 export interface CircuitBreakerActionResult<T> {
   success: boolean;
@@ -43,10 +45,50 @@ function getCircuitKey(provider: string, operation: string): string {
   return `${provider}:${operation}`;
 }
 
-function getBreakerOptions(name: string): CircuitBreakerOptions {
+// Exported for testing only — callers should use getBreakerOptions()
+export function _resolveFailureThreshold(provider: string): number | null {
+  const providerEnv = `${provider.toUpperCase()}_CIRCUIT_BREAKER_FAILURE_THRESHOLD`;
+  const globalEnv = "PROVIDER_CIRCUIT_BREAKER_VOLUME_THRESHOLD";
+  const raw = process.env[providerEnv] ?? process.env[globalEnv];
+  return raw !== undefined ? Number(raw) : null;
+}
+
+// Exported for testing only — callers should use getBreakerOptions()
+export function _resolveTimeoutMs(provider: string): number | null {
+  const providerEnv = `${provider.toUpperCase()}_CIRCUIT_BREAKER_TIMEOUT_MS`;
+  const globalEnv = "PROVIDER_CIRCUIT_BREAKER_TIMEOUT_MS";
+  const raw = process.env[providerEnv] ?? process.env[globalEnv];
+  return raw !== undefined ? Number(raw) : null;
+}
+
+async function getBreakerOptions(
+  name: string,
+  provider: string,
+): Promise<CircuitBreakerOptions> {
+  let settings:
+    | import("../services/providerSettingsService").ProviderSettings
+    | null = null;
+  try {
+    settings = await providerSettingsService.getProviderSettings(provider);
+  } catch {
+    // DB unavailable — fall back to env vars / defaults
+  }
+
+  const providerThreshold = _resolveFailureThreshold(provider);
+  const volumeThreshold = settings
+    ? settings.failure_threshold
+    : (providerThreshold ??
+      Number(process.env.PROVIDER_CIRCUIT_BREAKER_VOLUME_THRESHOLD ?? 3));
+
+  const providerTimeout = _resolveTimeoutMs(provider);
+  const timeoutMs = settings
+    ? settings.timeout_ms
+    : (providerTimeout ??
+      Number(process.env.PROVIDER_CIRCUIT_BREAKER_TIMEOUT_MS ?? 5_000));
+
   return {
     name,
-    timeout: Number(process.env.PROVIDER_CIRCUIT_BREAKER_TIMEOUT_MS ?? 5_000),
+    timeout: timeoutMs,
     resetTimeout: Number(
       process.env.PROVIDER_CIRCUIT_BREAKER_RESET_TIMEOUT_MS ?? 30_000,
     ),
@@ -56,9 +98,7 @@ function getBreakerOptions(name: string): CircuitBreakerOptions {
     rollingCountBuckets: Number(
       process.env.PROVIDER_CIRCUIT_BREAKER_ROLLING_BUCKETS ?? 10,
     ),
-    volumeThreshold: Number(
-      process.env.PROVIDER_CIRCUIT_BREAKER_VOLUME_THRESHOLD ?? 3,
-    ),
+    volumeThreshold,
     errorThresholdPercentage: Number(
       process.env.PROVIDER_CIRCUIT_BREAKER_ERROR_THRESHOLD_PERCENTAGE ?? 50,
     ),
@@ -105,20 +145,22 @@ function normalizeResult<T>(
   throw toExecutionError(result.error);
 }
 
-function getOrCreateCircuitBreaker<T>(
+async function getOrCreateCircuitBreaker<T>(
   provider: string,
   operation: string,
-): ProviderCircuitBreaker<T> {
+): Promise<ProviderCircuitBreaker<T>> {
   const key = getCircuitKey(provider, operation);
   const existing = circuitBreakers.get(key);
   if (existing) {
     return existing as ProviderCircuitBreaker<T>;
   }
 
+  const options = await getBreakerOptions(key, provider);
+
   const breaker = new CircuitBreaker<
     [BreakerInvocation<T>, BreakerFallback<T> | undefined],
     CircuitBreakerActionResult<T>
-  >(async (execute) => normalizeResult(await execute()), getBreakerOptions(key));
+  >(async (execute) => normalizeResult(await execute()), options);
 
   breaker.fallback(async (_execute, fallback, error) => {
     if (!fallback) {
@@ -129,15 +171,21 @@ function getOrCreateCircuitBreaker<T>(
   });
 
   breaker.on("open", () => {
-    console.error(`Circuit breaker opened for ${provider}:${operation} due to high error rate`);
+    logger.error(
+      `Circuit breaker opened for ${provider}:${operation} due to high error rate`,
+    );
     emitStateTransitionMetric(provider, operation, "open");
   });
   breaker.on("halfOpen", () => {
-    console.log(`Circuit breaker half-open for ${provider}:${operation}, testing recovery`);
+    console.log(
+      `Circuit breaker half-open for ${provider}:${operation}, testing recovery`,
+    );
     emitStateTransitionMetric(provider, operation, "half_open");
   });
   breaker.on("close", () => {
-    console.log(`Circuit breaker closed for ${provider}:${operation}, service recovered`);
+    console.log(
+      `Circuit breaker closed for ${provider}:${operation}, service recovered`,
+    );
     emitStateTransitionMetric(provider, operation, "closed");
   });
 
@@ -149,7 +197,7 @@ function getOrCreateCircuitBreaker<T>(
 export async function executeWithCircuitBreaker<T>(
   options: ExecuteWithCircuitBreakerOptions<T>,
 ): Promise<CircuitBreakerActionResult<T>> {
-  const breaker = getOrCreateCircuitBreaker<T>(
+  const breaker = await getOrCreateCircuitBreaker<T>(
     options.provider,
     options.operation,
   );
@@ -159,39 +207,62 @@ export async function executeWithCircuitBreaker<T>(
 
 export function isCircuitBreakerOpenError(error: unknown): boolean {
   return (
-    error instanceof Error &&
-    "code" in error &&
-    error.code === "EOPENBREAKER"
+    error instanceof Error && "code" in error && error.code === "EOPENBREAKER"
   );
 }
 
 export function resetCircuitBreakers(): void {
   for (const breaker of circuitBreakers.values()) {
-    breaker.shutdown();
+    try {
+      breaker.shutdown();
+    } catch {
+      // ignore individual shutdown failures
+    }
   }
   circuitBreakers.clear();
 }
 
-export async function checkAndResetCircuitBreaker(provider: string, operation: string): Promise<boolean> {
+export function resetCircuitBreakerForProvider(provider: string): void {
+  for (const [key, breaker] of circuitBreakers.entries()) {
+    if (key.startsWith(`${provider}:`)) {
+      breaker.shutdown();
+      circuitBreakers.delete(key);
+    }
+  }
+}
+
+export async function checkAndResetCircuitBreaker(
+  provider: string,
+  operation: string,
+): Promise<boolean> {
   const key = getCircuitKey(provider, operation);
   const breaker = circuitBreakers.get(key);
   if (!breaker) {
     return false;
   }
 
-  // Only reset if open
-  if (breaker.opened) {
-    try {
-      const healthResult = await checkMobileMoneyHealth();
-      const providerHealth = healthResult.providers[provider as keyof typeof healthResult.providers];
-      if (providerHealth && providerHealth.status === "up") {
-        breaker.close();
-        console.log(`Circuit breaker for ${provider}:${operation} reset due to health check`);
-        return true;
-      }
-    } catch (error) {
-      console.error(`Failed to check health for ${provider}: ${error}`);
+  // Only attempt to reset if the circuit is open or half-open
+  const state = (breaker as any).toJSON().state as {
+    open: boolean;
+    halfOpen: boolean;
+  };
+  if (!state?.open && !state?.halfOpen) {
+    return false;
+  }
+
+  try {
+    const healthResult = await checkMobileMoneyHealth();
+    const providerHealth =
+      healthResult.providers[provider as keyof typeof healthResult.providers];
+    if (providerHealth && providerHealth.status === "up") {
+      breaker.close();
+      console.log(
+        `Circuit breaker for ${provider}:${operation} reset due to health check`,
+      );
+      return true;
     }
+  } catch (error) {
+    logger.error(`Failed to check health for ${provider}: ${error}`);
   }
   return false;
 }
@@ -199,3 +270,120 @@ export async function checkAndResetCircuitBreaker(provider: string, operation: s
 export function getCircuitBreakerCount(): number {
   return circuitBreakers.size;
 }
+
+export interface CircuitBreakerStateInfo {
+  key: string;
+  provider: string;
+  operation: string;
+  state: "OPEN" | "CLOSED" | "HALF-OPEN";
+  stats: {
+    failures: number;
+    fallbacks: number;
+    successes: number;
+    rejects: number;
+    fires: number;
+    timeouts: number;
+  };
+  options: {
+    volumeThreshold: number;
+    errorThresholdPercentage: number;
+    timeout: number;
+  };
+}
+
+export function getAllCircuitBreakerStatesInfo(): CircuitBreakerStateInfo[] {
+  const defaultTelcos = [
+    { provider: "mtn", operation: "payment" },
+    { provider: "airtel", operation: "payment" },
+    { provider: "orange", operation: "payment" },
+    { provider: "mpesa", operation: "payment" },
+  ];
+
+  for (const item of defaultTelcos) {
+    const key = getCircuitKey(item.provider, item.operation);
+    if (!circuitBreakers.has(key)) {
+      void getOrCreateCircuitBreaker(item.provider, item.operation);
+    }
+  }
+
+  const result: CircuitBreakerStateInfo[] = [];
+  for (const [key, breaker] of circuitBreakers.entries()) {
+    const parts = key.split(":");
+    const provider = parts[0] || key;
+    const operation = parts[1] || "default";
+
+    const jsonState = (breaker as any).toJSON?.()?.state || {};
+    let stateStr: "OPEN" | "CLOSED" | "HALF-OPEN" = "CLOSED";
+    if (jsonState.open || (breaker as any).opened || (breaker as any).forcedOpen) {
+      stateStr = "OPEN";
+    } else if (jsonState.halfOpen || (breaker as any).halfOpen) {
+      stateStr = "HALF-OPEN";
+    }
+
+    const stats = (breaker as any).stats || {
+      failures: 0,
+      fallbacks: 0,
+      successes: 0,
+      rejects: 0,
+      fires: 0,
+      timeouts: 0,
+    };
+
+    result.push({
+      key,
+      provider,
+      operation,
+      state: stateStr,
+      stats: {
+        failures: stats.failures || 0,
+        fallbacks: stats.fallbacks || 0,
+        successes: stats.successes || 0,
+        rejects: stats.rejects || 0,
+        fires: stats.fires || 0,
+        timeouts: stats.timeouts || 0,
+      },
+      options: {
+        volumeThreshold: Number((breaker as any).options?.volumeThreshold ?? 3),
+        errorThresholdPercentage: Number((breaker as any).options?.errorThresholdPercentage ?? 50),
+        timeout: Number((breaker as any).options?.timeout ?? 5000),
+      },
+    });
+  }
+
+  return result;
+}
+
+export async function forceCloseCircuitBreaker(
+  provider: string,
+  operation: string = "payment",
+): Promise<void> {
+  const key = getCircuitKey(provider, operation);
+  const breaker = circuitBreakers.get(key);
+  if (breaker) {
+    if (typeof (breaker as any).close === "function") {
+      (breaker as any).close();
+    }
+    (breaker as any).forcedOpen = false;
+  }
+  emitStateTransitionMetric(provider, operation, "closed");
+}
+
+/**
+ * Programmatically open (trip) the circuit breaker for a provider+operation.
+ * Creates the breaker if it doesn't exist yet.
+ */
+export async function tripCircuitBreaker(
+  provider: string,
+  operation: string,
+): Promise<void> {
+  const breaker = await getOrCreateCircuitBreaker(provider, operation);
+  // opossum exposes open() on its prototype; use the internal flag as fallback
+  if (typeof (breaker as any).open === "function") {
+    (breaker as any).open();
+  } else {
+    // Force-open by marking the breaker via its internal state setter
+    (breaker as any).forcedOpen = true;
+  }
+  emitStateTransitionMetric(provider, operation, "open");
+}
+

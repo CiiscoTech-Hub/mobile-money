@@ -6,12 +6,12 @@ import { redisClient } from "../config/redis";
 const freeTier = {
   points: 100, // 100 requests
   duration: 60, // per 60 seconds
-  keyPrefix: "rl_free"
+  keyPrefix: "rl_free",
 };
 const proTier = {
   points: 1000, // 1000 requests
   duration: 60, // per 60 seconds
-  keyPrefix: "rl_pro"
+  keyPrefix: "rl_pro",
 };
 
 const freeLimiter = new RateLimiterRedis({
@@ -26,12 +26,16 @@ const proLimiter = new RateLimiterRedis({
 function getTier(req: Request) {
   // Example: check req.user or req.jwtUser for tier
   // Default to free if not authenticated
-  if (req.user && req.user.tier === "pro") return "pro";
-  if (req.jwtUser && req.jwtUser.tier === "pro") return "pro";
+  if (req.user && (req.user as any).tier === "pro") return "pro";
+  if (req.jwtUser && (req.jwtUser as any).tier === "pro") return "pro";
   return "free";
 }
 
-export async function rateLimitMiddleware(req: Request, res: Response, next: NextFunction) {
+export async function rateLimitMiddleware(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) {
   const ip = req.ip;
   const userId = req.jwtUser?.userId || req.user?.id;
   const tier = getTier(req);

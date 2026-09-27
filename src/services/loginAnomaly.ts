@@ -1,3 +1,4 @@
+// @ts-ignore
 import geoip from "geoip-lite";
 import type { Request } from "express";
 import { redisClient } from "../config/redis";
@@ -82,12 +83,14 @@ export async function evaluateAdminLoginAnomaly(
     currentCountry &&
     previousCountry !== currentCountry;
 
-  const suspicious = Boolean(previousIp && previousIp !== currentIp && (rapidIpChange || locationChange));
+  const suspicious = Boolean(
+    previousIp && previousIp !== currentIp && (rapidIpChange || locationChange),
+  );
   const reason = locationChange
     ? "admin_login_location_change"
     : rapidIpChange
-    ? "admin_login_rapid_ip_change"
-    : undefined;
+      ? "admin_login_rapid_ip_change"
+      : undefined;
 
   await redisClient.set(ADMIN_LOGIN_IP_KEY(user.id), currentIp, {
     EX: ADMIN_LOGIN_TTL_SECONDS,

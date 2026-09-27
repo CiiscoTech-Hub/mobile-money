@@ -57,10 +57,7 @@ const resolvers = {
   },
 };
 
-function runValidation(
-  query: string,
-  rules: any[],
-): readonly GraphQLError[] {
+function runValidation(query: string, rules: any[]): readonly GraphQLError[] {
   const schema = makeExecutableSchema({ typeDefs, resolvers });
   const document = parse(query);
   return validate(schema, document, rules);
@@ -169,7 +166,7 @@ describe("GraphQL Query Complexity", () => {
 
     const errors = runValidation(query, [
       createComplexityRule({
-        maximumComplexity: 1000,
+        maximumComplexity: 500,
         estimators: [
           fieldExtensionsEstimator(),
           simpleEstimator({ defaultComplexity: 1 }),

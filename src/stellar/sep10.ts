@@ -1,15 +1,18 @@
+import logger from "../utils/logger";
 import { Router, Request, Response } from "express";
-import * as StellarSdk from "stellar-sdk";
+import * as StellarSdk from "@stellar/stellar-sdk";
 import jwt from "jsonwebtoken";
 import { v4 as uuidv4 } from "uuid";
 import { getStellarServer, getNetworkPassphrase } from "../config/stellar";
+import { ERROR_CODES } from "../constants/errorCodes";
+import { createError } from "../middleware/errorHandler";
 
 /**
  * SEP-10: Stellar Authentication
- * 
+ *
  * This implements Stellar Ecosystem Proposal 10 (SEP-10) standard for
  * authentication using Stellar accounts.
- * 
+ *
  * Specification: https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0010.md
  */
 
@@ -37,6 +40,17 @@ export interface Sep10VerifyParams {
   transaction: string;
 }
 
+export interface SignerInfo {
+  publicKey: string;
+  weight: number;
+}
+
+export interface AccountThresholds {
+  lowThreshold: number;
+  mediumThreshold: number;
+  highThreshold: number;
+}
+
 // ============================================================================
 // Configuration
 // ============================================================================
@@ -52,27 +66,91 @@ export interface Sep10Config {
 }
 
 export function getSep10Config(): Sep10Config {
-  const signingKey = process.env.STELLAR_SIGNING_KEY || process.env.STELLAR_ISSUER_SECRET;
+  const signingKey =
+    process.env.STELLAR_SIGNING_KEY || process.env.STELLAR_ISSUER_SECRET;
   if (!signingKey) {
-    throw new Error("STELLAR_SIGNING_KEY or STELLAR_ISSUER_SECRET must be defined");
+    throw new Error(
+      "STELLAR_SIGNING_KEY or STELLAR_ISSUER_SECRET must be defined",
+    );
   }
 
   // Validate the signing key format
   try {
     StellarSdk.Keypair.fromSecret(signingKey);
   } catch (error) {
-    throw new Error("Invalid STELLAR_SIGNING_KEY or STELLAR_ISSUER_SECRET format");
+    throw new Error(
+      "Invalid STELLAR_SIGNING_KEY or STELLAR_ISSUER_SECRET format",
+    );
+  }
+
+  const jwtSecret = process.env.JWT_SECRET;
+  if (!jwtSecret) {
+    throw new Error("JWT_SECRET must be defined for SEP-10 authentication");
   }
 
   return {
     signingKey,
     webAuthDomain: process.env.WEB_AUTH_DOMAIN || "https://api.mobilemoney.com",
     networkPassphrase: getNetworkPassphrase(),
-    jwtSecret: process.env.JWT_SECRET || "default-jwt-secret",
+    jwtSecret,
     challengeExpiresIn: 900, // 15 minutes
     jwtExpiresIn: "1h",
     homeDomain: process.env.STELLAR_HOME_DOMAIN || "api.mobilemoney.com",
   };
+}
+
+const clientDomainCache = new Map<string, { signingKey: string; fetchedAt: number }>();
+const CACHE_TTL_MS = 15 * 60 * 1000;
+
+export async function fetchClientDomainSigningKey(
+  clientDomain: string,
+  fetchFn?: typeof fetch,
+): Promise<string> {
+  const normalizedDomain = clientDomain.toLowerCase().trim();
+  const cached = clientDomainCache.get(normalizedDomain);
+  if (cached && Date.now() - cached.fetchedAt < CACHE_TTL_MS) {
+    return cached.signingKey;
+  }
+
+  const protocol =
+    normalizedDomain.startsWith("localhost") || normalizedDomain.includes("127.0.0.1")
+      ? "http"
+      : "https";
+  const url = `${protocol}://${normalizedDomain}/.well-known/stellar.toml`;
+
+  try {
+    const customFetch = fetchFn || globalThis.fetch;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+
+    const response = await customFetch(url, { signal: controller.signal });
+    clearTimeout(timeout);
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status} fetching stellar.toml`);
+    }
+
+    const text = await response.text();
+    const match =
+      text.match(/SIGNING_KEY\s*=\s*["']?([G][A-Z0-9]{55})["']?/i) ||
+      text.match(/URI_REQUEST_SIGNER\s*=\s*["']?([G][A-Z0-9]{55})["']?/i);
+
+    if (!match || !match[1]) {
+      throw new Error(`No SIGNING_KEY found in ${normalizedDomain}/.well-known/stellar.toml`);
+    }
+
+    const signingKey = match[1];
+    clientDomainCache.set(normalizedDomain, { signingKey, fetchedAt: Date.now() });
+    return signingKey;
+  } catch (error: any) {
+    logger.warn(
+      { clientDomain: normalizedDomain, err: error.message },
+      "[SEP-10] Failed to fetch or parse client domain stellar.toml",
+    );
+    throw new Error(
+      `Client domain verification failed: ${error.message || "Unable to fetch SIGNING_KEY"}`,
+    );
+  }
 }
 
 // ============================================================================
@@ -80,12 +158,24 @@ export function getSep10Config(): Sep10Config {
 // ============================================================================
 
 export class Sep10Service {
-  private config: Sep10Config;
+  protected config: Sep10Config;
   private serverKeypair: StellarSdk.Keypair;
+  private stellarServer: StellarSdk.Horizon.Server | null;
 
-  constructor(config: Sep10Config) {
+  constructor(config: Sep10Config, stellarServer?: StellarSdk.Horizon.Server) {
     this.config = config;
     this.serverKeypair = StellarSdk.Keypair.fromSecret(config.signingKey);
+    this.stellarServer = stellarServer || null;
+  }
+
+  /**
+   * Get the Stellar server instance, initializing if not provided
+   */
+  private getStellarServer(): StellarSdk.Horizon.Server {
+    if (!this.stellarServer) {
+      this.stellarServer = getStellarServer();
+    }
+    return this.stellarServer;
   }
 
   static isValidPublicKey(publicKey: string): boolean {
@@ -101,24 +191,191 @@ export class Sep10Service {
   }
 
   /**
+   * Fetch account signers from the Horizon API
+   *
+   * @param accountId - The Stellar account ID
+   * @returns Object containing signers and thresholds
+   */
+  async fetchAccountSigners(accountId: string): Promise<{
+    signers: SignerInfo[];
+    thresholds: AccountThresholds;
+    masterWeight: number;
+  }> {
+    try {
+      const server = this.getStellarServer();
+      const account = await server.loadAccount(accountId);
+
+      // Get master key weight
+      const masterWeight = (account as any).thresholds?.master_weight ?? 1;
+
+      // Extract all signers
+      const signers: SignerInfo[] = [];
+
+      // Add master key as a signer
+      if (masterWeight > 0) {
+        signers.push({
+          publicKey: accountId,
+          weight: masterWeight,
+        });
+      }
+
+      // Add other signers
+      if ((account as any).signers) {
+        for (const signer of (account as any).signers) {
+          if (signer.type === "ed25519_public_key") {
+            signers.push({
+              publicKey: signer.key,
+              weight: signer.weight,
+            });
+          }
+        }
+      }
+
+      const thresholds: AccountThresholds = {
+        lowThreshold: (account as any).thresholds?.low_threshold ?? 0,
+        mediumThreshold: (account as any).thresholds?.med_threshold ?? 0,
+        highThreshold: (account as any).thresholds?.high_threshold ?? 0,
+      };
+
+      return { signers, thresholds, masterWeight };
+    } catch (error) {
+      logger.error(
+        `[SEP-10] Failed to fetch account signers for ${accountId}:`,
+        error,
+      );
+      throw new Error(
+        `Unable to fetch account information from Horizon: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  /**
+   * Calculate the total weight of valid signatures on a transaction
+   * Excludes the server signature
+   *
+   * @param transaction - The transaction to analyze
+   * @param signers - The list of valid signers with their weights
+   * @param serverPublicKey - The server's public key (to exclude from weight calculation)
+   * @returns The total weight of client signatures
+   */
+  calculateSignatureWeights(
+    transaction: StellarSdk.Transaction,
+    signers: SignerInfo[],
+    serverPublicKey: string,
+  ): number {
+    const txHash = transaction.hash();
+    let totalWeight = 0;
+
+    // Track which signers we've already counted (to avoid double-counting)
+    const validatedSigners = new Set<string>();
+
+    // Check each signature in the transaction
+    for (const sig of transaction.signatures) {
+      const signatureBuffer = Buffer.from(sig.signature.toString(), "hex");
+
+      // Try to verify this signature against each signer
+      for (const signer of signers) {
+        // Skip the server's public key - it's already verified separately
+        if (signer.publicKey === serverPublicKey) {
+          continue;
+        }
+
+        // Skip if we already counted this signer
+        if (validatedSigners.has(signer.publicKey)) {
+          continue;
+        }
+
+        try {
+          const keypair = StellarSdk.Keypair.fromPublicKey(signer.publicKey);
+          if (keypair.verify(txHash, signatureBuffer)) {
+            totalWeight += signer.weight;
+            validatedSigners.add(signer.publicKey);
+            break; // Move to next signature
+          }
+        } catch {
+          // This signer didn't produce this signature, continue to next signer
+          continue;
+        }
+      }
+    }
+
+    return totalWeight;
+  }
+
+  /**
+   * Verify that signature weights meet the account's medium threshold
+   *
+   * @param clientAccountId - The client's account ID
+   * @returns true if threshold is met
+   */
+  async verifyThresholdMet(
+    transaction: StellarSdk.Transaction,
+    clientAccountId: string,
+  ): Promise<boolean> {
+    const { signers, thresholds, masterWeight } =
+      await this.fetchAccountSigners(clientAccountId);
+
+    // If medium threshold is 0, no signatures required (master key always authorized)
+    if (thresholds.mediumThreshold === 0) {
+      return true;
+    }
+
+    // Calculate total weight of valid client signatures (excluding server signature)
+    const clientSignatureWeight = this.calculateSignatureWeights(
+      transaction,
+      signers,
+      this.serverKeypair.publicKey(),
+    );
+
+    console.log(
+      `[SEP-10] Account: ${clientAccountId}, ` +
+        `Required weight: ${thresholds.mediumThreshold}, ` +
+        `Actual weight: ${clientSignatureWeight}`,
+    );
+
+    return clientSignatureWeight >= thresholds.mediumThreshold;
+  }
+
+  /**
    * Generate a challenge transaction for SEP-10 authentication
-   * 
+   *
    * @param clientPublicKey - The client's Stellar public key
    * @param homeDomain - Optional home domain (defaults to config)
+   * @param clientDomain - Optional client domain to verify against stellar.toml (#1946)
    * @returns Challenge response with transaction XDR and network passphrase
    */
-  generateChallenge(clientPublicKey: string, homeDomain?: string): Sep10ChallengeResponse {
+  async generateChallenge(
+    clientPublicKey: string,
+    homeDomain?: string,
+    clientDomain?: string,
+    fetchFn?: typeof fetch,
+  ): Promise<Sep10ChallengeResponse> {
     // Validate account address
     if (!Sep10Service.isValidPublicKey(clientPublicKey)) {
       throw new Error("Invalid Stellar public key");
     }
 
+    // Verify client domain against its stellar.toml if provided (#1946)
+    let clientDomainSigningKey: string | null = null;
+    if (clientDomain) {
+      clientDomainSigningKey = await fetchClientDomainSigningKey(clientDomain, fetchFn);
+    }
+
     const domain = homeDomain || this.config.homeDomain;
     const now = Math.floor(Date.now() / 1000);
-    const timebounds = {
-      minTime: String(now),
-      maxTime: String(now + this.config.challengeExpiresIn),
-    };
+    // v16+ rejects inverted timebounds (minTime > maxTime) at build time, so a
+    // non-positive expiry yields valid bounds whose maxTime is already in the past
+    // (challenges are then rejected as expired during verification).
+    const timebounds =
+      this.config.challengeExpiresIn < 0
+        ? {
+            minTime: String(now + this.config.challengeExpiresIn - 60),
+            maxTime: String(now + this.config.challengeExpiresIn),
+          }
+        : {
+            minTime: String(now),
+            maxTime: String(now + this.config.challengeExpiresIn),
+          };
 
     // Create a source account with sequence number 0
     const sourceAccount = new StellarSdk.Account(clientPublicKey, "-1");
@@ -141,7 +398,9 @@ export class Sep10Service {
     for (let i = 0; i < 32; i++) {
       memoBytes[i] = Math.floor(Math.random() * 256);
     }
-    builder = builder.addMemo(new StellarSdk.Memo(StellarSdk.MemoHash, memoBytes));
+    builder = builder.addMemo(
+      new StellarSdk.Memo(StellarSdk.MemoHash, memoBytes),
+    );
 
     // Add manageData operation for client
     builder = builder.addOperation(
@@ -149,8 +408,19 @@ export class Sep10Service {
         name: `${domain} auth`,
         value: nonce,
         source: clientPublicKey,
-      })
+      }),
     );
+
+    // Add client_domain operation if requested (#1946)
+    if (clientDomain) {
+      builder = builder.addOperation(
+        StellarSdk.Operation.manageData({
+          name: "client_domain",
+          value: clientDomain,
+          source: clientPublicKey,
+        }),
+      );
+    }
 
     // Add web_auth_domain operation from server
     builder = builder.addOperation(
@@ -158,7 +428,7 @@ export class Sep10Service {
         name: "web_auth_domain",
         value: this.config.webAuthDomain,
         source: this.serverKeypair.publicKey(),
-      })
+      }),
     );
 
     const transaction = builder.build();
@@ -172,18 +442,23 @@ export class Sep10Service {
 
   /**
    * Verify a signed challenge transaction and issue a JWT token
-   * 
+   * Supports both single-signature and multi-signature accounts
+   *
    * @param transactionXDR - The signed transaction XDR
    * @param clientAccountID - Optional client account ID for validation
    * @returns JWT token response
    */
-  verifyChallenge(transactionXDR: string, clientAccountID?: string): Sep10TokenResponse {
+  async verifyChallenge(
+    transactionXDR: string,
+    clientAccountID?: string,
+    fetchFn?: typeof fetch,
+  ): Promise<Sep10TokenResponse> {
     // Parse the transaction from XDR
     let transaction: StellarSdk.Transaction;
     try {
       transaction = StellarSdk.TransactionBuilder.fromXDR(
         transactionXDR,
-        this.config.networkPassphrase
+        this.config.networkPassphrase,
       ) as StellarSdk.Transaction;
     } catch (error) {
       throw new Error("Invalid transaction envelope");
@@ -194,15 +469,19 @@ export class Sep10Service {
       throw new Error("Transaction sequence number must be 0");
     }
 
-    // Verify timebounds
+    // Verify timebounds (#1942)
     const timeBounds = transaction.timeBounds;
-    if (!timeBounds) {
+    if (!timeBounds || !timeBounds.minTime || !timeBounds.maxTime) {
       throw new Error("Transaction must have timebounds");
     }
 
     const now = Math.floor(Date.now() / 1000);
     const minTime = parseInt(timeBounds.minTime, 10);
     const maxTime = parseInt(timeBounds.maxTime, 10);
+
+    if (isNaN(minTime) || isNaN(maxTime) || (maxTime === 0 && minTime === 0)) {
+      throw new Error("Invalid challenge timebounds");
+    }
 
     if (now < minTime) {
       throw new Error("Transaction is not yet valid");
@@ -213,7 +492,7 @@ export class Sep10Service {
     }
 
     // Verify all operations are manageData
-    if (!transaction.operations.every(op => op.type === "manageData")) {
+    if (!transaction.operations.every((op) => op.type === "manageData")) {
       throw new Error("Transaction must contain only manageData operations");
     }
 
@@ -222,14 +501,19 @@ export class Sep10Service {
     const clientPublicKey = firstOp.source || transaction.source;
 
     if (clientAccountID && clientPublicKey !== clientAccountID) {
-      throw new Error("First manageData operation source must match client account");
+      throw new Error(
+        "First manageData operation source must match client account",
+      );
     }
 
-    // Verify server signature
+    // Verify server signature (always required for SEP-10)
     const txHash = transaction.hash();
-    const serverSigned = transaction.signatures.some(sig => {
+    const serverSigned = transaction.signatures.some((sig) => {
       try {
-        return this.serverKeypair.verify(txHash, sig.signature());
+        return this.serverKeypair.verify(
+          Buffer.from(txHash),
+          Buffer.from(sig.signature.toString(), "hex"),
+        );
       } catch {
         return false;
       }
@@ -239,18 +523,53 @@ export class Sep10Service {
       throw new Error("Transaction is not signed by the server");
     }
 
-    // Verify client signature
-    const clientKeypair = StellarSdk.Keypair.fromPublicKey(clientPublicKey);
-    const clientSigned = transaction.signatures.some(sig => {
-      try {
-        return clientKeypair.verify(txHash, sig.signature());
-      } catch {
-        return false;
+    // Verify that signatures meet the account's threshold (supports multi-signature)
+    try {
+      const thresholdMet = await this.verifyThresholdMet(
+        transaction,
+        clientPublicKey,
+      );
+      if (!thresholdMet) {
+        throw new Error(
+          "Signing threshold not met. The account requires additional signatures to authorize this transaction.",
+        );
       }
-    });
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        error.message.includes("Signing threshold")
+      ) {
+        throw error; // Re-throw threshold errors as-is
+      }
+      // For other errors (e.g., account not found), throw with context
+      throw new Error(
+        `Failed to verify signing threshold: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
 
-    if (!clientSigned) {
-      throw new Error("Transaction is not signed by the client account");
+    // Verify client domain signature if client_domain operation is present (#1946)
+    const clientDomainOp = transaction.operations.find(
+      (op: any) => op.type === "manageData" && op.name === "client_domain",
+    ) as any;
+    if (clientDomainOp && clientDomainOp.value) {
+      const clientDomainStr = clientDomainOp.value.toString("utf8");
+      const clientDomainSigningKey = await fetchClientDomainSigningKey(clientDomainStr, fetchFn);
+      const clientDomainKeypair = StellarSdk.Keypair.fromPublicKey(clientDomainSigningKey);
+      const domainSigned = transaction.signatures.some((sig) => {
+        try {
+          return clientDomainKeypair.verify(
+            Buffer.from(txHash),
+            Buffer.from(sig.signature.toString(), "hex"),
+          );
+        } catch {
+          return false;
+        }
+      });
+      if (!domainSigned) {
+        throw new Error(
+          `Transaction is not signed by client domain SIGNING_KEY (${clientDomainSigningKey})`,
+        );
+      }
     }
 
     // Issue a JWT token
@@ -259,7 +578,7 @@ export class Sep10Service {
 
   /**
    * Issue a JWT token for the authenticated client
-   * 
+   *
    * @param clientPublicKey - The Stellar public key of the authenticated client
    * @returns JWT token response
    */
@@ -276,20 +595,24 @@ export class Sep10Service {
       home_domain: this.config.homeDomain,
     };
 
-    const token = jwt.sign(payload, this.config.jwtSecret, { algorithm: "HS256" });
+    const token = jwt.sign(payload, this.config.jwtSecret, {
+      algorithm: "HS256",
+    });
 
     return { token };
   }
 
   /**
    * Verify a JWT token issued by SEP-10
-   * 
+   *
    * @param token - JWT token to verify
    * @returns Decoded token payload
    */
   verifyToken(token: string): jwt.JwtPayload {
     try {
-      const decoded = jwt.verify(token, this.config.jwtSecret, { algorithms: ["HS256"] });
+      const decoded = jwt.verify(token, this.config.jwtSecret, {
+        algorithms: ["HS256"],
+      });
       return decoded as jwt.JwtPayload;
     } catch (error) {
       if (error instanceof jwt.TokenExpiredError) {
@@ -309,10 +632,10 @@ export class Sep10Service {
 
 export function createSep10Router(service?: Sep10Service): Router {
   const router = Router();
-  
+
   // Only create service if not provided and config is valid
   let sep10Service: Sep10Service | null = service || null;
-  
+
   if (!sep10Service) {
     try {
       sep10Service = new Sep10Service(getSep10Config());
@@ -324,60 +647,74 @@ export function createSep10Router(service?: Sep10Service): Router {
 
   /**
    * GET /
-   * 
+   *
    * SEP-10 challenge endpoint
    * Returns a challenge transaction for the client to sign
    */
-  router.get("/", (req: Request, res: Response) => {
+  router.get("/", async (req: Request, res: Response) => {
     if (!sep10Service) {
-      return res.status(503).json({
-        error: "SEP-10 service not configured",
-      });
+      throw createError(
+        ERROR_CODES.SERVICE_UNAVAILABLE,
+        "SEP-10 service not configured",
+        {
+          error: "SEP-10 service not configured",
+        },
+      );
     }
 
     try {
-      const { account, home_domain } = req.query;
+      const { account, home_domain, client_domain } = req.query;
 
       // Validate required parameters
       if (!account || typeof account !== "string") {
-        return res.status(400).json({
-          error: "account parameter is required",
-        });
+        throw createError(
+          ERROR_CODES.INVALID_INPUT,
+          "account parameter is required",
+          {
+            error: "account parameter is required",
+          },
+        );
       }
 
       // Generate the challenge transaction
-      const challenge = sep10Service.generateChallenge(
+      const challenge = await sep10Service.generateChallenge(
         account,
-        home_domain as string | undefined
+        home_domain as string | undefined,
+        client_domain as string | undefined,
       );
 
       return res.json(challenge);
     } catch (error) {
-      console.error("[SEP-10] Error generating challenge:", error);
-      
+      logger.error("[SEP-10] Error generating challenge:", error);
+
       if (error instanceof Error) {
-        return res.status(400).json({
+        throw createError(ERROR_CODES.INVALID_INPUT, error.message, {
           error: error.message,
         });
       }
 
-      return res.status(500).json({
-        error: "Failed to generate challenge transaction",
-      });
+      throw createError(
+        ERROR_CODES.INTERNAL_ERROR,
+        "Failed to generate challenge transaction",
+      );
     }
   });
 
   /**
    * POST /
-   * 
+   *
    * SEP-10 verification endpoint
    * Verifies the signed challenge transaction and issues a JWT token
    */
-  router.post("/", (req: Request, res: Response) => {
+  router.post("/", async (req: Request, res: Response) => {
     if (!sep10Service) {
-      return res.status(503).json({
-        error: "SEP-10 service not configured",
-      });
+      throw createError(
+        ERROR_CODES.SERVICE_UNAVAILABLE,
+        "SEP-10 service not configured",
+        {
+          error: "SEP-10 service not configured",
+        },
+      );
     }
 
     try {
@@ -385,42 +722,51 @@ export function createSep10Router(service?: Sep10Service): Router {
 
       // Validate required parameters
       if (!transaction || typeof transaction !== "string") {
-        return res.status(400).json({
-          error: "transaction parameter is required",
-        });
+        throw createError(
+          ERROR_CODES.INVALID_INPUT,
+          "transaction parameter is required",
+          {
+            error: "transaction parameter is required",
+          },
+        );
       }
 
       // Verify the challenge and issue a token
-      const tokenResponse = sep10Service.verifyChallenge(transaction);
+      const tokenResponse = await sep10Service.verifyChallenge(transaction);
 
       return res.json(tokenResponse);
     } catch (error) {
-      console.error("[SEP-10] Error verifying challenge:", error);
-      
+      logger.error("[SEP-10] Error verifying challenge:", error);
+
       if (error instanceof Error) {
-        return res.status(400).json({
+        throw createError(ERROR_CODES.INVALID_INPUT, error.message, {
           error: error.message,
         });
       }
 
-      return res.status(500).json({
-        error: "Failed to verify challenge transaction",
-      });
+      throw createError(
+        ERROR_CODES.INTERNAL_ERROR,
+        "Failed to verify challenge transaction",
+      );
     }
   });
 
   /**
    * GET /health
-   * 
+   *
    * Health check endpoint
    */
   router.get("/health", (req: Request, res: Response) => {
     if (!sep10Service) {
-      return res.status(503).json({
-        status: "unavailable",
-        service: "SEP-10 Authentication",
-        error: "Service not configured",
-      });
+      throw createError(
+        ERROR_CODES.SERVICE_UNAVAILABLE,
+        "SEP-10 service not configured",
+        {
+          status: "unavailable",
+          service: "SEP-10 Authentication",
+          error: "Service not configured",
+        },
+      );
     }
 
     return res.json({

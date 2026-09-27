@@ -3,8 +3,12 @@ name = "htlc"
 version = "0.1.0"
 edition = "2021"
 
+# Inherit workspace-level lint configuration.
+[lints]
+workspace = true
+
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 soroban-sdk = { version = "25.3.0", features = ["alloc"] }

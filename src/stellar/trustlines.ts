@@ -1,5 +1,6 @@
-import * as StellarSdk from "stellar-sdk";
+import * as StellarSdk from "@stellar/stellar-sdk";
 import { getStellarServer, getNetworkPassphrase } from "../config/stellar";
+import { resolveToBaseAddress } from "./muxed";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -37,12 +38,16 @@ export async function hasTrustline(
       (b) =>
         b.asset_type !== "native" &&
         b.asset_type !== "liquidity_pool_shares" &&
-        (b as StellarSdk.Horizon.HorizonApi.BalanceLine<"credit_alphanum4"> |
-          StellarSdk.Horizon.HorizonApi.BalanceLine<"credit_alphanum12">)
-          .asset_code === asset.getCode() &&
-        (b as StellarSdk.Horizon.HorizonApi.BalanceLine<"credit_alphanum4"> |
-          StellarSdk.Horizon.HorizonApi.BalanceLine<"credit_alphanum12">)
-          .asset_issuer === asset.getIssuer(),
+        (
+          b as
+            | StellarSdk.Horizon.HorizonApi.BalanceLine<"credit_alphanum4">
+            | StellarSdk.Horizon.HorizonApi.BalanceLine<"credit_alphanum12">
+        ).asset_code === asset.getCode() &&
+        (
+          b as
+            | StellarSdk.Horizon.HorizonApi.BalanceLine<"credit_alphanum4">
+            | StellarSdk.Horizon.HorizonApi.BalanceLine<"credit_alphanum12">
+        ).asset_issuer === asset.getIssuer(),
     );
   } catch (err: unknown) {
     // If the account does not exist on-chain it cannot have a trustline
@@ -157,17 +162,10 @@ export interface EnsureTrustlinesResult {
 export async function ensureTrustlines(
   options: EnsureTrustlinesOptions,
 ): Promise<EnsureTrustlinesResult> {
-  const {
-    accountKeypair,
-    assets,
-    sponsored = false,
-    sponsorKeypair,
-  } = options;
+  const { accountKeypair, assets, sponsored = false, sponsorKeypair } = options;
 
   if (sponsored && !sponsorKeypair) {
-    throw new Error(
-      "sponsorKeypair must be provided when sponsored is true",
-    );
+    throw new Error("sponsorKeypair must be provided when sponsored is true");
   }
 
   const result: EnsureTrustlinesResult = {
@@ -226,7 +224,10 @@ function isAccountNotFoundError(err: unknown): boolean {
 
 /** Thrown when a trustline operation is rejected by the Stellar network. */
 export class TrustlineError extends Error {
-  constructor(message: string, public readonly asset: StellarSdk.Asset) {
+  constructor(
+    message: string,
+    public readonly asset: StellarSdk.Asset,
+  ) {
     super(message);
     this.name = "TrustlineError";
   }
@@ -238,14 +239,28 @@ export class TrustlineError extends Error {
  * Throws a {@link TrustlineError} when the trustline is absent so callers can
  * surface a clear error before attempting an on-chain payment.
  *
- * @throws {TrustlineError} when the trustline is missing
+ * Supports both G-addresses and M-addresses. M-addresses are resolved to their
+ * underlying G-address before verification.
+ *
+ * @throws {TrustlineError} when the trustline is missing or address is invalid
  * @throws re-throws unexpected Horizon errors as-is
  */
 export async function checkDestinationTrustline(
   destinationAccount: string,
   asset: StellarSdk.Asset,
 ): Promise<void> {
-  const trusted = await hasTrustline(destinationAccount, asset);
+  // Resolve muxed address to base address
+  let baseAddress: string;
+  try {
+    baseAddress = resolveToBaseAddress(destinationAccount);
+  } catch (error) {
+    throw new TrustlineError(
+      `Invalid destination account ${destinationAccount}: ${error instanceof Error ? error.message : "unknown error"}`,
+      asset,
+    );
+  }
+
+  const trusted = await hasTrustline(baseAddress, asset);
   if (!trusted) {
     throw new TrustlineError(
       `Destination account ${destinationAccount} has no trustline for ${asset.getCode()}`,

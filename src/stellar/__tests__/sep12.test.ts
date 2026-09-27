@@ -3,9 +3,13 @@ import express, { Express } from "express";
 import { Pool } from "pg";
 import { createSep12Router, Sep12CustomerStatus } from "../sep12";
 import KYCService, { KYCLevel, KYCStatus } from "../../services/kyc";
+import { UserModel } from "../../models/users";
+import { errorHandler } from "../../middleware/errorHandler";
+import { Keypair } from "@stellar/stellar-sdk";
 
-// Mock KYC Service
+// Mock KYC Service & UserModel
 jest.mock("../../services/kyc");
+jest.mock("../../models/users");
 
 describe("SEP-12 KYC API", () => {
   let app: Express;
@@ -13,6 +17,13 @@ describe("SEP-12 KYC API", () => {
   let mockKycService: jest.Mocked<KYCService>;
 
   beforeEach(() => {
+    (UserModel as jest.MockedClass<typeof UserModel>).mockImplementation(
+      () =>
+        ({
+          updateSensitiveData: jest.fn().mockResolvedValue(undefined),
+        }) as any,
+    );
+
     // Create mock database
     mockDb = {
       query: jest.fn(),
@@ -26,12 +37,15 @@ describe("SEP-12 KYC API", () => {
       getVerificationStatus: jest.fn(),
     } as any;
 
-    (KYCService as jest.MockedClass<typeof KYCService>).mockImplementation(() => mockKycService);
+    (KYCService as jest.MockedClass<typeof KYCService>).mockImplementation(
+      () => mockKycService,
+    );
 
     // Create Express app with SEP-12 router
     app = express();
     app.use(express.json());
     app.use("/sep12", createSep12Router(mockDb));
+    app.use(errorHandler);
   });
 
   afterEach(() => {
@@ -346,25 +360,109 @@ describe("SEP-12 KYC API", () => {
   });
 
   describe("DELETE /customer/:account", () => {
-    it("should delete customer information", async () => {
-      mockDb.query.mockResolvedValueOnce({
-        rows: [],
-        command: "",
-        oid: 0,
-        rowCount: 1,
-        fields: [],
+    const account = Keypair.random().publicKey();
+    let client: { query: jest.Mock; release: jest.Mock };
+
+    /** Route SQL issued inside the erasure transaction to canned results. */
+    const mockErasureDb = (
+      users: Array<{ id: string; anonymized_at: Date | null }>,
+    ) => {
+      client = {
+        release: jest.fn(),
+        query: jest.fn(async (sql: string) => {
+          if (sql.includes("FROM users WHERE stellar_address")) {
+            return { rows: users };
+          }
+          if (sql.includes("FROM transactions")) {
+            return {
+              rows: [
+                {
+                  id: "tx-1",
+                  reference_number: "REF-1",
+                  stellar_transaction_hash: "abc123",
+                  amount: "10.0000000",
+                  created_at: "2026-01-01",
+                },
+              ],
+            };
+          }
+          if (sql.includes("RETURNING anonymized_at")) {
+            return {
+              rows: [{ anonymized_at: new Date("2026-09-24T00:00:00Z") }],
+            };
+          }
+          return { rows: [] };
+        }),
+      };
+      (mockDb as any).connect = jest.fn().mockResolvedValue(client);
+    };
+
+    it("anonymizes the customer and returns 200", async () => {
+      mockErasureDb([{ id: "user-1", anonymized_at: null }]);
+
+      const response = await request(app).delete(`/sep12/customer/${account}`);
+
+      expect(response.status).toBe(200);
+      expect(response.body).toMatchObject({
+        status: "anonymized",
+        account,
+        already_anonymized: false,
+        retained_transactions: 1,
       });
-
-      const response = await request(app).delete("/sep12/customer/GABC123...");
-
-      expect(response.status).toBe(204);
-      expect(mockDb.query).toHaveBeenCalledWith(
-        expect.stringContaining("DELETE FROM kyc_applicants"),
-        ["GABC123..."]
-      );
+      const sql = client.query.mock.calls.map(([q]) => String(q));
+      expect(sql[0]).toBe("BEGIN");
+      expect(sql[sql.length - 1]).toBe("COMMIT");
+      expect(sql.some((q) => q.includes("UPDATE users"))).toBe(true);
+      // Never a hard delete of customer or financial records.
+      expect(sql.some((q) => /DELETE FROM/i.test(q))).toBe(false);
+      expect(client.release).toHaveBeenCalled();
     });
 
-    it("should return 400 if account is missing", async () => {
+    it("returns 200 without re-erasing an already anonymized customer", async () => {
+      mockErasureDb([{ id: "user-1", anonymized_at: new Date("2026-01-01") }]);
+
+      const response = await request(app).delete(`/sep12/customer/${account}`);
+
+      expect(response.status).toBe(200);
+      expect(response.body.already_anonymized).toBe(true);
+      const sql = client.query.mock.calls.map(([q]) => String(q));
+      expect(sql.some((q) => q.includes("UPDATE users"))).toBe(false);
+    });
+
+    it("returns 404 when the customer does not exist", async () => {
+      mockErasureDb([]);
+
+      const response = await request(app).delete(`/sep12/customer/${account}`);
+
+      expect(response.status).toBe(404);
+    });
+
+    it("returns 400 for an invalid Stellar account", async () => {
+      mockErasureDb([]);
+
+      const response = await request(app).delete("/sep12/customer/GABC123");
+
+      expect(response.status).toBe(400);
+      expect((mockDb as any).connect).not.toHaveBeenCalled();
+    });
+
+    it("rolls back and returns 500 when anonymization fails", async () => {
+      mockErasureDb([{ id: "user-1", anonymized_at: null }]);
+      const base = client.query.getMockImplementation()!;
+      client.query.mockImplementation(async (sql: string) => {
+        if (sql.includes("UPDATE kyc_applicants")) throw new Error("db down");
+        return base(sql);
+      });
+
+      const response = await request(app).delete(`/sep12/customer/${account}`);
+
+      expect(response.status).toBe(500);
+      const sql = client.query.mock.calls.map(([q]) => String(q));
+      expect(sql).toContain("ROLLBACK");
+      expect(sql).not.toContain("COMMIT");
+    });
+
+    it("returns 404 if account is missing", async () => {
       const response = await request(app).delete("/sep12/customer/");
 
       expect(response.status).toBe(404);
@@ -407,7 +505,9 @@ describe("SEP-12 KYC API", () => {
 
       expect(response.status).toBe(200);
       expect(response.body.fields.organization_name).toBeDefined();
-      expect(response.body.fields.organization_registration_number).toBeDefined();
+      expect(
+        response.body.fields.organization_registration_number,
+      ).toBeDefined();
     });
 
     it("should include document fields for unverified customers", async () => {

@@ -11,19 +11,19 @@ Internet → ALB (public subnets) → ECS Fargate (private subnets) → RDS Post
 
 ## Modules
 
-| Module | Purpose |
-|--------|---------|
-| `modules/vpc` | VPC, public/private subnets, IGW, NAT, route tables |
-| `modules/security` | Security groups for ALB, app, database, Redis |
+| Module             | Purpose                                                 |
+| ------------------ | ------------------------------------------------------- |
+| `modules/vpc`      | VPC, public/private subnets, IGW, NAT, route tables     |
+| `modules/security` | Security groups for ALB, app, database, Redis           |
 | `modules/database` | RDS PostgreSQL 16 with encryption and automated backups |
-| `modules/redis` | ElastiCache Redis 7 replication group |
-| `modules/web` | ALB + ECS Fargate cluster with auto-scaling |
+| `modules/redis`    | ElastiCache Redis 7 replication group                   |
+| `modules/web`      | ALB + ECS Fargate cluster with auto-scaling             |
 
 ## Prerequisites
 
 - [Terraform](https://developer.hashicorp.com/terraform/install) >= 1.5
 - AWS CLI configured with appropriate credentials
-- An S3 bucket + DynamoDB table for remote state (optional, see `main.tf`)
+- Remote backend configured in `terraform/main.tf` using S3 + DynamoDB locking
 
 ## Quick Start
 
@@ -60,12 +60,12 @@ terraform apply -var-file="environments/production.tfvars"
 
 After `terraform apply`, these values are available:
 
-| Output | Description |
-|--------|-------------|
-| `alb_dns_name` | ALB DNS — point your domain here |
-| `db_endpoint` | RDS PostgreSQL host:port |
-| `redis_endpoint` | ElastiCache primary endpoint |
-| `ecs_cluster_name` | ECS cluster name |
+| Output             | Description                      |
+| ------------------ | -------------------------------- |
+| `alb_dns_name`     | ALB DNS — point your domain here |
+| `db_endpoint`      | RDS PostgreSQL host:port         |
+| `redis_endpoint`   | ElastiCache primary endpoint     |
+| `ecs_cluster_name` | ECS cluster name                 |
 
 ```bash
 terraform output alb_dns_name

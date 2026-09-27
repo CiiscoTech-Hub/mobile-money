@@ -1,3 +1,4 @@
+import logger from "../utils/logger";
 /**
  * KYC Tier Upgrade Job
  *
@@ -19,7 +20,7 @@ import {
 export async function runKycTierUpgradeJob(): Promise<void> {
   console.log("[kyc-tier-upgrade] Starting volume scan");
 
-  let scanned = 0;
+  let scanned: number;
   let flagged = 0;
   let notified = 0;
   let errors = 0;
@@ -39,7 +40,7 @@ export async function runKycTierUpgradeJob(): Promise<void> {
         }
       } catch (userErr) {
         errors++;
-        console.error(
+        logger.error(
           `[kyc-tier-upgrade] Error processing user ${userInfo.userId}:`,
           userErr,
         );
@@ -47,7 +48,7 @@ export async function runKycTierUpgradeJob(): Promise<void> {
       }
     }
   } catch (err) {
-    console.error("[kyc-tier-upgrade] Fatal error during volume scan:", err);
+    logger.error("[kyc-tier-upgrade] Fatal error during volume scan:", err);
     throw err;
   }
 

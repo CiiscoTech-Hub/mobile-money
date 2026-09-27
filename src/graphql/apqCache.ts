@@ -1,3 +1,4 @@
+import logger from "../utils/logger";
 /**
  * APQ Redis Cache Adapter
  *
@@ -19,7 +20,10 @@ export interface KeyValueCache {
 }
 
 const APQ_KEY_PREFIX = "apq:";
-const DEFAULT_TTL_SECONDS = parseInt(process.env.APQ_TTL_SECONDS || "86400", 10); // 24 h
+const DEFAULT_TTL_SECONDS = parseInt(
+  process.env.APQ_TTL_SECONDS || "86400",
+  10,
+); // 24 h
 
 export class RedisAPQCache implements KeyValueCache {
   private client: Redis;
@@ -57,7 +61,11 @@ export class RedisAPQCache implements KeyValueCache {
     }
   }
 
-  async set(key: string, value: string, options?: { ttl?: number }): Promise<void> {
+  async set(
+    key: string,
+    value: string,
+    options?: { ttl?: number },
+  ): Promise<void> {
     if (!this.available) return;
     const ttl = options?.ttl ?? this.ttl;
     try {
@@ -99,7 +107,7 @@ export function createAPQCache(): RedisAPQCache {
   client.on("error", (err) => {
     // Suppress noisy repeated errors — the cache adapter already logs once
     if (process.env.NODE_ENV !== "test") {
-      console.error("[APQ] ioredis error:", err.message);
+      logger.error("[APQ] ioredis error:", err.message);
     }
   });
 

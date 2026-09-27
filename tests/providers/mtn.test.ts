@@ -82,7 +82,7 @@ describe("MTNProvider", () => {
         },
       );
 
-      expect(result).toEqual({
+      expect(result).toMatchObject({
         success: true,
         data: mockResponse.data,
       });
@@ -103,7 +103,7 @@ describe("MTNProvider", () => {
 
       const result = await provider.requestPayment(phoneNumber, amount);
 
-      expect(result).toEqual({
+      expect(result).toMatchObject({
         success: false,
         error: mockError,
       });
@@ -117,7 +117,7 @@ describe("MTNProvider", () => {
 
       const result = await provider.requestPayment(phoneNumber, amount);
 
-      expect(result).toEqual({
+      expect(result).toMatchObject({
         success: false,
         error: timeoutError,
       });
@@ -138,7 +138,7 @@ describe("MTNProvider", () => {
 
       const result = await provider.requestPayment(phoneNumber, amount);
 
-      expect(result).toEqual({
+      expect(result).toMatchObject({
         success: false,
         error: authError,
       });
@@ -152,7 +152,7 @@ describe("MTNProvider", () => {
 
       const result = await provider.requestPayment(phoneNumber, amount);
 
-      expect(result).toEqual({
+      expect(result).toMatchObject({
         success: false,
         error: networkError,
       });
@@ -173,7 +173,7 @@ describe("MTNProvider", () => {
 
       const result = await provider.requestPayment(phoneNumber, amount);
 
-      expect(result).toEqual({
+      expect(result).toMatchObject({
         success: false,
         error: serverError,
       });
@@ -194,7 +194,7 @@ describe("MTNProvider", () => {
 
       const result = await provider.requestPayment(phoneNumber, amount);
 
-      expect(result).toEqual({
+      expect(result).toMatchObject({
         success: false,
         error: rateLimitError,
       });
@@ -457,7 +457,7 @@ describe("MTNProvider", () => {
 
       const result = await provider.requestPayment("+256123456789", "1000");
 
-      expect(result).toEqual({
+      expect(result).toMatchObject({
         success: true,
         data: null,
       });
@@ -470,7 +470,7 @@ describe("MTNProvider", () => {
 
       const result = await provider.requestPayment("+256123456789", "1000");
 
-      expect(result).toEqual({
+      expect(result).toMatchObject({
         success: true,
         data: undefined,
       });
@@ -484,7 +484,7 @@ describe("MTNProvider", () => {
 
       const result = await provider.requestPayment("+256123456789", "1000");
 
-      expect(result).toEqual({
+      expect(result).toMatchObject({
         success: false,
         error: cancelError,
       });

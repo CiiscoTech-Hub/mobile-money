@@ -1,4 +1,4 @@
-import { taxRequirements } from "./taxRequirements";
+import { getTaxConfig } from "../services/taxService";
 import { Parser as CsvParser } from "json2csv";
 import { create } from "xmlbuilder2";
 
@@ -17,8 +17,12 @@ export interface TaxReportOptions {
   format: "CSV" | "XML";
 }
 
-export function generateTaxReport({ country, transactions, format }: TaxReportOptions): string {
-  const tax = taxRequirements[country];
+export async function generateTaxReport({
+  country,
+  transactions,
+  format,
+}: TaxReportOptions): Promise<string> {
+  const tax = await getTaxConfig(country);
   const reportRows = transactions.map((tx) => {
     const vat = tx.amount * tax.vatRate;
     const transferTax = tx.amount * tax.transferTaxRate;

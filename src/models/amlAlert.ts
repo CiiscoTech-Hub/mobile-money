@@ -15,12 +15,15 @@ export interface AMLAlertFilter {
   endDate?: Date;
   limit?: number;
   offset?: number;
+  before?: string;
+  after?: string;
 }
 
 export interface AMLAlertListResult {
   alerts: AMLAlert[];
   total: number;
   pendingReview: number;
+  hasMore?: boolean;
 }
 
 export interface AMLReviewHistoryEntry {
@@ -31,6 +34,36 @@ export interface AMLReviewHistoryEntry {
   reviewedBy: string;
   reviewNotes?: string;
   createdAt: string;
+}
+
+/**
+ * Row shape returned by aml_alerts queries (aliased to camelCase).
+ * Timestamps arrive as Date objects from pg and are converted to ISO
+ * strings by mapRow.
+ */
+export interface AMLAlertRow {
+  id: string;
+  transactionId: string;
+  userId: string;
+  severity: AMLAlertSeverity;
+  status: AMLAlertStatus;
+  ruleHits: AMLRuleHit[];
+  reasons: string[];
+  createdAt: Date;
+  updatedAt: Date;
+  reviewedAt?: Date | null;
+  reviewedBy?: string | null;
+  reviewNotes?: string | null;
+}
+
+export interface AMLAlertReviewHistoryRow {
+  id: string;
+  alertId: string;
+  previousStatus: string;
+  newStatus: string;
+  reviewedBy: string;
+  reviewNotes?: string | null;
+  createdAt: Date;
 }
 
 export class AMLAlertModel {
@@ -56,7 +89,7 @@ export class AMLAlertModel {
         review_notes AS "reviewNotes"
     `;
 
-    const result = await pool.query(query, [
+    const result = await pool.query<AMLAlertRow>(query, [
       alert.id,
       alert.transactionId,
       alert.userId,
@@ -89,13 +122,13 @@ export class AMLAlertModel {
       WHERE id = $1
     `;
 
-    const result = await pool.query(query, [id]);
+    const result = await pool.query<AMLAlertRow>(query, [id]);
     return result.rows.length > 0 ? this.mapRow(result.rows[0]) : null;
   }
 
   async list(filter: AMLAlertFilter = {}): Promise<AMLAlertListResult> {
     const conditions: string[] = [];
-    const params: any[] = [];
+    const params: unknown[] = [];
     let paramIndex = 1;
 
     if (filter.status) {
@@ -128,7 +161,7 @@ export class AMLAlertModel {
 
     // Get total count
     const countQuery = `SELECT COUNT(*) as count FROM aml_alerts ${whereClause}`;
-    const countResult = await pool.query(countQuery, params);
+    const countResult = await pool.query<{ count: string }>(countQuery, params);
     const total = parseInt(countResult.rows[0].count, 10);
 
     // Get pending review count
@@ -137,41 +170,141 @@ export class AMLAlertModel {
       FROM aml_alerts 
       ${whereClause ? whereClause + " AND" : "WHERE"} status = 'pending_review'
     `;
-    const pendingResult = await pool.query(pendingQuery, params);
+    const pendingResult = await pool.query<{ count: string }>(
+      pendingQuery,
+      params,
+    );
     const pendingReview = parseInt(pendingResult.rows[0].count, 10);
 
-    // Get paginated alerts
+    // Keyset pagination processing
+    let cursorTime: Date | null = null;
+    let cursorId: string | null = null;
+    let isReversed = false;
+
+    if (filter.after) {
+      const decoded = Buffer.from(filter.after, "base64").toString("utf8");
+      const [timeStr, idStr] = decoded.split("|");
+      if (timeStr && idStr) {
+        const parsedTime = new Date(timeStr);
+        if (!isNaN(parsedTime.getTime())) {
+          cursorTime = parsedTime;
+          cursorId = idStr;
+        }
+      }
+    } else if (filter.before) {
+      const decoded = Buffer.from(filter.before, "base64").toString("utf8");
+      const [timeStr, idStr] = decoded.split("|");
+      if (timeStr && idStr) {
+        const parsedTime = new Date(timeStr);
+        if (!isNaN(parsedTime.getTime())) {
+          cursorTime = parsedTime;
+          cursorId = idStr;
+          isReversed = true;
+        }
+      }
+    }
+
+    // Build conditions including keyset cursor
+    const alertsConditions = [...conditions];
+    const alertsParams = [...params];
+    let alertsParamIndex = paramIndex;
+
+    if (cursorTime && cursorId) {
+      if (isReversed) {
+        alertsConditions.push(
+          `(created_at > $${alertsParamIndex} OR (created_at = $${alertsParamIndex} AND id > $${alertsParamIndex + 1}))`,
+        );
+      } else {
+        alertsConditions.push(
+          `(created_at < $${alertsParamIndex} OR (created_at = $${alertsParamIndex} AND id < $${alertsParamIndex + 1}))`,
+        );
+      }
+      alertsParams.push(cursorTime);
+      alertsParams.push(cursorId);
+      alertsParamIndex += 2;
+    }
+
+    const alertsWhereClause =
+      alertsConditions.length > 0
+        ? `WHERE ${alertsConditions.join(" AND ")}`
+        : "";
+
     const limit = filter.limit ?? 50;
-    const offset = filter.offset ?? 0;
+    const isCursorPagination = !!(filter.before || filter.after);
+    const sortOrder = isReversed ? "ASC" : "DESC";
 
-    const alertsQuery = `
-      SELECT
-        id,
-        transaction_id AS "transactionId",
-        user_id AS "userId",
-        severity,
-        status,
-        rule_hits AS "ruleHits",
-        reasons,
-        created_at AS "createdAt",
-        updated_at AS "updatedAt",
-        reviewed_at AS "reviewedAt",
-        reviewed_by AS "reviewedBy",
-        review_notes AS "reviewNotes"
-      FROM aml_alerts
-      ${whereClause}
-      ORDER BY created_at DESC
-      LIMIT $${paramIndex++} OFFSET $${paramIndex++}
-    `;
+    let alertsQuery = "";
+    let alertsResult;
 
-    const alertsResult = await pool.query(alertsQuery, [
-      ...params,
-      limit,
-      offset,
-    ]);
-    const alerts = alertsResult.rows.map((row) => this.mapRow(row));
+    if (isCursorPagination) {
+      alertsQuery = `
+        SELECT
+          id,
+          transaction_id AS "transactionId",
+          user_id AS "userId",
+          severity,
+          status,
+          rule_hits AS "ruleHits",
+          reasons,
+          created_at AS "createdAt",
+          updated_at AS "updatedAt",
+          reviewed_at AS "reviewedAt",
+          reviewed_by AS "reviewedBy",
+          review_notes AS "reviewNotes"
+        FROM aml_alerts
+        ${alertsWhereClause}
+        ORDER BY created_at ${sortOrder}, id ${sortOrder}
+        LIMIT $${alertsParamIndex++}
+      `;
+      alertsResult = await pool.query<AMLAlertRow>(alertsQuery, [
+        ...alertsParams,
+        limit + 1,
+      ]);
+    } else {
+      const offset = filter.offset ?? 0;
+      alertsQuery = `
+        SELECT
+          id,
+          transaction_id AS "transactionId",
+          user_id AS "userId",
+          severity,
+          status,
+          rule_hits AS "ruleHits",
+          reasons,
+          created_at AS "createdAt",
+          updated_at AS "updatedAt",
+          reviewed_at AS "reviewedAt",
+          reviewed_by AS "reviewedBy",
+          review_notes AS "reviewNotes"
+        FROM aml_alerts
+        ${alertsWhereClause}
+        ORDER BY created_at DESC, id DESC
+        LIMIT $${alertsParamIndex++} OFFSET $${alertsParamIndex++}
+      `;
+      alertsResult = await pool.query<AMLAlertRow>(alertsQuery, [
+        ...alertsParams,
+        limit,
+        offset,
+      ]);
+    }
 
-    return { alerts, total, pendingReview };
+    let alerts = alertsResult.rows.map((row) => this.mapRow(row));
+    let hasMore = false;
+
+    if (isCursorPagination) {
+      if (alerts.length > limit) {
+        hasMore = true;
+        alerts = alerts.slice(0, limit);
+      }
+      if (isReversed) {
+        alerts.reverse();
+      }
+    } else {
+      const offset = filter.offset ?? 0;
+      hasMore = offset + limit < total;
+    }
+
+    return { alerts, total, pendingReview, hasMore };
   }
 
   async review(
@@ -188,7 +321,10 @@ export class AMLAlertModel {
       const currentQuery = `
         SELECT status FROM aml_alerts WHERE id = $1 FOR UPDATE
       `;
-      const currentResult = await client.query(currentQuery, [alertId]);
+      const currentResult = await client.query<{ status: string }>(
+        currentQuery,
+        [alertId],
+      );
 
       if (currentResult.rows.length === 0) {
         await client.query("ROLLBACK");
@@ -222,7 +358,7 @@ export class AMLAlertModel {
           review_notes AS "reviewNotes"
       `;
 
-      const updateResult = await client.query(updateQuery, [
+      const updateResult = await client.query<AMLAlertRow>(updateQuery, [
         input.status,
         reviewerId,
         input.reviewNotes || null,
@@ -271,21 +407,19 @@ export class AMLAlertModel {
       ORDER BY created_at DESC
     `;
 
-    const result = await pool.query(query, [alertId]);
+    const result = await pool.query<AMLAlertReviewHistoryRow>(query, [alertId]);
     return result.rows.map((row) => ({
       id: row.id,
       alertId: row.alertId,
       previousStatus: row.previousStatus,
       newStatus: row.newStatus,
       reviewedBy: row.reviewedBy,
-      reviewNotes: row.reviewNotes,
+      reviewNotes: row.reviewNotes ?? undefined,
       createdAt: row.createdAt.toISOString(),
     }));
   }
 
-  async getAlertsByTransaction(
-    transactionId: string,
-  ): Promise<AMLAlert[]> {
+  async getAlertsByTransaction(transactionId: string): Promise<AMLAlert[]> {
     const query = `
       SELECT
         id,
@@ -305,11 +439,11 @@ export class AMLAlertModel {
       ORDER BY created_at DESC
     `;
 
-    const result = await pool.query(query, [transactionId]);
+    const result = await pool.query<AMLAlertRow>(query, [transactionId]);
     return result.rows.map((row) => this.mapRow(row));
   }
 
-  private mapRow(row: any): AMLAlert {
+  private mapRow(row: AMLAlertRow): AMLAlert {
     return {
       id: row.id,
       transactionId: row.transactionId,

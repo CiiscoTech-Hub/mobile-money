@@ -1,6 +1,7 @@
-const workerInstances: Array<{
+const workers: Array<{
+  queue: string;
   processor: (job: any) => Promise<any>;
-  events: Record<string, Function>;
+  concurrency?: number;
 }> = [];
 
 jest.mock("bullmq", () => ({
@@ -16,33 +17,49 @@ jest.mock("bullmq", () => ({
     resume: jest.fn(),
     drain: jest.fn(),
   })),
-  Worker: jest.fn().mockImplementation(
-    (_name: string, processor: (job: any) => Promise<any>) => {
-      const instance = {
-        processor,
-        events: {} as Record<string, Function>,
-        on(event: string, handler: Function) {
-          instance.events[event] = handler;
-        },
-        close: jest.fn(async () => undefined),
-      };
-      workerInstances.push(instance);
-      return instance;
-    },
-  ),
+  Worker: jest.fn().mockImplementation((queue, processor, opts) => {
+    workers.push({ queue, processor, concurrency: opts?.concurrency });
+    return {
+      close: jest.fn().mockResolvedValue(undefined),
+    };
+  }),
 }));
 
 jest.mock("../../src/queue/config", () => ({
   queueOptions: {},
+  getWorkerConcurrency: () => 1,
 }));
 
 jest.mock("../../src/queue/transactionQueue", () => ({
   TRANSACTION_QUEUE_NAME: "transaction-processing",
 }));
 
+jest.mock("../../src/queue/rabbitmq", () => ({
+  EXCHANGES: {
+    TRANSACTIONS: "transactions.topic",
+  },
+  ROUTING_KEYS: {
+    TRANSACTION_COMPLETED: "transaction.completed",
+    TRANSACTION_FAILED: "transaction.failed",
+  },
+  rabbitMQManager: {
+    publish: jest.fn().mockResolvedValue(undefined),
+  },
+}));
+
+jest.mock("../../src/graphql/redisPubSub", () => ({
+  getRedisPubSub: () => ({
+    publish: jest.fn(),
+    asyncIterator: jest.fn(),
+  }),
+}));
+
 const mockTransactionModel = {
   updateStatus: jest.fn(),
   findById: jest.fn(),
+  patchMetadata: jest.fn(),
+  updateMetadata: jest.fn(),
+  incrementRetryCount: jest.fn(),
   updateWebhookDelivery: jest.fn(),
 };
 
@@ -66,7 +83,9 @@ jest.mock("../../src/models/transaction", () => {
 });
 
 jest.mock("../../src/services/mobilemoney/mobileMoneyService", () => ({
-  MobileMoneyService: jest.fn().mockImplementation(() => mockMobileMoneyService),
+  MobileMoneyService: jest
+    .fn()
+    .mockImplementation(() => mockMobileMoneyService),
 }));
 
 jest.mock("../../src/services/stellar/stellarService", () => ({
@@ -83,8 +102,10 @@ import { TransactionStatus } from "../../src/models/transaction";
 import "../../src/queue/worker";
 
 function getProcessor() {
-  expect(workerInstances).toHaveLength(1);
-  return workerInstances[0].processor;
+  expect(workers).toHaveLength(1);
+  return async (job: any) => {
+    return await workers[0].processor(job);
+  };
 }
 
 function buildJob(dataOverrides: Record<string, unknown> = {}) {
@@ -107,9 +128,18 @@ function buildJob(dataOverrides: Record<string, unknown> = {}) {
 describe("transaction worker webhook integration", () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    workers.splice(1);
+    process.env.MAX_RETRY_ATTEMPTS = "1";
     mockMobileMoneyService.initiatePayment.mockResolvedValue({ success: true });
     mockMobileMoneyService.sendPayout.mockResolvedValue({ success: true });
-    mockStellarService.sendPayment.mockResolvedValue(undefined);
+    mockStellarService.sendPayment.mockResolvedValue({
+      hash: "stellar-hash",
+      submittedAt: new Date("2026-06-10T00:00:00Z"),
+    });
+    mockTransactionModel.findById.mockResolvedValue(null);
+    mockTransactionModel.patchMetadata.mockResolvedValue(undefined);
+    mockTransactionModel.updateMetadata.mockResolvedValue(undefined);
+    mockTransactionModel.incrementRetryCount.mockResolvedValue(undefined);
     mockNotifyTransactionWebhook.mockResolvedValue({
       status: "delivered",
     });
@@ -147,8 +177,13 @@ describe("transaction worker webhook integration", () => {
       error: "provider outage",
     });
 
-    await expect(processor(job)).rejects.toThrow("provider outage");
+    const result = await processor(job);
 
+    expect(result).toEqual({
+      success: false,
+      transactionId: "txn-1",
+      error: "provider outage",
+    });
     expect(mockTransactionModel.updateStatus).toHaveBeenCalledWith(
       "txn-1",
       TransactionStatus.Failed,
