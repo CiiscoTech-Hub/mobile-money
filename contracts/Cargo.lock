@@ -334,12 +334,35 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
+name = "batch_payout"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk 26.0.1",
+]
+
+[[package]]
+name = "blacklist"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk 26.0.1",
+]
+
+[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
 dependencies = [
  "generic-array",
+]
+
+[[package]]
+name = "bridge"
+version = "0.1.0"
+dependencies = [
+ "blacklist",
+ "fee_tier",
+ "soroban-sdk 26.0.1",
 ]
 
 [[package]]
@@ -785,6 +808,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40404c3f5f511ec4da6fe866ddf6a717c309fdbb69fbbad7b0f3edab8f2e835f"
 
 [[package]]
+name = "faucet"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk 26.0.1",
+]
+
+[[package]]
+name = "fee_tier"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk 26.0.1",
+]
+
+[[package]]
 name = "ff"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1212,6 +1249,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "proof_of_reserve"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk 26.0.1",
+]
+
+[[package]]
 name = "quicklendx-contracts"
 version = "0.1.0"
 dependencies = [
@@ -1255,6 +1299,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
 dependencies = [
  "getrandom",
+]
+
+[[package]]
+name = "rebalancer"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk 26.0.1",
 ]
 
 [[package]]
@@ -2024,6 +2075,13 @@ checksum = "2e70e4c5a0e0a8a4823ad65dfe1a6930e4f4d756dcd9dd7939022b5e8c501215"
 dependencies = [
  "num-conv",
  "time-core",
+]
+
+[[package]]
+name = "timelock"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk 26.0.1",
 ]
 
 [[package]]
