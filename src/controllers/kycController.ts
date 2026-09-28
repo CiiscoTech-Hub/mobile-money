@@ -1,7 +1,11 @@
 import { Request, Response } from "express";
 import crypto from "crypto";
 import { Pool } from "pg";
-import KYCService, { KYCLevel, DocumentType } from "../services/kyc";
+import KYCService, {
+  KYCLevel,
+  DocumentType,
+  type WebhookEvent,
+} from "../services/kyc";
 import { z } from "zod";
 import { UserModel } from "../models/users";
 import { createError } from "../middleware/errorHandler";
@@ -322,8 +326,30 @@ export class KYCController {
     }
   };
 
-  handleWebhook = async (_req: Request, res: Response) => {
-    res.status(200).json({ status: "success" });
+  handleWebhook = async (req: Request, res: Response) => {
+    try {
+      const event = req.body as WebhookEvent;
+      if (!event?.payload?.action || !event?.payload?.object) {
+        throw createError(
+          ERROR_CODES.INVALID_INPUT,
+          "Invalid KYC webhook payload",
+          { error: "Invalid KYC webhook payload" },
+        );
+      }
+
+      await this.kycService.handleWebhook(event);
+      res.status(200).json({ status: "success" });
+    } catch (error) {
+      logger.error("Error in handleWebhook", {
+        error: (error as Error).message,
+      });
+      const statusCode = (error as any).statusCode || 500;
+      res.status(statusCode).json({
+        status: "error",
+        message: (error as Error).message,
+        code: (error as any).code || ERROR_CODES.INTERNAL_ERROR,
+      });
+    }
   };
 
   getApplicant = async (req: Request, res: Response) => {

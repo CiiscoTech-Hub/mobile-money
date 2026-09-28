@@ -34,6 +34,12 @@ describe("SEP-12 KYC API", () => {
       createApplicant: jest.fn(),
       getApplicant: jest.fn(),
       uploadDocument: jest.fn(),
+      submitFaceMatch: jest.fn().mockResolvedValue({
+        status: "pending",
+        checkId: "check-1",
+        livePhotoId: "live-1",
+        updatedAt: new Date().toISOString(),
+      }),
       getVerificationStatus: jest.fn(),
     } as any;
 
@@ -328,6 +334,63 @@ describe("SEP-12 KYC API", () => {
 
       expect(response.status).toBe(200);
       expect(mockKycService.uploadDocument).toHaveBeenCalled();
+      expect(mockKycService.submitFaceMatch).not.toHaveBeenCalled();
+    });
+
+    it("should send a biometric photo for face-match on registration", async () => {
+      mockDb.query
+        .mockResolvedValueOnce({
+          rows: [],
+          command: "",
+          oid: 0,
+          rowCount: 0,
+          fields: [],
+        })
+        .mockResolvedValueOnce({
+          rows: [{ id: "new-user-123" }],
+          command: "",
+          oid: 0,
+          rowCount: 1,
+          fields: [],
+        })
+        .mockResolvedValueOnce({
+          rows: [],
+          command: "",
+          oid: 0,
+          rowCount: 1,
+          fields: [],
+        });
+
+      mockKycService.createApplicant.mockResolvedValueOnce({
+        id: "new-applicant-789",
+        first_name: "Jane",
+        last_name: "Smith",
+        created_at: new Date().toISOString(),
+        sandbox: false,
+      });
+      mockKycService.uploadDocument.mockResolvedValueOnce({
+        id: "doc-123",
+        applicant_id: "new-applicant-789",
+      });
+
+      const response = await request(app)
+        .put("/sep12/customer")
+        .send({
+          account: "GDEF456...",
+          first_name: "Jane",
+          last_name: "Smith",
+          id_type: "passport",
+          photo_id_front: "base64encodedimage...",
+          biometric_photo: "base64biometric...",
+        });
+
+      expect(response.status).toBe(200);
+      expect(mockKycService.submitFaceMatch).toHaveBeenCalledWith(
+        expect.objectContaining({
+          applicantId: "new-applicant-789",
+          biometricPayload: "base64biometric...",
+        }),
+      );
     });
 
     it("should return 400 for invalid data", async () => {

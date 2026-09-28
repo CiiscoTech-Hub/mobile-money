@@ -72,6 +72,7 @@ export interface Sep12CustomerFields {
   photo_id_front?: string; // Base64 or URL
   photo_id_back?: string;
   photo_proof_residence?: string;
+  biometric_photo?: string; // Live photo used for face-match verification
 
   // Organization fields (for businesses)
   organization_name?: string;
@@ -139,6 +140,7 @@ const PutCustomerSchema = z.object({
   photo_id_front: z.string().optional(),
   photo_id_back: z.string().optional(),
   photo_proof_residence: z.string().optional(),
+  biometric_photo: z.string().optional(),
   
   // Organization
   organization_name: z.string().optional(),
@@ -460,6 +462,7 @@ export class Sep12Service {
         photo_id_front,
         photo_id_back,
         photo_proof_residence,
+        biometric_photo,
         organization_name: rawOrganizationName,
         organization_registration_number: rawOrganizationRegNumber,
         organization_registration_date,
@@ -608,6 +611,17 @@ export class Sep12Service {
           side: "back",
           filename: `id_back_${Date.now()}.jpg`,
           data: photo_id_back,
+        });
+      }
+
+      if (biometric_photo) {
+        if (!applicantId) {
+          throw new Error("applicantId is required for face-match verification");
+        }
+        await this.kycService.submitFaceMatch({
+          applicantId,
+          biometricPayload: biometric_photo,
+          filename: `biometric_${Date.now()}.jpg`,
         });
       }
 
