@@ -2,6 +2,7 @@ import { Request, Response, NextFunction } from "express";
 import { redisClient } from "../config/redis";
 import { MerchantModel } from "../models/merchant";
 import logger from "../utils/logger";
+import rateLimit from "express-rate-limit";
 
 // Merchant tier rate limits (requests per minute)
 const TIER_LIMITS: Record<string, number> = {
@@ -51,7 +52,8 @@ export async function merchantRateLimiter(
     const merchantModel = new MerchantModel();
     const merchant = await merchantModel.findById(merchantId);
     if (!merchant) {
-      return res.status(401).json({ error: "Invalid API key" });
+      res.status(401).json({ error: "Invalid API key" });
+      return;
     }
 
     // Get merchant tier (default to starter if not set)
@@ -77,9 +79,9 @@ export async function merchantRateLimiter(
     let totalRequests = 0;
     for (let i = 0; i < secondsInWindow; i++) {
       const key = `${redisKey}:${Math.floor((now - i * 1000) / 1000)}`;
-      const count = await redisClient.get(key);
-      if (count) {
-        totalRequests += parseInt(count, 10);
+      const rawCount = await redisClient.get(key);
+      if (rawCount) {
+        totalRequests += parseInt(String(rawCount), 10);
       }
     }
 
@@ -97,11 +99,12 @@ export async function merchantRateLimiter(
         { merchantId, tier, limit, totalRequests },
         "Rate limit exceeded for merchant",
       );
-      return res.status(429).json({
+      res.status(429).json({
         error: "Too Many Requests",
         message: `Rate limit of ${limit} requests per minute exceeded for tier: ${tier}`,
         retryAfter: resetTime,
       });
+      return;
     }
 
     // Attach merchant info to request for downstream handlers
@@ -113,3 +116,56 @@ export async function merchantRateLimiter(
     next();
   }
 }
+
+// ---------------------------------------------------------------------------
+// Device verification rate limiters (consumed by src/routes/auth.ts)
+// ---------------------------------------------------------------------------
+
+/**
+ * Rate limiter for the device-verification OTP check endpoint.
+ * Allows 5 attempts per 15 minutes per IP to prevent brute-force.
+ */
+export const verifyDeviceRateLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    error: "Too Many Requests",
+    message: "Too many device verification attempts, please try again later.",
+  },
+});
+
+/**
+ * Rate limiter for the resend-verification-OTP endpoint.
+ * Allows 3 resend requests per 10 minutes per IP.
+ */
+export const resendVerificationRateLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000, // 10 minutes
+  max: 3,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    error: "Too Many Requests",
+    message: "Too many resend requests, please try again later.",
+  },
+});
+
+// ---------------------------------------------------------------------------
+// SEP-38 rate limiter (consumed by src/routes/sep38.ts)
+// ---------------------------------------------------------------------------
+
+/**
+ * Rate limiter for SEP-38 price and quote endpoints.
+ * Allows 60 requests per minute per IP to prevent high-frequency scraping.
+ */
+export const sep38RateLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    error: "Too Many Requests",
+    message: "SEP-38 rate limit exceeded. Maximum 60 requests per minute.",
+  },
+});

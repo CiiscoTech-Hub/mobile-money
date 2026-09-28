@@ -1,5 +1,5 @@
 import logger from "../utils/logger";
-import { Router, Request, Response } from "express";
+import { Router, Request, Response, NextFunction } from "express";
 import { Pool } from "pg";
 import { sep12RateLimiter } from "../middleware/rateLimit";
 import { upload } from "../middleware/upload";
@@ -758,7 +758,7 @@ export const createSep12Router = (db: Pool): Router => {
         if (req.files && Array.isArray(req.files)) {
           const path = await import("path");
           const crypto = await import("crypto");
-          const { ALLOWED_MIME_TYPES, ALLOWED_EXTENSIONS } = await import("../middleware/upload");
+          const { ALLOWED_MIME_TYPES, ALLOWED_EXTENSIONS } = await import("../middleware/upload.js");
 
           for (const file of req.files as Express.Multer.File[]) {
             const ext = path.extname(file.originalname).toLowerCase();

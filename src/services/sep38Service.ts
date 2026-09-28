@@ -326,7 +326,7 @@ export class Sep38Service {
       if (redisClient && typeof redisClient.get === "function") {
         const cachedStr = await redisClient.get(`${this.redisKeyPrefix}${quoteId}`);
         if (cachedStr) {
-          const quote: Sep38Quote = JSON.parse(cachedStr);
+          const quote: Sep38Quote = JSON.parse(String(cachedStr));
           if (new Date() >= new Date(quote.expires_at)) {
             await redisClient.del(`${this.redisKeyPrefix}${quoteId}`);
             return { expired: true };

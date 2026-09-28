@@ -37,6 +37,7 @@ pact.log
 # ── Load Test / Benchmark Output ─────────────────
 tests/load/results/*.json
 benchmarks/results/*.json
+benchmarks/results/*.html
 
 # ── Environment & Secrets ─────────────────────────
 .env

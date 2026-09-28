@@ -72,7 +72,7 @@ export async function getCachedPrice(
     // Try hot cache first
     const cached = await redisClient.get(cacheKey);
     if (cached) {
-      const parsed = JSON.parse(cached);
+      const parsed = JSON.parse(String(cached));
       return {
         ...parsed,
         is_stale: false,
@@ -82,7 +82,7 @@ export async function getCachedPrice(
     // Fall back to stale cache if hot cache miss
     const stale = await redisClient.get(staleCacheKey);
     if (stale) {
-      const parsed = JSON.parse(stale);
+      const parsed = JSON.parse(String(stale));
       logger.debug(
         `[PriceCache] Serving stale price for ${sellAsset}/${buyAsset}`,
       );
@@ -257,7 +257,7 @@ export async function startBackgroundPriceRefreshWorker(
  * Stops the background price refresh worker.
  */
 export function stopBackgroundPriceRefreshWorker(
-  intervalHandle: NodeJS.Timer,
+  intervalHandle: ReturnType<typeof setInterval>,
 ): void {
   clearInterval(intervalHandle);
   logger.info("[PriceCache] Stopped background price refresh worker");

@@ -38,11 +38,10 @@ function parseArgs(): ArchiveConfig {
     (acc, arg) => {
       const [key, value] = arg.split("=");
       if (key.startsWith("--")) {
-        acc[key.slice(2) as keyof Omit<ArchiveConfig, "dryRun">] = isNaN(
-          Number(value),
-        )
+        const numVal = Number(value);
+        (acc as Record<string, number | string | boolean>)[key.slice(2)] = isNaN(numVal)
           ? value
-          : Number(value);
+          : numVal;
       }
       return acc;
     },
@@ -50,10 +49,10 @@ function parseArgs(): ArchiveConfig {
   );
 
   return {
-    daysOld: args.daysOld ?? 365,
-    batchSize: args.batchSize ?? 1000,
-    maxBatches: args.maxBatches ?? 0,
-    dryRun: args.dryRun === "true" || process.env.ARCHIVE_DRY_RUN === "true",
+    daysOld: (args.daysOld as number | undefined) ?? 365,
+    batchSize: (args.batchSize as number | undefined) ?? 1000,
+    maxBatches: (args.maxBatches as number | undefined) ?? 0,
+    dryRun: String(args.dryRun) === "true" || process.env.ARCHIVE_DRY_RUN === "true",
   };
 }
 
@@ -335,4 +334,5 @@ if (require.main === module) {
   });
 }
 
-export { archiveTransactions, ArchiveConfig, ArchiveStats };
+export { archiveTransactions };
+export type { ArchiveConfig, ArchiveStats };

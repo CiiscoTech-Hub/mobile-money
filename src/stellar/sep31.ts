@@ -21,6 +21,44 @@ import { strictIdempotency } from "../middleware/idempotency";
 const router = Router();
 const transactionModel = new TransactionModel();
 
+// ─── Fee calculation ─────────────────────────────────────────────────────────
+
+interface FeeOptions {
+  providerProcessingFee?: number;
+  fxConversionMarginPercent?: number;
+}
+
+interface FeeResult {
+  fee: number;
+  total: number;
+  feeDetails: {
+    providerProcessingFee: number;
+    fxConversionFee: number;
+  };
+}
+
+/**
+ * Calculates the total fee and gross-up amount for a SEP-31 transaction.
+ *
+ * @param amount - The send amount (in source-asset units) as a numeric value
+ * @param options - Optional fee configuration overrides
+ */
+function calculateFee(amount: number, options: FeeOptions = {}): FeeResult {
+  const providerProcessingFee = options.providerProcessingFee ?? 0;
+  const fxMargin = options.fxConversionMarginPercent ?? 0;
+  const fxConversionFee = amount * (fxMargin / 100);
+  const fee = providerProcessingFee + fxConversionFee;
+  return {
+    fee,
+    total: amount + fee,
+    feeDetails: {
+      providerProcessingFee,
+      fxConversionFee,
+    },
+  };
+}
+
+
 // --- SEP-31 Status State Machine ---
 // Valid statuses per SEP-31 spec
 export enum Sep31Status {
@@ -326,7 +364,7 @@ router.post(
     }
 
     // Strict KYC schema validation per country specifications (#1945)
-    const { validateSep31KycFields } = await import("../validators/sep31");
+    const { validateSep31KycFields } = await import("../validators/sep31.js");
     const kycValidation = validateSep31KycFields(
       fields,
       finalSenderId,

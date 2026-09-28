@@ -116,10 +116,10 @@ async function reserveLiquidity(amount: string): Promise<void> {
 async function releaseLiquidity(amount: string): Promise<void> {
   if (!redisClient.isOpen) return;
   try {
-    const next = await redisClient.incrbyfloat(
+    const next = parseFloat(String(await redisClient.incrbyfloat(
       POOL_RESERVED_KEY,
       -parseFloat(amount),
-    );
+    )));
     // Clamp at zero — counter drift can produce tiny negatives
     if (next < 0) {
       await redisClient.set(POOL_RESERVED_KEY, "0");
