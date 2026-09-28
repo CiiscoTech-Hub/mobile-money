@@ -142,12 +142,6 @@ function parseAssetCode(rawCode: string): string {
   return rawCode;
 }
 
-function calculateFee(amount: number): { fee: number; total: number } {
-  let fee = SEP31_CONFIG.feeFixed + (amount * SEP31_CONFIG.feePercent) / 100;
-  fee = parseFloat(fee.toFixed(7));
-  return { fee, total: parseFloat((amount + fee).toFixed(7)) };
-}
-
 function generateMemo(): string {
   // Generate a short unique memo (max 28 chars for Stellar text memo)
   return crypto.randomUUID().replace(/-/g, "").substring(0, 28);
@@ -368,7 +362,10 @@ router.post(
 
     try {
       const memo = generateMemo();
-      const { fee, total } = calculateFee(parsedAmount);
+      const { fee, total, feeDetails } = calculateFee(parsedAmount, {
+        providerProcessingFee: SEP31_CONFIG.feeFixed,
+        fxConversionMarginPercent: SEP31_CONFIG.feePercent,
+      });
       const amountOut = parsedAmount; // Amount delivered to receiver (before payout fees)
 
       // --- Receiver-side AML Sanctions Screening ---
@@ -455,6 +452,7 @@ router.post(
           amount_in: total.toString(),
           amount_out: amountOut.toString(),
           amount_fee: fee.toString(),
+          fee_details: feeDetails,
           asset_code: cleanAssetCode,
           asset_issuer: configuredAsset.isNative()
             ? null
@@ -656,6 +654,14 @@ router.get(
         transaction.metadata,
       );
       const assetString = getAssetString();
+      const feeDetails = Array.isArray(sep31Meta.fee_details)
+        ? sep31Meta.fee_details
+        : [
+            {
+              description: "Transaction fee",
+              amount: sep31Meta.amount_fee || "0",
+            },
+          ];
 
       return res.json({
         transaction: {
@@ -672,6 +678,7 @@ router.get(
           amount_out_asset: assetString,
           amount_fee: sep31Meta.amount_fee || "0",
           amount_fee_asset: assetString,
+          fee_details: feeDetails,
           stellar_account_id: SEP31_CONFIG.receivingAccount,
           stellar_memo_type: sep31Meta.memo_type || "text",
           stellar_memo: sep31Meta.memo || "",
