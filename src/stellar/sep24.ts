@@ -854,12 +854,12 @@ sep24Router.get("/transaction", async (req: Request, res: Response) => {
 });
 
 sep24Router.get("/interactive/callback", async (req: Request, res: Response, next: NextFunction) => {
-  const { sep24RouteHandler } = await import("../routes/sep24");
+  const { sep24RouteHandler } = await import("../routes/sep24.js");
   return sep24RouteHandler(req, res, next);
 });
 
 sep24Router.get("/callback/popup", async (req: Request, res: Response, next: NextFunction) => {
-  const { sep24RouteHandler } = await import("../routes/sep24");
+  const { sep24RouteHandler } = await import("../routes/sep24.js");
   return sep24RouteHandler(req, res, next);
 });
 

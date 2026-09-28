@@ -235,7 +235,7 @@ router.get("/price", async (req: Request, res: Response) => {
 
 router.post("/quote", async (req: Request, res: Response) => {
   try {
-    const { sell_asset, buy_asset, sell_amount, buy_amount, ttl } = req.body;
+    const { sell_asset, buy_asset, sell_amount, buy_amount, ttl, context } = req.body;
 
     if (!sell_asset || !buy_asset) {
       res.status(400).json({

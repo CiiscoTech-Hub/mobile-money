@@ -63,9 +63,9 @@ export function getKycRequirementsForCountry(countryCode?: string): CountryKycRe
 }
 
 export const sep31KycFieldsSchema = z.object({
-  sender: z.record(z.any()).optional(),
-  receiver: z.record(z.any()).optional(),
-  transaction: z.record(z.any()).optional(),
+  sender: z.record(z.string(), z.any()).optional(),
+  receiver: z.record(z.string(), z.any()).optional(),
+  transaction: z.record(z.string(), z.any()).optional(),
 }).passthrough();
 
 export interface ValidateSep31KycResult {

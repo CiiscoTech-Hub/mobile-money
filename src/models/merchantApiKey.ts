@@ -126,9 +126,10 @@ export async function getMerchantTier(
     if (redisClient.isOpen) {
       const cached = await redisClient.get(redisKey);
       if (cached) {
-        if (isValidTier(cached)) {
-          l1Set(hash, cached);
-          return cached;
+        const tierStr = String(cached);
+        if (isValidTier(tierStr)) {
+          l1Set(hash, tierStr);
+          return tierStr;
         }
         // Stale / invalid value — fall through to DB
         await redisClient.del(redisKey);

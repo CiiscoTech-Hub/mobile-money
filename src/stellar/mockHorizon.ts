@@ -166,18 +166,19 @@ export class MockHorizonServer {
     res.writeHead(200, { "Content-Type": "application/json" });
 
     if (url === "/" || url === "/health") {
-      return res.end(
+      res.end(
         JSON.stringify({
           horizon_version: "2.28.0",
           core_version: "19.5.0",
           network_passphrase: this.options.networkPassphrase || "Test SDF Network ; July 2015",
         }),
       );
+      return;
     }
 
     if (url.startsWith("/accounts/")) {
       const accountId = url.replace("/accounts/", "").split("?")[0];
-      return res.end(
+      res.end(
         JSON.stringify({
           id: accountId,
           account_id: accountId,
@@ -195,9 +196,10 @@ export class MockHorizonServer {
           ],
         }),
       );
+      return;
     }
 
-    return res.end(
+    res.end(
       JSON.stringify({
         status: "ok",
         message: "Mock Horizon Healthy Response",
