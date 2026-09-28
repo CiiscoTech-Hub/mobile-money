@@ -102,6 +102,7 @@ interface AirtelProviderConfig {
   paymentPath: string;
   payoutPath: string;
   statusPath: string;
+  disbursementStatusPath: string;
   username: string;
   password: string;
   usernameField: string;
@@ -225,6 +226,12 @@ export class AirtelService {
     }
     if (this.config.statusPath && !this.config.statusPath.startsWith(prefix)) {
       this.config.statusPath = `${prefix}${this.config.statusPath}`;
+    }
+    if (
+      this.config.disbursementStatusPath &&
+      !this.config.disbursementStatusPath.startsWith(prefix)
+    ) {
+      this.config.disbursementStatusPath = `${prefix}${this.config.disbursementStatusPath}`;
     }
 
     this.mode = this.resolveMode();
@@ -357,6 +364,10 @@ export class AirtelService {
         options.statusPath ??
         process.env.AIRTEL_STATUS_PATH ??
         "/standard/v1/payments/:reference",
+      disbursementStatusPath:
+        options.disbursementStatusPath ??
+        process.env.AIRTEL_DISBURSEMENT_STATUS_PATH ??
+        "/standard/v1/disbursements/:reference",
       username: options.username ?? process.env.AIRTEL_USERNAME ?? "",
       password: options.password ?? process.env.AIRTEL_PASSWORD ?? "",
       usernameField:
@@ -573,6 +584,41 @@ export class AirtelService {
         : this.checkStatusViaDirect(reference);
   }
 
+  /**
+   * Query Airtel's disbursement-specific status endpoint
+   * (`GET /standard/v1/disbursements/:reference`), as opposed to
+   * {@link getTransactionStatus}/{@link checkStatus} which query the general
+   * collections/payments status endpoint. Used by the disbursement
+   * reconciliation worker (#1955) to poll payouts whose webhook callback is
+   * delayed.
+   */
+  async getDisbursementStatus(
+    reference: string,
+  ): Promise<{ status: "completed" | "failed" | "pending" | "unknown" }> {
+    try {
+      const result = await this.checkDisbursementStatus(reference);
+      if (!result.success) return { status: "unknown" };
+      const txStatus = String(
+        (result.data as AirtelResponse)?.data?.transaction?.status ?? "",
+      ).toUpperCase();
+      // TS = success, TF = failed, TP = pending
+      if (txStatus === "TS") return { status: "completed" };
+      if (txStatus === "TF") return { status: "failed" };
+      if (txStatus === "TP") return { status: "pending" };
+      return { status: "unknown" };
+    } catch {
+      return { status: "unknown" };
+    }
+  }
+
+  async checkDisbursementStatus(reference: string) {
+    return this.mode === "proxy"
+      ? this.checkDisbursementStatusViaProxy(reference)
+      : this.mode === "web"
+        ? this.checkDisbursementStatusViaWebSession(reference)
+        : this.checkDisbursementStatusViaDirect(reference);
+  }
+
   async getOperationalBalance() {
     return this.mode === "proxy"
       ? this.getBalanceViaProxy()
@@ -734,6 +780,16 @@ export class AirtelService {
     return this.toProviderResult(response, reference);
   }
 
+  private async checkDisbursementStatusViaDirect(
+    reference: string,
+  ): Promise<{ success: boolean; data?: unknown; error?: unknown }> {
+    const response = await this.requestDirectWithRetry({
+      method: "GET",
+      url: this.formatPath(this.config.disbursementStatusPath, reference),
+    });
+
+    return this.toProviderResult(response, reference);
+  }
 
   private async getBalanceViaDirect(): Promise<{
     success: boolean;
@@ -1014,6 +1070,20 @@ export class AirtelService {
     return this.toProviderResult(response, reference);
   }
 
+  private async checkDisbursementStatusViaWebSession(
+    reference: string,
+  ): Promise<{ success: boolean; data?: unknown; error?: unknown }> {
+    const response = await this.requestWithSessionAndRetry(
+      {
+        method: "GET",
+        url: this.formatPath(this.config.disbursementStatusPath, reference),
+      },
+      "payout",
+    );
+
+    return this.toProviderResult(response, reference);
+  }
+
   private async getBalanceViaWebSession(): Promise<{
     success: boolean;
     data?: { availableBalance: number; currency: string };
@@ -1139,6 +1209,24 @@ export class AirtelService {
     const response = await this.sendRequest(this.proxyClient, {
       method: "GET",
       url: this.formatPath(this.config.statusPath, reference),
+      headers: this.config.proxySecret
+        ? { "X-Airtel-Proxy-Secret": this.config.proxySecret }
+        : undefined,
+    });
+
+    return this.toProviderResult(response, reference);
+  }
+
+  private async checkDisbursementStatusViaProxy(
+    reference: string,
+  ): Promise<{ success: boolean; data?: unknown; error?: unknown }> {
+    if (!this.proxyClient) {
+      throw new Error("Proxy client not configured");
+    }
+
+    const response = await this.sendRequest(this.proxyClient, {
+      method: "GET",
+      url: this.formatPath(this.config.disbursementStatusPath, reference),
       headers: this.config.proxySecret
         ? { "X-Airtel-Proxy-Secret": this.config.proxySecret }
         : undefined,
