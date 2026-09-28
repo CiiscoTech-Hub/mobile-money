@@ -9,7 +9,7 @@ import "./tracer";
 import path from "path";
 import express, { NextFunction, Request, Response } from "express";
 import { IncomingMessage, Server } from "http";
-import compression from "compression";
+import { compressionMiddleware } from "./middleware/compression";
 import dotenv from "dotenv";
 import axios from "axios";
 import * as Sentry from "@sentry/node";
@@ -190,30 +190,7 @@ applySecurityMiddleware(app);
 
 // Compression middleware
 if (process.env.COMPRESSION_ENABLED !== "false") {
-  app.use(
-    compression({
-      threshold: parseInt(process.env.COMPRESSION_THRESHOLD || "1024"),
-      level: parseInt(process.env.COMPRESSION_LEVEL || "6"),
-      filter: (req, res) => {
-        if (req.headers["x-no-compression"]) {
-          return false;
-        }
-        // Don't compress already compressed content types
-        const contentType = res.getHeader("content-type") as string;
-        if (
-          contentType &&
-          (contentType.includes("image/") ||
-            contentType.includes("video/") ||
-            contentType.includes("audio/") ||
-            contentType.includes("application/zip") ||
-            contentType.includes("application/gzip"))
-        ) {
-          return false;
-        }
-        return compression.filter(req, res);
-      },
-    }),
-  );
+  app.use(compressionMiddleware);
 }
 
 app.use(
