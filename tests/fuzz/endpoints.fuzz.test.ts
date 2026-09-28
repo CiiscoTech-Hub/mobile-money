@@ -34,7 +34,7 @@ const mockDatabase = {
 };
 // Database — every query returns an empty result
 jest.mock("../../src/config/database", () => mockDatabase);
-jest.mock("../../src/config/database.js", () => mockDatabase);
+// jest.mock("../../src/config/database.js", () => mockDatabase);
 
 // Redis
 jest.mock("../../src/config/redis", () => ({
@@ -123,7 +123,25 @@ jest.mock("../../src/graphql/server", () => ({
 }));
 
 // Tracer (avoids dd-trace startup overhead)
-jest.mock("../../src/tracer", () => {});
+jest.mock("../../src/tracer", () => ({
+  __esModule: true,
+  getTraceIds: jest.fn(() => ({ trace_id: "", span_id: "" })),
+  withSpan: jest.fn((_name: string, fn: () => unknown) => fn()),
+  createJobSpan: jest.fn(),
+  default: {
+    getTraceIds: jest.fn(() => ({ trace_id: "", span_id: "" })),
+    withSpan: jest.fn((_name: string, fn: () => unknown) => fn()),
+    createJobSpan: jest.fn(),
+    startSpan: jest.fn(() => ({
+      setTag: jest.fn(),
+      finish: jest.fn(),
+      context: jest.fn(() => ({})),
+    })),
+    scope: jest.fn(() => ({
+      active: jest.fn(() => null),
+    })),
+  },
+}));
 
 // External HTTP (currency service, etc.)
 jest.mock("axios", () => {

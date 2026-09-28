@@ -23,28 +23,36 @@ import { getTraceIds } from "../tracer";
 // ─── Metrics ──────────────────────────────────────────────────────────────────
 
 function buildMetrics(reg: Registry = defaultRegister) {
-  const httpRequestsTotal = new Counter({
-    name: "http_requests_red_total",
-    help: "RED: total HTTP requests",
-    labelNames: ["method", "route", "status_code"],
-    registers: [reg],
-  });
+  const httpRequestsTotal =
+    (reg.getSingleMetric("http_requests_red_total") as Counter<string>) ||
+    new Counter({
+      name: "http_requests_red_total",
+      help: "RED: total HTTP requests",
+      labelNames: ["method", "route", "status_code"],
+      registers: [reg],
+    });
 
-  const httpRequestErrorsTotal = new Counter({
-    name: "http_request_errors_red_total",
-    help: "RED: total HTTP error responses (4xx+5xx)",
-    labelNames: ["method", "route", "status_code"],
-    registers: [reg],
-  });
+  const httpRequestErrorsTotal =
+    (reg.getSingleMetric("http_request_errors_red_total") as Counter<string>) ||
+    new Counter({
+      name: "http_request_errors_red_total",
+      help: "RED: total HTTP error responses (4xx+5xx)",
+      labelNames: ["method", "route", "status_code"],
+      registers: [reg],
+    });
 
-  const httpRequestDuration = new Histogram({
-    name: "http_request_duration_red_seconds",
-    help: "RED: HTTP request duration with exemplars",
-    labelNames: ["method", "route", "status_code"],
-    buckets: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
-    enableExemplars: true,
-    registers: [reg],
-  });
+  const httpRequestDuration =
+    (reg.getSingleMetric(
+      "http_request_duration_red_seconds",
+    ) as Histogram<string>) ||
+    new Histogram({
+      name: "http_request_duration_red_seconds",
+      help: "RED: HTTP request duration with exemplars",
+      labelNames: ["method", "route", "status_code"],
+      buckets: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
+      enableExemplars: false,
+      registers: [reg],
+    });
 
   return { httpRequestsTotal, httpRequestErrorsTotal, httpRequestDuration };
 }
@@ -71,14 +79,16 @@ export function tracingMetricsMiddleware(
   const start = process.hrtime.bigint();
 
   res.on("finish", () => {
-    const durationSeconds =
-      Number(process.hrtime.bigint() - start) / 1e9;
+    const durationSeconds = Number(process.hrtime.bigint() - start) / 1e9;
 
     // Normalise route: prefer Express route pattern, fall back to raw path
-    const route = (req.route?.path as string | undefined) ?? req.path ?? "unknown";
+    const route =
+      (req.route?.path as string | undefined) ?? req.path ?? "unknown";
     const method = req.method;
     const statusCode = String(res.statusCode);
-    const { trace_id, span_id } = getTraceIds();
+    const { trace_id, span_id } = (typeof getTraceIds === "function"
+      ? getTraceIds()
+      : null) ?? { trace_id: "", span_id: "" };
 
     const labels = { method, route, status_code: statusCode };
     const { httpRequestsTotal, httpRequestErrorsTotal, httpRequestDuration } =
@@ -90,15 +100,7 @@ export function tracingMetricsMiddleware(
       httpRequestErrorsTotal.inc(labels);
     }
 
-    if (trace_id) {
-      // Attach exemplar so Prometheus can link this bucket to the live trace
-      httpRequestDuration.observe(
-        { labels, exemplarLabels: { traceID: trace_id, spanID: span_id } },
-        durationSeconds,
-      );
-    } else {
-      httpRequestDuration.observe(labels, durationSeconds);
-    }
+    httpRequestDuration.observe(labels, durationSeconds);
   });
 
   next();

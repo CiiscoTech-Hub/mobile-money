@@ -1,4 +1,5 @@
 import { Request, Response, NextFunction } from "express";
+// @ts-ignore
 import geoip from "geoip-lite";
 
 // Operational regions: African countries where mobile money services are supported

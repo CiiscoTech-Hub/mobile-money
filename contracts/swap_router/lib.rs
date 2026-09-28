@@ -141,6 +141,7 @@ mod tests {
 
     #[test]
     fn slippage_check_passes_when_output_meets_min() {
+        let _env = soroban_sdk::Env::default();
         let actual_out: i128 = 950_000;
         let min_out: i128 = 900_000;
         assert!(actual_out >= min_out);

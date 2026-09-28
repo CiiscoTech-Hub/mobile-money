@@ -4,6 +4,7 @@ import { WebhookService, WebhookEvent } from "../services/webhook";
 import { TransactionModel } from "../models/transaction";
 import logger from "../utils/logger";
 import { queueOptions, getWebhookRetryWorkerConcurrency } from "./config";
+import { capturePersistentFailure } from "./dlq";
 
 let webhookRetryWorker: Worker<WebhookRetryJobData> | null = null;
 
@@ -62,7 +63,7 @@ export function startWebhookRetryWorker(): void {
 
         if (result.status === "delivered") {
           logger.info(
-            { webhookId, eventType },
+            { webhookId, eventType, statusCode: result.statusCode },
             "Webhook retry delivered successfully",
           );
         } else {
@@ -71,6 +72,7 @@ export function startWebhookRetryWorker(): void {
               webhookId,
               eventType,
               status: result.status,
+              statusCode: result.statusCode,
               error: result.lastError,
             },
             "Webhook retry failed after processing",
@@ -100,6 +102,18 @@ export function startWebhookRetryWorker(): void {
       { jobId: job?.id, error: error.message },
       "Webhook retry job failed",
     );
+
+    if (job) {
+      // No-ops until attemptsMade reaches the job's configured max (5 by
+      // default via WEBHOOK_RETRY_MAX_ATTEMPTS), at which point the
+      // exhausted job is moved to the dead-letter queue for inspection.
+      capturePersistentFailure(job).catch((dlqError) =>
+        logger.error(
+          { jobId: job.id, dlqError },
+          "[DLQ] Failed to capture exhausted webhook retry job",
+        ),
+      );
+    }
   });
 
   logger.info("Webhook retry worker started");

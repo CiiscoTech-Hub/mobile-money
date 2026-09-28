@@ -780,7 +780,7 @@ router.post(
       // ────────────────────────────────────────────────────────────────────────
 
       // Decode the XDR envelope and sign it with the managed key
-      const { TransactionBuilder } = await import("stellar-sdk");
+      const { TransactionBuilder } = await import("@stellar/stellar-sdk");
       const { getNetworkPassphrase } = await import("../config/stellar.js");
       let tx: any;
       try {

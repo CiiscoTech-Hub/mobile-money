@@ -526,3 +526,9 @@ export function getVerificationCountries(): VerificationCountry[] {
     passportVerificationEnabled: passportEnabledAlpha2.has(alpha2),
   }));
 }
+
+export function validateExpiryDate(expiryStr: string): boolean {
+  if (!expiryStr) return false;
+  const d = new Date(expiryStr);
+  return !isNaN(d.getTime()) && d.getTime() > Date.now();
+}

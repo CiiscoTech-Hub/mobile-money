@@ -8,7 +8,7 @@ import {
   Operation,
   Asset,
   Account,
-} from "stellar-sdk";
+} from "@stellar/stellar-sdk";
 import { createSep8Router } from "../sep8";
 import { Sep12Service, Sep12CustomerStatus } from "../sep12";
 import {
@@ -250,7 +250,10 @@ describe("SEP-08 Regulated Asset Approval", () => {
     });
 
     it("returned XDR carries the bridge's signature", async () => {
-      const { Transaction, Networks: SDKNetworks } = require("stellar-sdk");
+      const {
+        Transaction,
+        Networks: SDKNetworks,
+      } = require("@stellar/stellar-sdk");
 
       const res = await request(app)
         .post("/sep8/tx_approve")
@@ -261,8 +264,8 @@ describe("SEP-08 Regulated Asset Approval", () => {
       const signedTx = new Transaction(res.body.tx, SDKNetworks.TESTNET);
       const signers = signedTx.signatures.map((s: any) =>
         Keypair.fromPublicKey(SERVER_KEYPAIR.publicKey()).verify(
-          signedTx.hash(),
-          s.signature(),
+          Buffer.from(signedTx.hash()),
+          s.signature,
         ),
       );
       expect(signers.some(Boolean)).toBe(true);

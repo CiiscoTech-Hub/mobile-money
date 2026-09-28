@@ -1,3 +1,4 @@
+// @ts-ignore
 import geoip from "geoip-lite";
 import type { Request } from "express";
 import { redisClient } from "../config/redis";

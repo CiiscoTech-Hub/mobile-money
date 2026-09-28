@@ -1,5 +1,9 @@
 import { executeWithCircuitBreaker } from "../../utils/circuitBreaker";
 import {
+  buildProviderCircuitOpenResponse,
+  isCircuitBreakerOpenError,
+} from "../providerCircuitBreaker";
+import {
   providerFailoverAlerts,
   providerFailoverTotal,
   transactionErrorsTotal,
@@ -11,10 +15,7 @@ import { createError } from "../../middleware/errorHandler";
 import { ERROR_CODES } from "../../constants/errorCodes";
 
 export type ProviderTransactionStatus =
-  | "completed"
-  | "failed"
-  | "pending"
-  | "unknown";
+  "completed" | "failed" | "pending" | "unknown";
 
 export interface BatchPayoutItem {
   referenceId: string;
@@ -61,6 +62,7 @@ const {
 const SENEGAL_PHONE_REGEX = /^\+221\d{9}$/;
 const CAMEROON_PHONE_REGEX = /^\+237\d{9}$/;
 const UGANDA_PHONE_REGEX = /^\+256\d{9}$/;
+const KENYA_PHONE_REGEX = /^\+254\d{9}$/;
 
 export function isValidSenegalPhoneNumber(phoneNumber: string): boolean {
   return SENEGAL_PHONE_REGEX.test(phoneNumber.trim());
@@ -72,6 +74,10 @@ export function isValidCameroonPhoneNumber(phoneNumber: string): boolean {
 
 export function isValidUgandaPhoneNumber(phoneNumber: string): boolean {
   return UGANDA_PHONE_REGEX.test(phoneNumber.trim());
+}
+
+export function isValidKenyaPhoneNumber(phoneNumber: string): boolean {
+  return KENYA_PHONE_REGEX.test(phoneNumber.trim());
 }
 
 function isSenegalPhoneNumberCandidate(phoneNumber: string): boolean {
@@ -90,6 +96,12 @@ function isUgandaPhoneNumberCandidate(phoneNumber: string): boolean {
   const trimmed = phoneNumber.trim();
   const digits = trimmed.replace(/\D/g, "");
   return trimmed.startsWith("+256") || digits.startsWith("256");
+}
+
+function isKenyaPhoneNumberCandidate(phoneNumber: string): boolean {
+  const trimmed = phoneNumber.trim();
+  const digits = trimmed.replace(/\D/g, "");
+  return trimmed.startsWith("+254") || digits.startsWith("254");
 }
 
 function assertSupportedPhoneNumberFormat(phoneNumber: string): void {
@@ -120,6 +132,32 @@ function assertSupportedPhoneNumberFormat(phoneNumber: string): void {
       "Invalid Uganda phone number format. Use +256 followed by 9 digits.",
     );
   }
+  if (
+    isKenyaPhoneNumberCandidate(phoneNumber) &&
+    !isValidKenyaPhoneNumber(phoneNumber)
+  ) {
+    throw createError(
+      ERROR_CODES.INVALID_PHONE_FORMAT,
+      "Invalid Kenya phone number format. Use +254 followed by 9 digits.",
+    );
+  }
+}
+
+/**
+ * Whether a rejection from `super.initiatePayment`/`sendPayout` is an
+ * unrecovered circuit-breaker-open failure (#1962): every provider in the
+ * failover chain had an open breaker, so `executeProviderOperation` in the
+ * compiled dispatcher rethrew as a `MobileMoneyError` wrapping the original
+ * `EOPENBREAKER` error. Checks both the wrapper and its `originalError`,
+ * since the dispatcher always wraps the underlying cause.
+ */
+function isUnrecoveredCircuitBreakerFailure(error: unknown): boolean {
+  if (isCircuitBreakerOpenError(error)) {
+    return true;
+  }
+  const originalError = (error as { originalError?: unknown } | undefined)
+    ?.originalError;
+  return isCircuitBreakerOpenError(originalError);
 }
 
 class MobileMoneyService extends MobileMoneyServiceImpl {
@@ -187,11 +225,22 @@ class MobileMoneyService extends MobileMoneyServiceImpl {
       };
     }
 
-    const result = await super.initiatePayment(
-      routing.providerKey,
-      phoneNumber,
-      amount,
-    );
+    let result;
+    try {
+      result = await super.initiatePayment(
+        routing.providerKey,
+        phoneNumber,
+        amount,
+      );
+    } catch (error) {
+      if (isUnrecoveredCircuitBreakerFailure(error)) {
+        return buildProviderCircuitOpenResponse(
+          routing.providerKey,
+          "requestPayment",
+        );
+      }
+      throw error;
+    }
     return routing.maintenance
       ? { ...result, maintenance: routing.maintenance }
       : result;
@@ -212,11 +261,18 @@ class MobileMoneyService extends MobileMoneyServiceImpl {
       };
     }
 
-    const result = await super.sendPayout(
-      routing.providerKey,
-      phoneNumber,
-      amount,
-    );
+    let result;
+    try {
+      result = await super.sendPayout(routing.providerKey, phoneNumber, amount);
+    } catch (error) {
+      if (isUnrecoveredCircuitBreakerFailure(error)) {
+        return buildProviderCircuitOpenResponse(
+          routing.providerKey,
+          "sendPayout",
+        );
+      }
+      throw error;
+    }
     return routing.maintenance
       ? { ...result, maintenance: routing.maintenance }
       : result;
@@ -247,7 +303,27 @@ class MobileMoneyService extends MobileMoneyServiceImpl {
       };
     }
 
-    const result = await super.sendBatchPayout(routing.providerKey, items);
+    let result;
+    try {
+      result = await super.sendBatchPayout(routing.providerKey, items);
+    } catch (error) {
+      if (isUnrecoveredCircuitBreakerFailure(error)) {
+        const circuitResponse = buildProviderCircuitOpenResponse(
+          routing.providerKey,
+          "sendBatchPayout",
+        );
+        return {
+          success: false,
+          results: items.map((item) => ({
+            referenceId: item.referenceId,
+            success: false,
+            error: JSON.stringify(circuitResponse.error),
+          })),
+          error: circuitResponse.error,
+        };
+      }
+      throw error;
+    }
     return routing.maintenance
       ? { ...result, maintenance: routing.maintenance }
       : result;

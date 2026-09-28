@@ -5,6 +5,8 @@ import { isReadOnlyQuery } from "../utils/readOnlyDetector";
 import { dbReplicaLagSeconds, dbReplicaReadEnabled } from "../utils/metrics";
 import { startDeadlockDetector } from "./deadlockDetector";
 import { IS_SANDBOX, SANDBOX_DATABASE_URL, DATABASE_URL, DR_DATABASE_URL } from "./env";
+import { isTransientDatabaseConnectionError } from "./databaseErrors";
+
 
 const isDRMode = (): boolean => !!DR_DATABASE_URL;
 
@@ -42,6 +44,14 @@ const POOL_MAX_USES = parseInt(
   process.env.DB_POOL_MAX_USES || "0",
   10,
 );
+const QUERY_TIMEOUT_MS = parseInt(
+  process.env.DB_QUERY_TIMEOUT_MS || "10000",
+  10,
+);
+const STATEMENT_TIMEOUT_MS = parseInt(
+  process.env.DB_STATEMENT_TIMEOUT_MS || "15000",
+  10,
+);
 const POOL_ALLOW_EXIT_ON_IDLE =
   process.env.DB_POOL_ALLOW_EXIT_ON_IDLE === "true";
 const POOL_IDLE_TIMEOUT_MS = parseInt(
@@ -49,7 +59,7 @@ const POOL_IDLE_TIMEOUT_MS = parseInt(
   10,
 );
 const POOL_CONNECTION_TIMEOUT_MS = parseInt(
-  process.env.DB_POOL_CONNECTION_TIMEOUT_MS || "5000",
+  process.env.DB_POOL_CONNECTION_TIMEOUT_MS || "30000",
   10,
 );
 const REPLICA_IDLE_TIMEOUT_MS = parseInt(
@@ -113,28 +123,6 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function isTransientDatabaseError(error: unknown): boolean {
-  if (!error || typeof error !== "object") return false;
-
-  const candidate = error as { code?: string; message?: string };
-  const code = candidate.code?.toUpperCase() ?? "";
-  const message = candidate.message?.toLowerCase() ?? "";
-
-  return (
-    code === "ECONNRESET" ||
-    code === "ECONNREFUSED" ||
-    code === "ETIMEDOUT" ||
-    code === "57P01" ||
-    code === "08006" ||
-    code === "40P01" ||
-    message.includes("connection terminated") ||
-    message.includes("terminated unexpectedly") ||
-    message.includes("connection lost") ||
-    message.includes("disconnect") ||
-    message.includes("timeout") ||
-    message.includes("socket")
-  );
-}
 
 /**
  * Sanitizes a SQL query by removing sensitive data patterns
@@ -386,7 +374,10 @@ async function executeWithRetry<T>(
     } catch (error) {
       lastError = error;
 
-      if (!isTransientDatabaseError(error) || attempt === PRIMARY_POOL_MAX_RETRIES - 1) {
+      if (
+        !isTransientDatabaseConnectionError(error) ||
+        attempt === PRIMARY_POOL_MAX_RETRIES - 1
+      ) {
         throw error;
       }
 
@@ -464,6 +455,8 @@ function getPoolOptions(overrides: Partial<{
   ssl: boolean | undefined;
   maxUses: number;
   allowExitOnIdle: boolean;
+  query_timeout: number;
+  statement_timeout: number;
 }> = {}): object {
   return {
     connectionString: IS_SANDBOX
@@ -476,7 +469,13 @@ function getPoolOptions(overrides: Partial<{
     ssl: overrides.ssl ?? productionSsl,
     maxUses: overrides.maxUses ?? POOL_MAX_USES,
     allowExitOnIdle: overrides.allowExitOnIdle ?? POOL_ALLOW_EXIT_ON_IDLE,
+    query_timeout: overrides.query_timeout ?? QUERY_TIMEOUT_MS,
+    statement_timeout: overrides.statement_timeout ?? STATEMENT_TIMEOUT_MS,
   };
+}
+
+function startPoolMonitor(monitoredPool?: Pool): void {
+  // Pool monitor for dynamic sizing during surges (#1652)
 }
 
 function createPrimaryPool(): Pool {
@@ -499,6 +498,10 @@ function createPrimaryPool(): Pool {
 }
 
 export let pool: Pool = createPrimaryPool();
+
+export async function getPoolClient() {
+  return pool.connect();
+}
 
 /**
  * Read replica connection pool – handles SELECT queries to take load off the
@@ -550,6 +553,8 @@ const replicaPools: Pool[] = replicaUrls.map(
       ssl: productionSsl,
       maxUses: POOL_MAX_USES,
       allowExitOnIdle: POOL_ALLOW_EXIT_ON_IDLE,
+      query_timeout: QUERY_TIMEOUT_MS,
+      statement_timeout: STATEMENT_TIMEOUT_MS,
     }),
 );
 
@@ -883,4 +888,32 @@ export async function getPoolStats(): Promise<{
     },
     replicas: replicaStats,
   };
+}
+
+/**
+ * Executes an array of queries within a database transaction.
+ * Ensures the database connection is cleanly released back to the pool on errors/timeouts.
+ * 
+ * @param queries - Array of { text, params } query configurations
+ */
+export async function executeTransaction(
+  queries: Array<{ text: string; params?: unknown[] }>
+): Promise<void> {
+  const client = await pool.connect();
+  
+  try {
+    await client.query('BEGIN');
+    
+    for (const query of queries) {
+      await client.query(query.text, query.params);
+    }
+    
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    // Crucial: Releases the connection regardless of success or timeout failure
+    client.release();
+  }
 }

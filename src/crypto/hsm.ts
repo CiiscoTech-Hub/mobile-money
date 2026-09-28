@@ -32,7 +32,7 @@ import {
   FeeBumpTransaction,
   xdr,
   hash,
-} from "stellar-sdk";
+} from "@stellar/stellar-sdk";
 
 // ─── Configuration ───────────────────────────────────────────────────────────
 
@@ -260,7 +260,7 @@ export class KmsAsymmetricSigner implements TransactionSigner {
   async signTransaction(
     tx: Transaction | FeeBumpTransaction,
   ): Promise<SignedTransactionResult> {
-    const txHash = tx.hash();
+    const txHash = Buffer.from(tx.hash());
     const { decoratedSignature } = await this.sign(txHash);
 
     appendSignature(tx, decoratedSignature);
@@ -354,7 +354,7 @@ export class KmsEnvelopeSigner implements TransactionSigner {
   async signTransaction(
     tx: Transaction | FeeBumpTransaction,
   ): Promise<SignedTransactionResult> {
-    const txHash = tx.hash();
+    const txHash = Buffer.from(tx.hash());
     const { decoratedSignature } = await this.sign(txHash);
 
     appendSignature(tx, decoratedSignature);
@@ -510,7 +510,7 @@ export class Pkcs11Signer implements TransactionSigner {
   async signTransaction(
     tx: Transaction | FeeBumpTransaction,
   ): Promise<SignedTransactionResult> {
-    const txHash = tx.hash();
+    const txHash = Buffer.from(tx.hash());
     const { decoratedSignature } = await this.sign(txHash);
     appendSignature(tx, decoratedSignature);
     return {
@@ -557,7 +557,7 @@ export class LocalSigner implements TransactionSigner {
   async signTransaction(
     tx: Transaction | FeeBumpTransaction,
   ): Promise<SignedTransactionResult> {
-    const txHash = tx.hash();
+    const txHash = Buffer.from(tx.hash());
     const { decoratedSignature } = await this.sign(txHash);
     appendSignature(tx, decoratedSignature);
     return {
@@ -719,7 +719,7 @@ export async function signEnvelope(
   networkPassphrase: string,
   signer: TransactionSigner,
 ): Promise<string> {
-  const { TransactionBuilder } = await import("stellar-sdk");
+  const { TransactionBuilder } = await import("@stellar/stellar-sdk");
   const tx = TransactionBuilder.fromXDR(envelopeXdr, networkPassphrase);
   const result = await signer.signTransaction(tx);
   return result.envelopeXdr;

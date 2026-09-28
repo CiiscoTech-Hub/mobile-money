@@ -36,6 +36,36 @@ export interface AMLReviewHistoryEntry {
   createdAt: string;
 }
 
+/**
+ * Row shape returned by aml_alerts queries (aliased to camelCase).
+ * Timestamps arrive as Date objects from pg and are converted to ISO
+ * strings by mapRow.
+ */
+export interface AMLAlertRow {
+  id: string;
+  transactionId: string;
+  userId: string;
+  severity: AMLAlertSeverity;
+  status: AMLAlertStatus;
+  ruleHits: AMLRuleHit[];
+  reasons: string[];
+  createdAt: Date;
+  updatedAt: Date;
+  reviewedAt?: Date | null;
+  reviewedBy?: string | null;
+  reviewNotes?: string | null;
+}
+
+export interface AMLAlertReviewHistoryRow {
+  id: string;
+  alertId: string;
+  previousStatus: string;
+  newStatus: string;
+  reviewedBy: string;
+  reviewNotes?: string | null;
+  createdAt: Date;
+}
+
 export class AMLAlertModel {
   async create(alert: Omit<AMLAlert, "updatedAt">): Promise<AMLAlert> {
     const query = `
@@ -59,7 +89,7 @@ export class AMLAlertModel {
         review_notes AS "reviewNotes"
     `;
 
-    const result = await pool.query(query, [
+    const result = await pool.query<AMLAlertRow>(query, [
       alert.id,
       alert.transactionId,
       alert.userId,
@@ -92,13 +122,13 @@ export class AMLAlertModel {
       WHERE id = $1
     `;
 
-    const result = await pool.query(query, [id]);
+    const result = await pool.query<AMLAlertRow>(query, [id]);
     return result.rows.length > 0 ? this.mapRow(result.rows[0]) : null;
   }
 
   async list(filter: AMLAlertFilter = {}): Promise<AMLAlertListResult> {
     const conditions: string[] = [];
-    const params: any[] = [];
+    const params: unknown[] = [];
     let paramIndex = 1;
 
     if (filter.status) {
@@ -131,7 +161,7 @@ export class AMLAlertModel {
 
     // Get total count
     const countQuery = `SELECT COUNT(*) as count FROM aml_alerts ${whereClause}`;
-    const countResult = await pool.query(countQuery, params);
+    const countResult = await pool.query<{ count: string }>(countQuery, params);
     const total = parseInt(countResult.rows[0].count, 10);
 
     // Get pending review count
@@ -140,7 +170,10 @@ export class AMLAlertModel {
       FROM aml_alerts 
       ${whereClause ? whereClause + " AND" : "WHERE"} status = 'pending_review'
     `;
-    const pendingResult = await pool.query(pendingQuery, params);
+    const pendingResult = await pool.query<{ count: string }>(
+      pendingQuery,
+      params,
+    );
     const pendingReview = parseInt(pendingResult.rows[0].count, 10);
 
     // Keyset pagination processing
@@ -223,7 +256,7 @@ export class AMLAlertModel {
         ORDER BY created_at ${sortOrder}, id ${sortOrder}
         LIMIT $${alertsParamIndex++}
       `;
-      alertsResult = await pool.query(alertsQuery, [
+      alertsResult = await pool.query<AMLAlertRow>(alertsQuery, [
         ...alertsParams,
         limit + 1,
       ]);
@@ -248,7 +281,7 @@ export class AMLAlertModel {
         ORDER BY created_at DESC, id DESC
         LIMIT $${alertsParamIndex++} OFFSET $${alertsParamIndex++}
       `;
-      alertsResult = await pool.query(alertsQuery, [
+      alertsResult = await pool.query<AMLAlertRow>(alertsQuery, [
         ...alertsParams,
         limit,
         offset,
@@ -288,7 +321,10 @@ export class AMLAlertModel {
       const currentQuery = `
         SELECT status FROM aml_alerts WHERE id = $1 FOR UPDATE
       `;
-      const currentResult = await client.query(currentQuery, [alertId]);
+      const currentResult = await client.query<{ status: string }>(
+        currentQuery,
+        [alertId],
+      );
 
       if (currentResult.rows.length === 0) {
         await client.query("ROLLBACK");
@@ -322,7 +358,7 @@ export class AMLAlertModel {
           review_notes AS "reviewNotes"
       `;
 
-      const updateResult = await client.query(updateQuery, [
+      const updateResult = await client.query<AMLAlertRow>(updateQuery, [
         input.status,
         reviewerId,
         input.reviewNotes || null,
@@ -371,14 +407,14 @@ export class AMLAlertModel {
       ORDER BY created_at DESC
     `;
 
-    const result = await pool.query(query, [alertId]);
+    const result = await pool.query<AMLAlertReviewHistoryRow>(query, [alertId]);
     return result.rows.map((row) => ({
       id: row.id,
       alertId: row.alertId,
       previousStatus: row.previousStatus,
       newStatus: row.newStatus,
       reviewedBy: row.reviewedBy,
-      reviewNotes: row.reviewNotes,
+      reviewNotes: row.reviewNotes ?? undefined,
       createdAt: row.createdAt.toISOString(),
     }));
   }
@@ -403,11 +439,11 @@ export class AMLAlertModel {
       ORDER BY created_at DESC
     `;
 
-    const result = await pool.query(query, [transactionId]);
+    const result = await pool.query<AMLAlertRow>(query, [transactionId]);
     return result.rows.map((row) => this.mapRow(row));
   }
 
-  private mapRow(row: any): AMLAlert {
+  private mapRow(row: AMLAlertRow): AMLAlert {
     return {
       id: row.id,
       transactionId: row.transactionId,

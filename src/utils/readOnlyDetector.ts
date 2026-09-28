@@ -23,9 +23,11 @@ export function isReadOnlyQuery(query: string): boolean {
     return false;
   }
 
-  // Check for write operations in the query (case-insensitive)
-  // This catches queries that might have INSERT/UPDATE/DELETE in subqueries or CTEs
-  const writePattern = /\b(INSERT|UPDATE|DELETE|CREATE|DROP|ALTER|TRUNCATE)\b/i;
+  // Check for write operations in the query (case-insensitive).
+  // The detector is intentionally conservative: if a write keyword appears as
+  // part of the SQL text, the query is treated as non-read-only to avoid
+  // incorrectly routing write-capable statements to replicas.
+  const writePattern = /(INSERT|UPDATE|DELETE|CREATE|DROP|ALTER|TRUNCATE)/i;
   if (writePattern.test(query)) {
     return false;
   }

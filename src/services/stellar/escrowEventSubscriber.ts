@@ -1,7 +1,6 @@
 // src/services/stellar/escrowEventSubscriber.ts
-import { getStellarServer } from "../../config/stellar";
 import { insertEscrowEvent } from "../../database/escrowEventRepository";
-import EventSource from "eventsource";
+import { LedgerEventSync } from "./ledgerEventSync";
 
 interface EscrowEventPayload {
   escrowId: string;
@@ -12,52 +11,32 @@ interface EscrowEventPayload {
 
 type EscrowEventType = "lock" | "release";
 
-export function startEventSubscription() {
-  const horizon = getStellarServer();
-  const horizonUrl = (horizon as any).serverURL || (horizon as any).host; // fallback
+export function startEventSubscription(): LedgerEventSync | null {
   const escrowContractId = process.env.ESCROW_CONTRACT_ID;
   if (!escrowContractId) {
     console.warn(
-      "ESCROW_CONTRACT_ID not set – Horizon event subscription disabled",
+      "ESCROW_CONTRACT_ID not set – escrow event subscription disabled",
     );
-    return;
+    return null;
   }
 
-  const streamUrl = `${horizonUrl}/accounts/${escrowContractId}/transactions?cursor=now&limit=200&order=asc`;
-  const es = new EventSource(streamUrl);
+  const sync = new LedgerEventSync({
+    contractId: escrowContractId,
+    streamKey: `escrow:${escrowContractId}`,
+  });
 
-  es.onmessage = async (msg) => {
-    try {
-      const data = JSON.parse(msg.data);
-      if (!data || !data._embedded?.records) return;
-      for (const tx of data._embedded.records) {
-        const opsResponse = await horizon
-          .operations()
-          .forTransaction(tx.id)
-          .call();
-        for (const op of opsResponse.records) {
-          const operation = op as any;
-          if (operation.type !== "contract_event") continue;
-          if (operation.contract !== escrowContractId) continue;
-          const eventType: EscrowEventType = operation.value?.type;
-          if (eventType !== "lock" && eventType !== "release") continue;
-          const payload: EscrowEventPayload = operation.value?.payload || {};
-          await insertEscrowEvent({
-            tx_hash: tx.hash,
-            ledger: tx.ledger_seq,
-            event_type: eventType,
-            payload,
-            created_at: new Date(),
-          });
-        }
-      }
-    } catch (err) {
-      console.error("Error processing Horizon event stream", err);
-    }
-  };
+  sync.start(async (_tx, operation) => {
+    const eventType: EscrowEventType = operation.value?.type;
+    if (eventType !== "lock" && eventType !== "release") return;
+    const payload: EscrowEventPayload = operation.value?.payload || {};
+    await insertEscrowEvent({
+      tx_hash: _tx.hash,
+      ledger: _tx.ledger_seq,
+      event_type: eventType,
+      payload,
+      created_at: new Date(),
+    });
+  });
 
-  es.onerror = (err) => {
-    console.error("Horizon SSE error, attempting reconnect", err);
-    setTimeout(() => startEventSubscription(), 5000);
-  };
+  return sync;
 }

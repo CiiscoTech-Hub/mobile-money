@@ -1,0 +1,9 @@
+-- Rollback: Remove volatility-based fee strategy support (1/2)
+--
+-- NOTE: PostgreSQL does not support removing a single value from an existing
+-- enum type, so this is a no-op. The 'volatility_based' value added by the
+-- corresponding "up" migration remains in fee_strategy_type. Run the
+-- companion 20260826_add_volatility_fee_strategy_columns.down.sql first
+-- (it rolls back before this one, since it was applied after) to drop the
+-- supporting columns/constraint; any rows using 'volatility_based' should be
+-- migrated to another strategy_type before relying on this being clean.

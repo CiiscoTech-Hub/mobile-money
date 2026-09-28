@@ -9,8 +9,56 @@ import rateLimit from "express-rate-limit";
 import { ERROR_CODES } from "../constants/errorCodes";
 import { createError } from "../middleware/errorHandler";
 
+import { pool } from "../config/database";
+import { sanctionService } from "../services/sanctionService";
+import {
+  AmlScreeningResult,
+  PENDING_COMPLIANCE_REVIEW,
+  amlScreeningService,
+} from "../services/amlScreening";
+import { notifyReceivingAnchorStatus } from "../services/webhookService";
+import { strictIdempotency } from "../middleware/idempotency";
+
 const router = Router();
 const transactionModel = new TransactionModel();
+
+// ─── Fee calculation ─────────────────────────────────────────────────────────
+
+interface FeeOptions {
+  providerProcessingFee?: number;
+  fxConversionMarginPercent?: number;
+}
+
+interface FeeResult {
+  fee: number;
+  total: number;
+  feeDetails: {
+    providerProcessingFee: number;
+    fxConversionFee: number;
+  };
+}
+
+/**
+ * Calculates the total fee and gross-up amount for a SEP-31 transaction.
+ *
+ * @param amount - The send amount (in source-asset units) as a numeric value
+ * @param options - Optional fee configuration overrides
+ */
+function calculateFee(amount: number, options: FeeOptions = {}): FeeResult {
+  const providerProcessingFee = options.providerProcessingFee ?? 0;
+  const fxMargin = options.fxConversionMarginPercent ?? 0;
+  const fxConversionFee = amount * (fxMargin / 100);
+  const fee = providerProcessingFee + fxConversionFee;
+  return {
+    fee,
+    total: amount + fee,
+    feeDetails: {
+      providerProcessingFee,
+      fxConversionFee,
+    },
+  };
+}
+
 
 // --- SEP-31 Status State Machine ---
 // Valid statuses per SEP-31 spec
@@ -63,6 +111,12 @@ function mapToSep31Status(
     case TransactionStatus.Failed:
       return Sep31Status.Error;
     case TransactionStatus.Cancelled:
+      return Sep31Status.Error;
+    case TransactionStatus.Expired:
+      // #1793: an expired transaction never reached a terminal state with
+      // the provider, but SEP-31 has no "expired" status — Error is the
+      // closest terminal signal a sending anchor's polling client expects
+      // rather than leaving it (incorrectly) reported as still pending.
       return Sep31Status.Error;
     default:
       return Sep31Status.PendingSender;
@@ -125,12 +179,6 @@ function parseAssetCode(rawCode: string): string {
     return parts[1];
   }
   return rawCode;
-}
-
-function calculateFee(amount: number): { fee: number; total: number } {
-  let fee = SEP31_CONFIG.feeFixed + (amount * SEP31_CONFIG.feePercent) / 100;
-  fee = parseFloat(fee.toFixed(7));
-  return { fee, total: parseFloat((amount + fee).toFixed(7)) };
 }
 
 function generateMemo(): string {
@@ -211,6 +259,7 @@ router.get("/info", sep31ReadLimiter, async (req: Request, res: Response) => {
 router.post(
   "/transactions",
   sep31WriteLimiter,
+  strictIdempotency,
   async (req: Request, res: Response) => {
     const ip = req.ip || req.connection.remoteAddress || "0.0.0.0";
     const risk = await ipReputationService.checkIP(ip);
@@ -228,6 +277,8 @@ router.post(
       receiver_id,
       fields,
       lang,
+      callback_url,
+      callback_secret,
     } = req.body;
 
     // --- Input Validation ---
@@ -321,6 +372,29 @@ router.post(
       );
     }
 
+    // Strict KYC schema validation per country specifications (#1945)
+    const { validateSep31KycFields } = await import("../validators/sep31.js");
+    const kycValidation = validateSep31KycFields(
+      fields,
+      finalSenderId,
+      finalReceiverId,
+      req.body.country_code || req.body.destination_country,
+    );
+    if (!kycValidation.valid) {
+      throw createError(
+        ERROR_CODES.INVALID_INPUT,
+        kycValidation.error || "Missing mandatory KYC compliance fields",
+        {
+          error: "invalid_request",
+          message: kycValidation.error || "Missing mandatory KYC compliance fields",
+          details: {
+            missingSenderFields: kycValidation.missingSenderFields,
+            missingReceiverFields: kycValidation.missingReceiverFields,
+          },
+        },
+      );
+    }
+
     if (!SEP31_CONFIG.receivingAccount) {
       logger.error("SEP-31: STELLAR_RECEIVING_ACCOUNT not configured");
       throw createError(
@@ -335,14 +409,87 @@ router.post(
 
     try {
       const memo = generateMemo();
-      const { fee, total } = calculateFee(parsedAmount);
+      const { fee, total, feeDetails } = calculateFee(parsedAmount, {
+        providerProcessingFee: SEP31_CONFIG.feeFixed,
+        fxConversionMarginPercent: SEP31_CONFIG.feePercent,
+      });
       const amountOut = parsedAmount; // Amount delivered to receiver (before payout fees)
 
+      // --- Receiver-side AML Sanctions Screening ---
+      const receiverScreeningIdentifier =
+        txFields.receiver_name ||
+        (txFields.receiver_first_name
+          ? `${txFields.receiver_first_name} ${txFields.receiver_last_name || ""}`.trim()
+          : finalReceiverId);
+
+      let isComplianceFlagged = false;
+      let topMatch: any = null;
+
+      try {
+        const matches = await sanctionService.searchSanctionsWithLevenshtein(
+          receiverScreeningIdentifier,
+          0.85,
+        );
+        if (matches && matches.length > 0) {
+          isComplianceFlagged = true;
+          topMatch = matches[0];
+        }
+      } catch (screenErr) {
+        logger.warn(
+          { error: screenErr },
+          "[SEP-31] Receiver sanctions screening error",
+        );
+      }
+
+      // --- High-volume sender/receiver AML screening (#1970) ---
+      // SEP-31 senders whose rolling 24h USD volume crosses the configured
+      // threshold are screened against the OFAC/UN/EU sanctions lists and the
+      // PEP database. Matches flag the payment as pending_compliance_review.
+      const senderScreeningIdentifier =
+        txFields.sender_name ||
+        (txFields.sender_first_name
+          ? `${txFields.sender_first_name} ${txFields.sender_last_name || ""}`.trim()
+          : finalSenderId);
+
+      let amlScreening: AmlScreeningResult | null = null;
+      try {
+        const dailyVolumeUsd =
+          await amlScreeningService.getDailyVolumeUsd(finalSenderId);
+        amlScreening = await amlScreeningService.screenParties(
+          {
+            transactionId: memo,
+            userId: finalSenderId,
+            senderName: senderScreeningIdentifier,
+            receiverName: receiverScreeningIdentifier,
+            dailyVolumeUsd:
+              dailyVolumeUsd + (Number.isFinite(parsedAmount) ? parsedAmount : 0),
+          },
+          { persistAudit: false },
+        );
+      } catch (amlErr) {
+        logger.warn({ error: amlErr }, "[SEP-31] AML screening error");
+      }
+
+      const isAmlFlagged = Boolean(amlScreening?.flagged);
+      const flaggedForReview = isComplianceFlagged || isAmlFlagged;
+
+      const initialStatus = flaggedForReview
+        ? Sep31Status.PendingReceiver
+        : Sep31Status.PendingSender;
+
+      const complianceStatus = isComplianceFlagged
+        ? "PENDING_COMPLIANCE"
+        : isAmlFlagged
+          ? PENDING_COMPLIANCE_REVIEW
+          : "PASSED";
+
+      // Build sender/receiver payload mapping
       const metadata = {
         sep31: {
-          status: Sep31Status.PendingSender,
+          status: initialStatus,
           sender_id: finalSenderId,
           receiver_id: finalReceiverId,
+          receiver_name: receiverScreeningIdentifier,
           receiver_routing_number: txFields.receiver_routing_number || null,
           receiver_account_number: txFields.receiver_account_number || null,
           payout_type: txFields.type || "mobile_money",
@@ -352,11 +499,44 @@ router.post(
           amount_in: total.toString(),
           amount_out: amountOut.toString(),
           amount_fee: fee.toString(),
+          fee_details: feeDetails,
           asset_code: cleanAssetCode,
           asset_issuer: configuredAsset.isNative()
             ? null
             : configuredAsset.getIssuer(),
           lang: lang || "en",
+          // Receiving anchors register their callback and shared secret with
+          // the transfer. They are used only for outbound status webhooks.
+          callback_url: callback_url || txFields.callback_url || null,
+          callback_secret: callback_secret || txFields.callback_secret || null,
+          compliance_status: complianceStatus,
+          ...(isComplianceFlagged && topMatch
+            ? {
+                compliance_match: {
+                  matched_entity: topMatch.entity.name,
+                  score: topMatch.score,
+                  source: topMatch.entity.source,
+                  category: topMatch.entity.category,
+                  reason: `Receiver matched sanction entry ${topMatch.entity.name}`,
+                },
+              }
+            : {}),
+          ...(isAmlFlagged && amlScreening
+            ? {
+                aml_screening: {
+                  status: PENDING_COMPLIANCE_REVIEW,
+                  threshold_usd: amlScreening.thresholdUsd,
+                  daily_volume_usd: amlScreening.dailyVolumeUsd,
+                  matches: amlScreening.matches.map((match) => ({
+                    party: match.party,
+                    list_type: match.listType,
+                    matched_name: match.matchedName,
+                    score: match.score,
+                    source: match.source,
+                  })),
+                },
+              }
+            : {}),
         },
         ipRisk: risk,
       };
@@ -367,15 +547,94 @@ router.post(
         phoneNumber: "SEP-31",
         provider: "stellar-sep31",
         stellarAddress: SEP31_CONFIG.receivingAccount,
-        status: TransactionStatus.Pending,
+        status: flaggedForReview
+          ? TransactionStatus.Review
+          : TransactionStatus.Pending,
         metadata,
-        notes: `SEP-31 cross-border payment from ${finalSenderId} to ${finalReceiverId}`,
+        notes: isComplianceFlagged
+          ? `SEP-31 cross-border payment from ${finalSenderId} to ${finalReceiverId} flagged for compliance review: matched ${topMatch?.entity?.name}`
+          : isAmlFlagged
+            ? `SEP-31 cross-border payment from ${finalSenderId} to ${finalReceiverId} flagged pending_compliance_review by high-volume AML screening`
+            : `SEP-31 cross-border payment from ${finalSenderId} to ${finalReceiverId}`,
       });
+
+      if (initialStatus === Sep31Status.PendingReceiver) {
+        await notifyReceivingAnchorStatus(
+          newTransaction,
+          Sep31Status.PendingReceiver,
+          metadata,
+        );
+      }
+
+      // Persist the immutable, hash-chained AML audit records for any matches
+      // now that the transaction (and its real id) exists.
+      if (isAmlFlagged && amlScreening && newTransaction) {
+        for (const match of amlScreening.matches) {
+          try {
+            await amlScreeningService.recordScreeningAudit({
+              transactionId: newTransaction.id,
+              userId: finalSenderId,
+              party: match.party,
+              listType: match.listType,
+              screenedName: match.screenedName,
+              matchedName: match.matchedName,
+              score: match.score,
+              source: match.source,
+              dailyVolumeUsd: amlScreening.dailyVolumeUsd,
+              status: PENDING_COMPLIANCE_REVIEW,
+            });
+          } catch (auditErr) {
+            logger.error(
+              { error: auditErr, transactionId: newTransaction.id },
+              "[SEP-31] Failed to record AML screening audit record",
+            );
+          }
+        }
+      }
+
+      // Write incident entry into audit logs if flagged
+      if (isComplianceFlagged && topMatch) {
+        try {
+          await pool.query(
+            `INSERT INTO audit_logs (user_id, action, metadata) VALUES ($1, $2, $3)`,
+            [
+              finalReceiverId,
+              "AML_SANCTION_MATCH_RECEIVER",
+              JSON.stringify({
+                transactionId: newTransaction.id,
+                party: "receiver",
+                receiverId: finalReceiverId,
+                screenedName: receiverScreeningIdentifier,
+                matchedEntity: topMatch.entity.name,
+                score: topMatch.score,
+                source: topMatch.entity.source,
+                status: "PENDING_COMPLIANCE",
+                createdAt: new Date().toISOString(),
+              }),
+            ],
+          );
+        } catch (auditErr) {
+          logger.error(
+            { error: auditErr },
+            "[SEP-31] Failed to record AML sanction audit log entry",
+          );
+        }
+
+        logger.warn(
+          {
+            transactionId: newTransaction.id,
+            receiverId: finalReceiverId,
+            matchedEntity: topMatch.entity.name,
+            score: topMatch.score,
+          },
+          "[SEP-31] Recipient flagged in AML sanctions check - transaction flagged as PENDING_COMPLIANCE",
+        );
+      }
 
       return res.status(201).json({
         id: newTransaction.id,
-        status: Sep31Status.PendingSender,
-        status_eta: SEP31_CONFIG.statusEta,
+        status: initialStatus,
+        status_eta: flaggedForReview ? null : SEP31_CONFIG.statusEta,
         stellar_account_id: SEP31_CONFIG.receivingAccount,
         stellar_memo_type: "text",
         stellar_memo: memo,
@@ -385,6 +644,10 @@ router.post(
         amount_out_asset: getAssetString(),
         amount_fee: fee.toString(),
         amount_fee_asset: getAssetString(),
+        ...(flaggedForReview && {
+          required_info_message:
+            "This transfer requires AML compliance verification before proceeding.",
+        }),
       });
     } catch (error: any) {
       if (error && error.statusCode) {
@@ -439,6 +702,14 @@ router.get(
         transaction.metadata,
       );
       const assetString = getAssetString();
+      const feeDetails = Array.isArray(sep31Meta.fee_details)
+        ? sep31Meta.fee_details
+        : [
+            {
+              description: "Transaction fee",
+              amount: sep31Meta.amount_fee || "0",
+            },
+          ];
 
       return res.json({
         transaction: {
@@ -455,6 +726,7 @@ router.get(
           amount_out_asset: assetString,
           amount_fee: sep31Meta.amount_fee || "0",
           amount_fee_asset: assetString,
+          fee_details: feeDetails,
           stellar_account_id: SEP31_CONFIG.receivingAccount,
           stellar_memo_type: sep31Meta.memo_type || "text",
           stellar_memo: sep31Meta.memo || "",

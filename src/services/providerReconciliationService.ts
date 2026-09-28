@@ -23,8 +23,16 @@
  */
 
 import { Pool } from "pg";
-import { pool } from "../config/database";
+import { pool, queryRead, queryWrite } from "../config/database";
 import { ledgerService, LedgerService } from "./ledgerService";
+import {
+  parseCSV,
+  reconcileTransactions,
+  ProviderCSVRow,
+} from "./csvReconciliation";
+import logger from "../utils/logger";
+import axios from "axios";
+import { withReconciliationDbRetry } from "./reconciliationDbRetry";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -68,6 +76,59 @@ export interface SettlementSummary {
   totalTransactionsProcessed: number;
   issues: string[];
   completedAt: Date;
+}
+
+export interface ProviderReportConfig {
+  id: string;
+  provider: string;
+  is_enabled: boolean;
+  download_method: "api" | "manual"; // Simplified for now
+  api_endpoint?: string;
+  api_key?: string;
+  api_secret?: string;
+  report_timezone?: string;
+  report_time_format?: string;
+}
+
+export interface ReconciliationRun {
+  id: string;
+  provider: string;
+  report_date: string;
+  status: "running" | "completed" | "failed";
+  total_provider_rows: number;
+  total_db_records: number;
+  matched_count: number;
+  discrepancies_count: number;
+  orphaned_provider_count: number;
+  orphaned_db_count: number;
+  match_rate: number;
+  report_file_path?: string;
+  error_message?: string;
+  started_at: string;
+  completed_at?: string;
+}
+
+export interface ReconciliationAlert {
+  id: string;
+  reconciliation_run_id: string;
+  transaction_id?: string;
+  alert_type:
+    | "amount_mismatch"
+    | "status_mismatch"
+    | "orphaned_provider"
+    | "orphaned_db";
+  severity: "low" | "medium" | "high" | "critical";
+  status: "pending_review" | "reviewed" | "dismissed" | "resolved";
+  reference_number?: string;
+  expected_amount?: number;
+  actual_amount?: number;
+  expected_status?: string;
+  actual_status?: string;
+  provider_data?: any;
+  db_data?: any;
+  review_notes?: string;
+  reviewed_by?: string;
+  reviewed_at?: string;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -525,91 +586,24 @@ export class ProviderReconciliationService {
   private toDateString(date: Date): string {
     return date.toISOString().split("T")[0];
   }
-}
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
-function toErrorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
-
-// ─── Singleton export ────────────────────────────────────────────────────────
-
-export const providerReconciliationService = new ProviderReconciliationService();
-import { queryRead, queryWrite } from "../config/database";
-import {
-  parseCSV,
-  reconcileTransactions,
-  ProviderCSVRow,
-} from "./csvReconciliation";
-import logger from "../utils/logger";
-import axios from "axios";
-
-export interface ProviderReportConfig {
-  id: string;
-  provider: string;
-  is_enabled: boolean;
-  download_method: "api" | "manual"; // Simplified for now
-  api_endpoint?: string;
-  api_key?: string;
-  api_secret?: string;
-  report_timezone?: string;
-  report_time_format?: string;
-}
-
-export interface ReconciliationRun {
-  id: string;
-  provider: string;
-  report_date: string;
-  status: "running" | "completed" | "failed";
-  total_provider_rows: number;
-  total_db_records: number;
-  matched_count: number;
-  discrepancies_count: number;
-  orphaned_provider_count: number;
-  orphaned_db_count: number;
-  match_rate: number;
-  report_file_path?: string;
-  error_message?: string;
-  started_at: string;
-  completed_at?: string;
-}
-
-export interface ReconciliationAlert {
-  id: string;
-  reconciliation_run_id: string;
-  transaction_id?: string;
-  alert_type:
-    | "amount_mismatch"
-    | "status_mismatch"
-    | "orphaned_provider"
-    | "orphaned_db";
-  severity: "low" | "medium" | "high" | "critical";
-  status: "pending_review" | "reviewed" | "dismissed" | "resolved";
-  reference_number?: string;
-  expected_amount?: number;
-  actual_amount?: number;
-  expected_status?: string;
-  actual_status?: string;
-  provider_data?: any;
-  db_data?: any;
-  review_notes?: string;
-  reviewed_by?: string;
-  reviewed_at?: string;
-}
-
-export class ProviderReconciliationService {
+  // ─── CSV Provider Reconciliation Methods ──────────────────────────────────────
   // S3 client removed for simplicity - can be added back later
 
   /**
    * Get provider report configurations
    */
   async getProviderConfigs(): Promise<ProviderReportConfig[]> {
-    const result = await queryRead(`
+    const result = await withReconciliationDbRetry(
+      "providerReconciliation:getProviderConfigs",
+      {},
+      () =>
+        queryRead(`
       SELECT * FROM provider_report_configs
       WHERE is_enabled = true
       ORDER BY provider
-    `);
+    `),
+    );
 
     return result.rows;
   }
@@ -674,11 +668,19 @@ export class ProviderReconciliationService {
     );
 
     // Get provider config
-    const configResult = await queryRead(
-      `
+    const configResult = await withReconciliationDbRetry(
+      "providerReconciliation:loadConfig",
+      {
+        provider,
+        reportDate: reportDate.toISOString().split("T")[0],
+      },
+      () =>
+        queryRead(
+          `
       SELECT * FROM provider_report_configs WHERE provider = $1 AND is_enabled = true
     `,
-      [provider],
+          [provider],
+        ),
     );
 
     if (configResult.rows.length === 0) {
@@ -690,13 +692,23 @@ export class ProviderReconciliationService {
     const config = configResult.rows[0];
 
     // Create reconciliation run record
-    const runResult = await queryWrite(
-      `
+    const reportDateKey = reportDate.toISOString().split("T")[0];
+
+    const runResult = await withReconciliationDbRetry(
+      "providerReconciliation:createRun",
+      {
+        provider,
+        reportDate: reportDateKey,
+      },
+      () =>
+        queryWrite(
+          `
       INSERT INTO provider_reconciliation_runs (provider, report_date, status)
       VALUES ($1, $2, 'running')
       RETURNING *
     `,
-      [provider, reportDate.toISOString().split("T")[0]],
+          [provider, reportDateKey],
+        ),
     );
 
     const reconciliationRun = runResult.rows[0];
@@ -717,8 +729,16 @@ export class ProviderReconciliationService {
       const result = await reconcileTransactions(providerRows, dateRange);
 
       // Update reconciliation run with results
-      await queryWrite(
-        `
+      await withReconciliationDbRetry(
+        "providerReconciliation:completeRun",
+        {
+          provider,
+          reportDate: reportDateKey,
+          runId: reconciliationRun.id,
+        },
+        () =>
+          queryWrite(
+            `
         UPDATE provider_reconciliation_runs
         SET
           status = 'completed',
@@ -732,16 +752,17 @@ export class ProviderReconciliationService {
           completed_at = CURRENT_TIMESTAMP
         WHERE id = $8
       `,
-        [
-          result.total_provider_rows,
-          result.total_db_records,
-          result.summary.total_matched,
-          result.summary.total_discrepancies,
-          result.summary.total_orphaned_provider,
-          result.summary.total_orphaned_db,
-          parseFloat(result.summary.match_rate),
-          reconciliationRun.id,
-        ],
+            [
+              result.total_provider_rows,
+              result.total_db_records,
+              result.summary.total_matched,
+              result.summary.total_discrepancies,
+              result.summary.total_orphaned_provider,
+              result.summary.total_orphaned_db,
+              parseFloat(result.summary.match_rate),
+              reconciliationRun.id,
+            ],
+          ),
       );
 
       // Create alerts for discrepancies
@@ -752,18 +773,35 @@ export class ProviderReconciliationService {
       );
 
       // Return updated run
-      const updatedResult = await queryRead(
-        `
+      const updatedResult = await withReconciliationDbRetry(
+        "providerReconciliation:loadCompletedRun",
+        {
+          provider,
+          reportDate: reportDateKey,
+          runId: reconciliationRun.id,
+        },
+        () =>
+          queryRead(
+            `
         SELECT * FROM provider_reconciliation_runs WHERE id = $1
       `,
-        [reconciliationRun.id],
+            [reconciliationRun.id],
+          ),
       );
 
       return updatedResult.rows[0];
     } catch (error) {
       // Update run with error
-      await queryWrite(
-        `
+      await withReconciliationDbRetry(
+        "providerReconciliation:failRun",
+        {
+          provider,
+          reportDate: reportDateKey,
+          runId: reconciliationRun.id,
+        },
+        () =>
+          queryWrite(
+            `
         UPDATE provider_reconciliation_runs
         SET
           status = 'failed',
@@ -771,10 +809,11 @@ export class ProviderReconciliationService {
           completed_at = CURRENT_TIMESTAMP
         WHERE id = $2
       `,
-        [
-          error instanceof Error ? error.message : "Unknown error",
-          reconciliationRun.id,
-        ],
+            [
+              error instanceof Error ? error.message : "Unknown error",
+              reconciliationRun.id,
+            ],
+          ),
       );
 
       logger.error(error, `Reconciliation failed for ${provider}`);
@@ -861,15 +900,23 @@ export class ProviderReconciliationService {
         alert.review_notes,
       ]);
 
-      await queryWrite(
-        `
+      await withReconciliationDbRetry(
+        "providerReconciliation:createAlerts",
+        {
+          runId,
+          alertCount: alerts.length,
+        },
+        () =>
+          queryWrite(
+            `
         INSERT INTO provider_reconciliation_alerts (
           reconciliation_run_id, transaction_id, alert_type, severity,
           reference_number, expected_amount, actual_amount, expected_status, actual_status,
           provider_data, db_data, review_notes
         ) VALUES ${values}
       `,
-        params,
+            params,
+          ),
       );
 
       logger.info(
@@ -951,3 +998,13 @@ export class ProviderReconciliationService {
     return result.rows;
   }
 }
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+function toErrorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+// ─── Singleton export ────────────────────────────────────────────────────────
+
+export const providerReconciliationService = new ProviderReconciliationService();

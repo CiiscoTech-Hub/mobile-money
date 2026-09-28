@@ -78,7 +78,6 @@ const sidebars: SidebarsConfig = {
         "PACT_CONTRACT_TESTING",
         "CICD_PIPELINE",
         "CODE_COVERAGE",
-        "CODECOV_SETUP",
         "STALE_BRANCH_CLEANUP",
       ],
     },

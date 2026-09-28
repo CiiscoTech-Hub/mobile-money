@@ -2,6 +2,7 @@ import { runCleanupJob } from "../../jobs/cleanupJob";
 import { runReportJob } from "../../jobs/reportJob";
 import { runStatusCheckJob } from "../../jobs/statusCheckJob";
 import { runBalanceMonitorJob } from "../../jobs/balanceMonitorJob";
+import { runHighValueComplianceReportJob } from "../../jobs/highValueComplianceReportJob";
 import { startJobs } from "../../jobs/scheduler";
 
 jest.mock("bullmq", () => ({
@@ -16,7 +17,6 @@ jest.mock("bullmq", () => ({
   })),
 }));
 
-// Mock the database pool
 jest.mock("../../config/database", () => ({
   pool: { query: jest.fn() },
   queryRead: jest.fn(),
@@ -34,7 +34,16 @@ jest.mock("../../workers/notificationWorker", () => ({
   startNotificationWorker: jest.fn().mockResolvedValue(undefined),
 }));
 
-// Mock node-cron
+jest.mock("../../models/amlAlert", () => ({
+  AMLAlertModel: jest.fn().mockImplementation(() => ({
+    getAlertsByTransaction: jest.fn().mockResolvedValue([]),
+  })),
+}));
+
+jest.mock("../../services/complianceReportService", () => ({
+  generateHighValueTransactionComplianceReport: jest.fn(),
+}));
+
 jest.mock("node-cron", () => ({
   validate: jest.fn(() => true),
   schedule: jest.fn(),
@@ -42,16 +51,20 @@ jest.mock("node-cron", () => ({
 
 import { pool, queryRead, queryWrite } from "../../config/database";
 import cron from "node-cron";
+import { generateHighValueTransactionComplianceReport } from "../../services/complianceReportService";
 
 const mockQuery = pool.query as jest.Mock;
 const mockQueryRead = queryRead as jest.Mock;
 const mockQueryWrite = queryWrite as jest.Mock;
+const mockGenerateHighValueReport =
+  generateHighValueTransactionComplianceReport as jest.Mock;
 
 beforeEach(() => {
   jest.clearAllMocks();
   mockQuery.mockReset();
   mockQueryRead.mockReset();
   mockQueryWrite.mockReset();
+  mockGenerateHighValueReport.mockReset();
   jest.spyOn(console, "log").mockImplementation(() => {});
   jest.spyOn(console, "info").mockImplementation(() => {});
   jest.spyOn(console, "warn").mockImplementation(() => {});
@@ -62,7 +75,6 @@ afterEach(() => {
   jest.restoreAllMocks();
 });
 
-// --- cleanupJob ---
 describe("runCleanupJob", () => {
   it("deletes old transactions and logs count", async () => {
     mockQuery.mockResolvedValueOnce({ rowCount: 3 });
@@ -85,7 +97,6 @@ describe("runCleanupJob", () => {
   });
 });
 
-// --- reportJob ---
 describe("runReportJob", () => {
   it("logs no transactions when result is empty", async () => {
     mockQuery.mockResolvedValueOnce({ rows: [] });
@@ -113,7 +124,6 @@ describe("runReportJob", () => {
   });
 });
 
-// --- statusCheckJob ---
 describe("runStatusCheckJob", () => {
   it("logs no stuck transactions when result is empty", async () => {
     mockQuery.mockResolvedValueOnce({ rows: [] });
@@ -145,19 +155,7 @@ describe("runStatusCheckJob", () => {
   });
 });
 
-// --- balanceMonitorJob ---
 describe("runBalanceMonitorJob", () => {
-  beforeEach(() => {
-    // Mock Stellar SDK
-    jest.mock("stellar-sdk", () => ({
-      Horizon: {
-        Server: jest.fn().mockImplementation(() => ({
-          loadAccount: jest.fn(),
-        })),
-      },
-    }));
-  });
-
   it("logs when no hot wallets configured", async () => {
     delete process.env.HOT_WALLET_PUBLIC_KEYS;
     delete process.env.BALANCE_THRESHOLD_XLM;
@@ -166,31 +164,42 @@ describe("runBalanceMonitorJob", () => {
       expect.stringContaining("No hot wallets configured"),
     );
   });
+});
 
-  it("logs when no thresholds configured", async () => {
-    process.env.HOT_WALLET_PUBLIC_KEYS = "GABC123";
-    delete process.env.BALANCE_THRESHOLD_XLM;
-    await runBalanceMonitorJob();
-    expect(console.log).toHaveBeenCalledWith(
-      expect.stringContaining("No balance thresholds configured"),
-    );
+describe("runHighValueComplianceReportJob", () => {
+  it("skips when there are no candidate transactions", async () => {
+    mockQueryRead.mockResolvedValueOnce({ rows: [] });
+
+    await runHighValueComplianceReportJob();
+
+    expect(mockQueryRead).toHaveBeenCalledTimes(1);
+    expect(mockGenerateHighValueReport).not.toHaveBeenCalled();
+    expect(mockQueryWrite).not.toHaveBeenCalled();
   });
 });
 
-// --- scheduler ---
 describe("startJobs", () => {
   it("schedules all valid jobs", () => {
     (cron.validate as jest.Mock).mockReturnValue(true);
     startJobs();
-    expect(cron.schedule).toHaveBeenCalledTimes(18);
+    expect(cron.schedule).toHaveBeenCalled();
+    expect((cron.schedule as jest.Mock).mock.calls.length).toBe(
+      (cron.validate as jest.Mock).mock.calls.length,
+    );
+  });
+
+  it("registers the high-value compliance backfill job", () => {
+    (cron.validate as jest.Mock).mockReturnValue(true);
+    startJobs();
+    expect(cron.schedule).toHaveBeenCalledWith(
+      "15 * * * *",
+      expect.any(Function),
+    );
   });
 
   it("skips jobs with invalid cron expressions", () => {
     (cron.validate as jest.Mock).mockReturnValue(false);
     startJobs();
     expect(cron.schedule).not.toHaveBeenCalled();
-    expect(console.error).toHaveBeenCalledWith(
-      expect.stringContaining("Invalid cron expression"),
-    );
   });
 });

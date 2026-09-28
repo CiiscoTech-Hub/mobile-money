@@ -21,6 +21,7 @@ describe("AMLService", () => {
       frequencySpikeMultiplier: 3,
       geoHopMaxKm: 100,
       geoHopMaxHours: 6,
+      highValueReportThresholdUsd: 10_000,
     });
     amlService.clearAlerts();
   });
@@ -45,6 +46,9 @@ describe("AMLService", () => {
     amount: partial.amount ?? 1000,
     createdAt: partial.createdAt ?? now,
     status: partial.status ?? "pending",
+    currency: partial.currency ?? "XAF",
+    originalAmount: partial.originalAmount ?? partial.amount ?? 1000,
+    convertedAmount: partial.convertedAmount ?? null,
     locationMetadata: partial.locationMetadata,
   });
 
@@ -62,6 +66,43 @@ describe("AMLService", () => {
     ).toBe(true);
     expect(result.recommendedAction).toBe("review");
     expect(amlService.getPendingReviewAlerts()).toHaveLength(1);
+  });
+
+  it("flags USD-equivalent high-value transactions even when below XAF AML threshold", async () => {
+    const result = await amlService.evaluateTransaction(
+      baseTx({
+        amount: 900_000,
+        originalAmount: 900_000,
+        convertedAmount: 10_500,
+        currency: "XAF",
+      }),
+      [],
+    );
+
+    expect(result.flagged).toBe(true);
+    expect(result.ruleHits).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          rule: "single_transaction_threshold",
+          threshold: 10_000,
+        }),
+      ]),
+    );
+  });
+
+  it("assesses high-value alerts using USD-equivalent amounts", () => {
+    const assessment = amlService.assessHighValueTransaction(
+      baseTx({
+        amount: 900_000,
+        originalAmount: 900_000,
+        convertedAmount: 12_050.75,
+        currency: "XAF",
+      }),
+    );
+
+    expect(assessment.qualifies).toBe(true);
+    expect(assessment.usdEquivalent).toBe(12_050.75);
+    expect(assessment.thresholdUsd).toBe(10_000);
   });
 
   it("flags 24-hour aggregate amount above threshold", async () => {

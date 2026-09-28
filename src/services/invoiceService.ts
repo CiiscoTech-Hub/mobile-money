@@ -88,7 +88,13 @@ export class InvoiceService {
         }
 
         const amount = parseFloat(tx.amount);
-        const fee = tx.fee ? parseFloat(tx.fee) : 0;
+        // There is no `fee` column on transactions; fees are recorded in
+        // metadata when present, otherwise the invoice reports 0.
+        const feeValue = tx.metadata?.fee;
+        const fee =
+          typeof feeValue === "string" || typeof feeValue === "number"
+            ? parseFloat(String(feeValue))
+            : 0;
 
         currencyGroups[currency].count++;
         currencyGroups[currency].fees += fee;
@@ -162,8 +168,13 @@ export class InvoiceService {
         }
         doc.text(new Date(tx.createdAt).toLocaleDateString(), 50, y);
         doc.text(tx.type.toUpperCase(), 120, y);
+        const rowFee =
+          typeof tx.metadata?.fee === "string" ||
+          typeof tx.metadata?.fee === "number"
+            ? String(tx.metadata.fee)
+            : "0.00";
         doc.text(`${tx.amount} ${tx.currency || "USD"}`, 180, y);
-        doc.text(tx.fee || "0.00", 250, y);
+        doc.text(rowFee, 250, y);
         doc.text(tx.provider.toUpperCase(), 300, y);
         doc.text(tx.referenceNumber, 380, y);
         y += 15;

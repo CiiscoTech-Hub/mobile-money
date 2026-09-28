@@ -18,6 +18,7 @@ import { PeriodicExportingMetricReader } from "@opentelemetry/sdk-metrics";
 import { Resource } from "@opentelemetry/resources";
 import { ATTR_SERVICE_NAME, ATTR_SERVICE_VERSION } from "@opentelemetry/semantic-conventions";
 import { W3CTraceContextPropagator } from "@opentelemetry/core";
+import tracer from "dd-trace";
 import { CompositePropagator, W3CBaggagePropagator } from "@opentelemetry/core";
 import {
   TraceIdRatioBasedSampler,
@@ -63,14 +64,14 @@ if (OTEL_ENABLED) {
     : undefined; // no-op when endpoint not set
 
   const metricExporter = OTLP_ENDPOINT
-    ? new OTLPMetricExporter({ url: OTLP_ENDPOINT })
+    ? (new OTLPMetricExporter({ url: OTLP_ENDPOINT }) as any)
     : undefined;
 
   const metricReader = metricExporter
-    ? new PeriodicExportingMetricReader({
+    ? (new PeriodicExportingMetricReader({
         exporter: metricExporter,
         exportIntervalMillis: 15_000,
-      })
+      }) as any)
     : undefined;
 
   sdk = new NodeSDK({
@@ -110,19 +111,17 @@ if (OTEL_ENABLED) {
         },
         // Redis — adds db.statement to Redis commands
         "@opentelemetry/instrumentation-redis-4": { enabled: true },
-        // BullMQ — wraps job processing in spans
-        "@opentelemetry/instrumentation-bullmq": { enabled: true },
         // DNS, Net, FS — disable to keep overhead low
         "@opentelemetry/instrumentation-dns":  { enabled: false },
         "@opentelemetry/instrumentation-net":  { enabled: false },
         "@opentelemetry/instrumentation-fs":   { enabled: false },
-      }),
+      } as any),
     ],
-  });
+  } as any);
 
   sdk.start();
   console.log(
-    `[otel] SDK started — service=${SERVICE_NAME} sampling=${SAMPLING_RATE * 100}% endpoint=${OTLP_ENDPOINT ?? "none (no-op)"}`,
+    `[Tracer] OpenTelemetry SDK initialized for service '${SERVICE_NAME}'`,
   );
 
   // ─── Graceful shutdown ───────────────────────────────────────────────────
@@ -133,28 +132,24 @@ if (OTEL_ENABLED) {
 // ─── Log / Trace correlation helper ──────────────────────────────────────────
 
 /**
- * Returns the current trace_id and span_id so that structured log lines can
- * include them for log/trace correlation in Loki / Grafana Tempo.
- *
- * Usage:
- *   const { trace_id, span_id } = getTraceIds();
- *   console.log(JSON.stringify({ level: "info", message: "...", trace_id, span_id }));
+ * Convenience helper to extract the active trace and span ID.
+ * Returns null strings if no active trace context exists.
  */
 export function getTraceIds(): { trace_id: string; span_id: string } {
-  const span = trace.getActiveSpan();
-  if (!span) return { trace_id: "", span_id: "" };
-  const ctx = span.spanContext();
-  return { trace_id: ctx.traceId, span_id: ctx.spanId };
+  const activeSpan = trace.getSpan(context.active());
+  if (!activeSpan) {
+    return { trace_id: "", span_id: "" };
+  }
+  const spanContext = activeSpan.spanContext();
+  return {
+    trace_id: spanContext.traceId,
+    span_id: spanContext.spanId,
+  };
 }
 
 /**
- * Wrap a function in a named span.
- * Useful for instrumenting cron jobs and background workers that are not
- * covered by auto-instrumentation.
- *
- * @param name      Span name (e.g. "job.daily-settlement")
- * @param fn        Async function to execute inside the span
- * @param attributes Optional span attributes
+ * Wrap an async function in a new tracing span.
+ * Automatically records exceptions and ends the span.
  */
 export async function withSpan<T>(
   name: string,
@@ -162,14 +157,20 @@ export async function withSpan<T>(
   attributes?: Record<string, string | number | boolean>,
 ): Promise<T> {
   const tracer = trace.getTracer(SERVICE_NAME);
-  return tracer.startActiveSpan(name, { attributes }, async (span) => {
+  return tracer.startActiveSpan(name, async (span) => {
+    if (attributes) {
+      span.setAttributes(attributes);
+    }
     try {
       const result = await fn();
       span.setStatus({ code: SpanStatusCode.OK });
       return result;
-    } catch (err) {
-      span.setStatus({ code: SpanStatusCode.ERROR, message: String(err) });
-      span.recordException(err as Error);
+    } catch (err: any) {
+      span.recordException(err);
+      span.setStatus({
+        code: SpanStatusCode.ERROR,
+        message: err.message,
+      });
       throw err;
     } finally {
       span.end();
@@ -192,12 +193,12 @@ export function createJobSpan(
     linkedTraceId && linkedSpanId
       ? [
           {
-            context: trace.wrapSpanContext({
+            context: {
               traceId: linkedTraceId,
               spanId: linkedSpanId,
               traceFlags: 1,
               isRemote: true,
-            }),
+            },
           },
         ]
       : [];
@@ -206,49 +207,10 @@ export function createJobSpan(
 }
 
 export { sdk };
-export default { getTraceIds, withSpan, createJobSpan };
-tracer.use("graphql", {
-  // -1 = instrument all resolvers (no depth limit) — required for nested
-  // query bottleneck analysis. Set to 0 to disable resolver spans.
-  depth: -1,
-
-  // Derive the resource name from the operation signature (e.g.
-  // "query transaction($id: String!)") so it's human-readable in the UI.
-  signature: true,
-
-  // Do NOT capture the raw query text — it may contain PII.
-  source: false,
-
-  // Truncate variables that contain PII (phone numbers, addresses, etc.)
-  // so they never appear as span tags.
-  variables: (vars) => {
-    if (!vars) return vars;
-    const sanitized: Record<string, unknown> = {};
-    for (const [key, value] of Object.entries(vars)) {
-      if (/phone|address|token|secret|password|key/i.test(key)) {
-        sanitized[key] = "***";
-      } else {
-        sanitized[key] = value;
-      }
-    }
-    return sanitized;
-  },
-
-  hooks: {
-    execute: (span, args) => {
-      if (!span || !args) return;
-      // Extract operation type and name from the parsed document
-      const opDef = args.document?.definitions?.find(
-        (d: any) => d.kind === "OperationDefinition",
-      );
-      if (opDef) {
-        span.setTag("graphql.operation.type", opDef.operation);
-        if (opDef.name?.value) {
-          span.setTag("graphql.operation.name", opDef.name.value);
-        }
-      }
-    },
-  },
-});
-
-export default tracer;
+export default {
+  getTraceIds,
+  withSpan,
+  createJobSpan,
+  startSpan: (name: string, options?: any) => tracer.startSpan(name, options),
+  scope: () => tracer.scope(),
+};

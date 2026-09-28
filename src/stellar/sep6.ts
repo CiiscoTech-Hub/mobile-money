@@ -1,7 +1,7 @@
 import logger from "../utils/logger";
 import { Router, Request, Response } from "express";
 import { v4 as uuidv4 } from "uuid";
-import { StrKey } from "stellar-sdk";
+import { StrKey } from "@stellar/stellar-sdk";
 import { Pool } from "pg";
 import { Sep12Service, Sep12CustomerStatus } from "./sep12";
 

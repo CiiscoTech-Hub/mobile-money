@@ -1,3 +1,3 @@
-use soroban_sdk::BytesN;
+use soroban_sdk::{symbol_short, Symbol};
 
-pub const ESCROW: BytesN<1> = BytesN([0u8]);
+pub const ESCROW: Symbol = symbol_short!("ESCROW");

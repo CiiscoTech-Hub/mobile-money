@@ -157,14 +157,14 @@ function buildCspDirectives(): Record<string, Iterable<string>> {
     // "https://cdn.example.com" — never "'unsafe-inline'" or "'unsafe-eval'".
     scriptSrc: ["'self'"],
 
-    // Styles: only same-origin.
-    styleSrc: ["'self'"],
+    // Styles: same-origin + Google Fonts stylesheet (preconnect in <head>).
+    styleSrc: ["'self'", "https://fonts.googleapis.com"],
 
     // Images: same-origin + data URIs (needed for inline SVG/img src="data:…").
     imgSrc: ["'self'", "data:"],
 
-    // Fonts: same-origin.
-    fontSrc: ["'self'"],
+    // Fonts: same-origin + Google Fonts CDN (Inter, Outfit, Fira Code families).
+    fontSrc: ["'self'", "https://fonts.gstatic.com"],
 
     // fetch(), XHR, WebSocket: same-origin + explicitly listed API origins.
     connectSrc: ["'self'", ...allowedOriginList],
@@ -349,11 +349,22 @@ export function applySecurityMiddleware(app: Application): void {
   app.use(reportToMiddleware);
 
   // 4. CORS (exact-match allowlist, no wildcards).
-  app.use(cors(corsOptions));
+  const globalCors = cors(corsOptions);
+  app.use((req, res, next) => {
+    if (req.path.startsWith("/api/admin")) {
+      return next();
+    }
+    return globalCors(req, res, next);
+  });
 
   // 5. Maintenance Mode (blocks non-GET requests when active)
   app.use(maintenanceModeMiddleware);
 
   // 6. Respond to all OPTIONS preflight requests immediately.
-  app.options("*", cors(corsOptions));
+  app.options("*", (req, res, next) => {
+    if (req.path.startsWith("/api/admin")) {
+      return next();
+    }
+    return globalCors(req, res, next);
+  });
 }

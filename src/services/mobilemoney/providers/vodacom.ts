@@ -266,7 +266,7 @@ export class VodacomProvider {
       const code = response.data?.output_ResponseCode;
       if (code === "INS-0") {
         const txStatus = String(
-          response.data?.output_TransactionStatus || "",
+          response.data?.output_ResponseTransactionStatus || response.data?.output_TransactionStatus || "",
         ).toUpperCase();
         if (
           txStatus === "SUCCESSFUL" ||

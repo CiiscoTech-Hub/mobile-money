@@ -1,21 +1,19 @@
 # docker-compose.yml
 #
-# Local development environment for sublime247/mobile-money.
-# Starts the app alongside Postgres, Redis, and local mock services for Stellar and SMTP.
+# Local container environment for sublime247/mobile-money.
+# Builds the optimized production image alongside Postgres, Redis, and local mock services.
 #
 # Usage:
-#   docker compose up          # start everything
+#   docker compose up --build  # build and start everything
 #   docker compose up -d       # start in background
 #   docker compose down        # stop and remove containers
 #   docker compose down -v     # stop and wipe volumes (fresh DB)
-
-version: "3.9"
 
 services:
   app:
     build:
       context: .
-      dockerfile: Dockerfile.dev
+      dockerfile: Dockerfile
     container_name: mobilemoney_app
     restart: unless-stopped
     depends_on:
@@ -24,9 +22,10 @@ services:
       redis:
         condition: service_healthy
     env_file:
-      - .env
+      - path: .env
+        required: false
     environment:
-      NODE_ENV: development
+      NODE_ENV: production
       LOG_LEVEL: ${LOG_LEVEL:-info}
       DATABASE_URL: postgresql://user:password@postgres:5432/mobilemoney_stellar
       REDIS_URL: redis://redis:6379
@@ -35,6 +34,18 @@ services:
       SERVICE_NAME: ${SERVICE_NAME:-mobile-money-api}
     ports:
       - "3000:3000"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://localhost:3000/health').then(response => { if (!response.ok) process.exit(1); }).catch(() => process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
     networks:
       - mobilemoney_net
     logging:
@@ -138,7 +149,12 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./scripts:/scripts:ro
-    command: ["/bin/sh", "-c", "apk add --no-cache bash docker-cli curl && bash /scripts/checkResources.sh"]
+    command:
+      [
+        "/bin/sh",
+        "-c",
+        "apk add --no-cache bash docker-cli curl && bash /scripts/checkResources.sh",
+      ]
     networks:
       - mobilemoney_net
 

@@ -11,9 +11,9 @@ import {
   Transaction,
   TransactionBuilder,
   Horizon,
-} from "stellar-sdk";
+} from "@stellar/stellar-sdk";
 import { createSep10Router, Sep10Service, getSep10Config } from "../sep10";
-import { Networks } from "stellar-sdk";
+import { Networks } from "@stellar/stellar-sdk";
 import { errorHandler } from "../../middleware/errorHandler";
 import { z } from "zod";
 
@@ -168,10 +168,18 @@ function createChallengeTransaction(
   const expiresInSeconds = options?.expiresInSeconds || 900;
 
   const now = Math.floor(Date.now() / 1000);
-  const timebounds = {
-    minTime: String(now),
-    maxTime: String(now + expiresInSeconds),
-  };
+  // v16+ rejects inverted timebounds (minTime > maxTime) at build time, so
+  // "already expired" challenges use valid bounds whose maxTime is in the past.
+  const timebounds =
+    expiresInSeconds < 0
+      ? {
+          minTime: String(now - 60),
+          maxTime: String(now + expiresInSeconds),
+        }
+      : {
+          minTime: String(now),
+          maxTime: String(now + expiresInSeconds),
+        };
 
   const manageDataKey = `${homeDomain} auth`;
   const nonceLength = options?.wrongNonceLength ?? 64;

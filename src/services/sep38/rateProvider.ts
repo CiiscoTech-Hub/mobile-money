@@ -1,6 +1,6 @@
 import { currencyService, SupportedCurrency } from "../currency";
 import { exchangeRateBufferService } from "../exchangeRateBufferService";
-import * as StellarSdk from "stellar-sdk";
+import * as StellarSdk from "@stellar/stellar-sdk";
 import { getStellarServer } from "../../config/stellar";
 
 // ---------------------------------------------------------------------------

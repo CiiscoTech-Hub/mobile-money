@@ -107,4 +107,26 @@ describe("Admin Monitoring Controller & Dashboard API", () => {
       expect(res.body.logs.length).toBeGreaterThan(0);
     });
   });
+
+  describe("GET /api/monitoring/provider-maintenance", () => {
+    it("should list manual failover state for providers (#1550)", async () => {
+      const res = await request(app).get(
+        "/api/monitoring/provider-maintenance",
+      );
+
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(Array.isArray(res.body.providers)).toBe(true);
+    });
+  });
+
+  describe("POST /api/monitoring/provider-maintenance/:provider/toggle", () => {
+    it("should reject the toggle when the caller is not an authenticated admin (#1550)", async () => {
+      const res = await request(app)
+        .post("/api/monitoring/provider-maintenance/airtel/toggle")
+        .send({ enabled: false, reason: "Unplanned maintenance" });
+
+      expect(res.status).toBe(403);
+    });
+  });
 });

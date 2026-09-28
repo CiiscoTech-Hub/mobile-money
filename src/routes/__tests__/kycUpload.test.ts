@@ -17,13 +17,13 @@ jest.mock("redis", () => ({
   })),
 }));
 
-jest.mock("connect-redis", () => {
-  return jest.fn(() => ({
+jest.mock("connect-redis", () => ({
+  RedisStore: jest.fn(() => ({
     get: jest.fn(),
     set: jest.fn(),
     destroy: jest.fn(),
-  }));
-});
+  })),
+}));
 
 import { createKYCRoutes } from "../kycRoutes";
 import * as s3Upload from "../../services/s3Upload";

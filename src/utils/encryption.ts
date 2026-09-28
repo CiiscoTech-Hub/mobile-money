@@ -1,6 +1,7 @@
 import logger from "./logger";
 import crypto from "crypto";
 import { env } from "../config/env";
+import { encryptAesGcm, decryptAesGcm } from "../crypto/aesGcm";
 
 const ALGORITHM = "aes-256-gcm" as const;
 const IV_LENGTH = 12; // 96-bit IV — recommended for GCM
@@ -62,6 +63,7 @@ export function deriveUserKey(userId: string): Buffer {
 /**
  * Encrypts plaintext with AES-256-GCM.
  * A fresh random IV is generated for every call — IVs are NEVER reused.
+ * Delegates to the canonical primitives in src/crypto/aesGcm.ts.
  *
  * @param plaintext  The string to encrypt
  * @param key        32-byte Buffer (use deriveKey / deriveUserKey)
@@ -70,25 +72,17 @@ export function encryptAES(plaintext: string, key: Buffer): EncryptedPayload {
   if (key.length !== 32) {
     throw new Error("Encryption key must be exactly 32 bytes for AES-256-GCM");
   }
-  const iv = crypto.randomBytes(IV_LENGTH);
-  const cipher = crypto.createCipheriv(ALGORITHM, key, iv, {
-    authTagLength: AUTH_TAG_LENGTH,
-  });
-  const ciphertext = Buffer.concat([
-    cipher.update(plaintext, "utf8"),
-    cipher.final(),
-  ]);
-  const authTag = cipher.getAuthTag();
-  return {
-    iv: iv.toString("hex"),
-    authTag: authTag.toString("hex"),
-    ciphertext: ciphertext.toString("hex"),
-  };
+  const { iv, authTag, ciphertext } = encryptAesGcm(
+    Buffer.from(plaintext, "utf8"),
+    key,
+  );
+  return { iv, authTag, ciphertext };
 }
 
 /**
  * Decrypts an EncryptedPayload produced by `encryptAES()`.
  * Throws a clear, catchable error on authentication failure — never silently returns garbage.
+ * Delegates to the canonical primitives in src/crypto/aesGcm.ts.
  *
  * @param payload  The EncryptedPayload to decrypt
  * @param key      The same 32-byte Buffer used during encryption
@@ -97,18 +91,8 @@ export function decryptAES(payload: EncryptedPayload, key: Buffer): string {
   if (key.length !== 32) {
     throw new Error("Decryption key must be exactly 32 bytes for AES-256-GCM");
   }
-  const iv = Buffer.from(payload.iv, "hex");
-  const authTag = Buffer.from(payload.authTag, "hex");
-  const ciphertext = Buffer.from(payload.ciphertext, "hex");
-  const decipher = crypto.createDecipheriv(ALGORITHM, key, iv, {
-    authTagLength: AUTH_TAG_LENGTH,
-  });
-  decipher.setAuthTag(authTag);
   try {
-    const plaintext = Buffer.concat([
-      decipher.update(ciphertext),
-      decipher.final(),
-    ]);
+    const plaintext = decryptAesGcm(payload, key);
     return plaintext.toString("utf8");
   } catch {
     // Never log the key or ciphertext — only surface a safe message

@@ -2,6 +2,7 @@ import logger from "../../utils/logger";
 import { Queue, Worker, Job } from "bullmq";
 import { createHmac } from "crypto";
 import { queueOptions } from "../../queue/config";
+import { signWebhookPayload } from "../../crypto/webhookSigning";
 
 export const SEP_WEBHOOK_QUEUE_NAME = "sep-webhooks";
 
@@ -66,8 +67,11 @@ export const sepWebhookWorker = new Worker<SepWebhookJobData>(
     const secret = process.env.STELLAR_WEBHOOK_SECRET || "default_secret";
 
     const bodyStr = JSON.stringify(payload);
-    const signature =
-      "sha256=" + createHmac("sha256", secret).update(bodyStr).digest("hex");
+    const signature = signWebhookPayload(
+      bodyStr,
+      (p) => "sha256=" + createHmac("sha256", secret).update(p).digest("hex"),
+      process.env.STELLAR_WEBHOOK_ED25519_SIGNING_KEY,
+    ).signature;
 
     console.log(
       `[sep-webhook] Delivering webhook job=${job.id} for transaction=${transactionId} status=${status} to callbackUrl=${callbackUrl}`,

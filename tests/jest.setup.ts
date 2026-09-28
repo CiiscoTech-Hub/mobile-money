@@ -39,6 +39,7 @@ if (!process.env.STELLAR_ISSUER_SECRET || process.env.STELLAR_ISSUER_SECRET.leng
 if (process.env.STELLAR_SIGNING_KEY && process.env.STELLAR_SIGNING_KEY.length < 56) {
   delete process.env.STELLAR_SIGNING_KEY;
 }
+process.env.WEBVIEW_SIGNING_SECRET ??= "test-webview-signing-secret-32-chars";
 process.env.JWT_SECRET ??= "test-jwt-secret";
 process.env.ADMIN_API_KEY ??= "test-admin-key";
 process.env.DB_ENCRYPTION_KEY ??= "development-encryption-key-32-chars-long";
@@ -175,6 +176,10 @@ jest.mock("../src/config/redis", () => ({
     connect: jest.fn(),
     quit: jest.fn(),
     disconnect: jest.fn(),
+    get: jest.fn(),
+    setEx: jest.fn(),
+    del: jest.fn(),
   },
+  createRedisStore: jest.fn().mockReturnValue({ on: jest.fn(), get: jest.fn((sid: any, cb: any) => cb && cb(null, null)), set: jest.fn((sid: any, session: any, cb: any) => cb && cb(null)), destroy: jest.fn((sid: any, cb: any) => cb && cb(null)) }),
   SESSION_TTL_SECONDS: 86400,
 }));

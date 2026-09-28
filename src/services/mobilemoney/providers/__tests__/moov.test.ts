@@ -1,6 +1,9 @@
 import axios from "axios";
-import crypto from "crypto";
 import { MoovProvider } from "../moov";
+import {
+  buildMoovSoapResponse,
+  generateMoovTestKeyPair,
+} from "../../../mocks/helpers/moov";
 
 jest.mock("axios");
 
@@ -11,12 +14,7 @@ describe("MoovProvider", () => {
   let publicKey: string;
 
   beforeAll(() => {
-    // Generate RSA key pair dynamically for testing
-    const keys = crypto.generateKeyPairSync("rsa", {
-      modulusLength: 2048,
-      publicKeyEncoding: { type: "spki", format: "pem" },
-      privateKeyEncoding: { type: "pkcs8", format: "pem" },
-    });
+    const keys = generateMoovTestKeyPair();
     privateKey = keys.privateKey;
     publicKey = keys.publicKey;
   });
@@ -29,20 +27,7 @@ describe("MoovProvider", () => {
   });
 
   function mockSoapResponse(bodyContent: string): string {
-    const cleanBody = bodyContent.trim();
-    const sign = crypto.createSign("SHA256");
-    sign.update(cleanBody);
-    const signature = sign.sign(privateKey, "base64");
-
-    return `<?xml version="1.0" encoding="utf-8"?>
-<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
-  <soap:Header>
-    <Signature xmlns="http://www.moov.com/security">${signature}</Signature>
-  </soap:Header>
-  <soap:Body>
-    ${cleanBody}
-  </soap:Body>
-</soap:Envelope>`;
+    return buildMoovSoapResponse(bodyContent, privateKey);
   }
 
   describe("Initialization & Signing Utility", () => {

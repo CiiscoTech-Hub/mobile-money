@@ -1,6 +1,7 @@
-import logger from "../utils/logger";
+import logger, { getTelecomAverageMetrics } from "../utils/logger";
+
 import { Router, Request, Response, NextFunction } from "express";
-import * as StellarSdk from "stellar-sdk";
+import * as StellarSdk from "@stellar/stellar-sdk";
 import { generateToken } from "../auth/jwt";
 import {
   updateAdminNotesHandler,
@@ -47,15 +48,28 @@ import {
   ComplianceDocumentUpdateInput,
 } from "../models/complianceDocument";
 import { providerSettingsService } from "../services/providerSettingsService";
+import { systemConfigService } from "../services/systemConfigService";
 import { ProviderConfigCacheInvalidation } from "../services/cacheAside";
 import { resetCircuitBreakerForProvider } from "../utils/circuitBreaker";
 import { ERROR_CODES } from "../constants/errorCodes";
 import { createError } from "../middleware/errorHandler";
+import { AuditLogFilter, AuditLogModel } from "../models/auditLog";
 
-import adminControllerRouter from "../controllers/adminController";
+import adminControllerRouter, {
+  getDeadLetterJobsHandler,
+  getDeadLetterJobByIdHandler,
+  replayDeadLetterJobHandler,
+} from "../controllers/adminController";
 
 const router = Router();
 router.use("/monitoring", adminControllerRouter);
+
+// Dead-Letter Queue (DLQ) Admin Endpoints (#1989)
+router.get("/dlq", dlqInspectorHandler);
+router.get("/dlq/jobs", getDeadLetterJobsHandler);
+router.get("/dlq/jobs/:id", getDeadLetterJobByIdHandler);
+router.get("/dlq/:id", getDeadLetterJobByIdHandler);
+router.post("/dlq/replay/:id", replayDeadLetterJobHandler);
 const IMPERSONATION_TOKEN_EXPIRES_IN = "15m";
 const IMPERSONATION_TOKEN_TTL_MS = 15 * 60 * 1000;
 const READ_ONLY_IMPERSONATION_MESSAGE = "Read-only mode active";
@@ -127,6 +141,7 @@ const MAX_BULK_IDS = 100;
 const users: User[] = [];
 const transactionModel = new TransactionModel();
 const complianceDocumentModel = new ComplianceDocumentModel();
+const auditLogModel = new AuditLogModel();
 
 const isAdminRole = (role?: string) =>
   role === "admin" || role === "super-admin";
@@ -227,6 +242,283 @@ const paginate = <T>(data: T[], page: number, limit: number) => {
   };
 };
 
+const parseAuditLogQuery = (req: Request) => {
+  const page = Number.parseInt(String(req.query.page ?? "1"), 10);
+  const limit = Number.parseInt(String(req.query.limit ?? "50"), 10);
+
+  if (!Number.isInteger(page) || page < 1) {
+    throw createError(ERROR_CODES.INVALID_INPUT, "page must be a positive integer");
+  }
+  if (!Number.isInteger(limit) || limit < 1 || limit > 200) {
+    throw createError(ERROR_CODES.INVALID_INPUT, "limit must be an integer between 1 and 200");
+  }
+
+  const filter: AuditLogFilter = { limit, offset: (page - 1) * limit };
+  for (const key of ["adminId", "action", "resource", "resourceId"] as const) {
+    const value = req.query[key];
+    if (typeof value === "string" && value.trim()) {
+      filter[key] = value.trim();
+    }
+  }
+
+  return { page, limit, filter };
+};
+
+router.get(
+  "/audit-logs",
+  requireAdmin,
+  logAdminAction("LIST_AUDIT_LOGS"),
+  async (req: Request, res: Response) => {
+    try {
+      const { page, limit, filter } = parseAuditLogQuery(req);
+      const [data, total] = await Promise.all([
+        auditLogModel.list(filter),
+        auditLogModel.count(filter),
+      ]);
+
+      res.json({
+        data,
+        pagination: { total, page, limit, totalPages: Math.ceil(total / limit) },
+      });
+    } catch (error) {
+      if ((error as { statusCode?: number }).statusCode) throw error;
+      logger.error("Error listing audit logs:", error);
+      throw createError(ERROR_CODES.INTERNAL_ERROR, "Failed to list audit logs");
+    }
+  },
+);
+
+router.get(
+  "/audit-logs/view",
+  requireAdmin,
+  logAdminAction("VIEW_AUDIT_LOGS"),
+  (_req: Request, res: Response) => {
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.send(`<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Audit Trail</title><style>
+*{box-sizing:border-box}body{margin:0;padding:24px;font:14px system-ui,sans-serif;background:#f6f7f9;color:#17202a}
+main{max-width:1400px;margin:auto}h1{font-size:24px;margin:0 0 18px}form{display:grid;grid-template-columns:repeat(4,1fr) auto;gap:10px;margin-bottom:18px}
+input,button{font:inherit;padding:9px 10px;border:1px solid #c9d1d9;border-radius:4px;background:white}button{background:#155eef;color:white;border-color:#155eef;cursor:pointer}
+.table-wrap{overflow:auto;background:white;border:1px solid #d8dee4}table{width:100%;border-collapse:collapse;min-width:900px}th,td{text-align:left;vertical-align:top;padding:10px;border-bottom:1px solid #eaeef2}th{background:#eef2f6;font-size:12px;text-transform:uppercase}td{white-space:pre-wrap}td.diff{max-width:360px;word-break:break-word;font-family:ui-monospace,monospace;font-size:12px}#status{margin:12px 0;color:#586069}.pager{display:flex;justify-content:space-between;align-items:center;margin-top:12px}
+@media(max-width:800px){body{padding:14px}form{grid-template-columns:1fr 1fr}.table-wrap{margin:0 -14px;border-left:0;border-right:0}}
+</style></head><body><main><h1>Audit Trail</h1>
+<form id="filters"><input name="adminId" placeholder="Admin ID"><input name="action" placeholder="Action"><input name="resource" placeholder="Resource"><input name="resourceId" placeholder="Resource ID"><button type="submit">Filter</button></form>
+<div id="status">Loading...</div><div class="table-wrap"><table><thead><tr><th>Time</th><th>Admin</th><th>Action</th><th>Resource</th><th>Resource ID</th><th>IP address</th><th>User agent</th><th>Change</th></tr></thead><tbody id="rows"></tbody></table></div>
+<div class="pager"><button id="previous" type="button">Previous</button><span id="page"></span><button id="next" type="button">Next</button></div></main>
+<script>
+const form=document.getElementById('filters'), rows=document.getElementById('rows'), status=document.getElementById('status'), pageLabel=document.getElementById('page');
+let page=1, totalPages=1;
+function cell(row,value, className){const el=document.createElement(row);el.textContent=value ?? '';if(className)el.className=className;return el;}
+async function load(){const params=new URLSearchParams(new FormData(form));params.set('page',page);params.set('limit','50');status.textContent='Loading...';
+try{const response=await fetch('/api/admin/audit-logs?'+params,{credentials:'include'});if(response.status===401||response.status===403){status.innerHTML='Session expired. Please <a href="/api/auth/login" style="color:#155eef;">log in</a> again.';rows.replaceChildren();return;}if(!response.ok)throw new Error('HTTP '+response.status);const result=await response.json();rows.replaceChildren();
+result.data.forEach(log=>{const tr=document.createElement('tr');[new Date(log.createdAt).toLocaleString(),log.adminId,log.action,log.resource,log.resourceId,log.ipAddress,log.userAgent].forEach(value=>tr.appendChild(cell('td',value)));tr.appendChild(cell('td',JSON.stringify(log.diff,null,2),'diff'));rows.appendChild(tr)});
+totalPages=result.pagination.totalPages;pageLabel.textContent='Page '+result.pagination.page+' of '+Math.max(totalPages,1)+' ('+result.pagination.total+' entries)';status.textContent=result.data.length?'':'No audit entries found';document.getElementById('previous').disabled=page<=1;document.getElementById('next').disabled=page>=totalPages;
+}catch(error){status.textContent='Unable to load audit trail';rows.replaceChildren()}}
+form.addEventListener('submit',event=>{event.preventDefault();page=1;load()});document.getElementById('previous').onclick=()=>{if(page>1){page--;load()}};document.getElementById('next').onclick=()=>{if(page<totalPages){page++;load()}};load();
+</script></body></html>`);
+  },
+);
+
+/**
+ * =========================
+ * DYNAMIC SYSTEM CONFIGURATION
+ * =========================
+ */
+
+router.get(
+  "/config",
+  requireAdmin,
+  logAdminAction("LIST_SYSTEM_CONFIG"),
+  async (req: Request, res: Response) => {
+    try {
+      const category = req.query.category as string | undefined;
+      const { systemConfigService } = await import(
+        "../services/systemConfigService.js"
+      );
+      const configs = await systemConfigService.getAll(category);
+
+      res.json({
+        success: true,
+        configs,
+        total: configs.length,
+      });
+    } catch (err) {
+      logger.error("Error listing system config:", err);
+      throw createError(ERROR_CODES.INTERNAL_ERROR, "Failed to list system configuration");
+    }
+  },
+);
+
+router.get(
+  "/config/:key",
+  requireAdmin,
+  logAdminAction("GET_SYSTEM_CONFIG"),
+  async (req: Request, res: Response) => {
+    try {
+      const { systemConfigService } = await import(
+        "../services/systemConfigService.js"
+      );
+      const entry = await systemConfigService.get(req.params.key);
+
+      if (!entry) {
+        throw createError(ERROR_CODES.NOT_FOUND, `Config key '${req.params.key}' not found`);
+      }
+
+      res.json({ success: true, config: entry });
+    } catch (err) {
+      if ((err as any).statusCode) throw err;
+      logger.error("Error fetching system config:", err);
+      throw createError(ERROR_CODES.INTERNAL_ERROR, "Failed to fetch system configuration");
+    }
+  },
+);
+
+router.put(
+  "/config",
+  requireAdmin,
+  logAdminAction("UPSERT_SYSTEM_CONFIG"),
+  async (req: Request, res: Response) => {
+    try {
+      const adminUser = (req as AuthRequest).user;
+      if (!adminUser) {
+        throw createError(ERROR_CODES.UNAUTHORIZED, "Authentication required");
+      }
+
+      const { key, value, category, description, value_type } = req.body;
+
+      if (!key || typeof key !== "string" || key.trim().length === 0) {
+        throw createError(ERROR_CODES.INVALID_INPUT, "key is required and must be a non-empty string");
+      }
+      if (value === undefined || value === null) {
+        throw createError(ERROR_CODES.INVALID_INPUT, "value is required");
+      }
+
+      const validTypes = ["string", "number", "boolean", "json"];
+      if (value_type && !validTypes.includes(value_type)) {
+        throw createError(
+          ERROR_CODES.INVALID_INPUT,
+          `value_type must be one of: ${validTypes.join(", ")}`,
+        );
+      }
+
+      const { systemConfigService } = await import(
+        "../services/systemConfigService.js"
+      );
+      const entry = await systemConfigService.upsert({
+        key: key.trim(),
+        value: String(value),
+        category,
+        description,
+        value_type,
+        updated_by: adminUser.id,
+      });
+
+      res.json({
+        success: true,
+        message: `Config '${key}' updated`,
+        config: entry,
+      });
+    } catch (err) {
+      if ((err as any).statusCode) throw err;
+      logger.error("Error upserting system config:", err);
+      throw createError(ERROR_CODES.INTERNAL_ERROR, "Failed to update system configuration");
+    }
+  },
+);
+
+router.delete(
+  "/config/:key",
+  requireAdmin,
+  logAdminAction("DELETE_SYSTEM_CONFIG"),
+  async (req: Request, res: Response) => {
+    try {
+      const adminUser = (req as AuthRequest).user;
+      if (!adminUser) {
+        throw createError(ERROR_CODES.UNAUTHORIZED, "Authentication required");
+      }
+
+      const { systemConfigService } = await import(
+        "../services/systemConfigService.js"
+      );
+      const deleted = await systemConfigService.delete(req.params.key);
+
+      if (!deleted) {
+        throw createError(ERROR_CODES.NOT_FOUND, `Config key '${req.params.key}' not found`);
+      }
+
+      res.json({
+        success: true,
+        message: `Config '${req.params.key}' deleted`,
+      });
+    } catch (err) {
+      if ((err as any).statusCode) throw err;
+      logger.error("Error deleting system config:", err);
+      throw createError(ERROR_CODES.INTERNAL_ERROR, "Failed to delete system configuration");
+    }
+  },
+);
+
+router.patch(
+  "/config/bulk",
+  requireAdmin,
+  logAdminAction("BULK_UPDATE_SYSTEM_CONFIG"),
+  async (req: Request, res: Response) => {
+    try {
+      const adminUser = (req as AuthRequest).user;
+      if (!adminUser) {
+        throw createError(ERROR_CODES.UNAUTHORIZED, "Authentication required");
+      }
+
+      const { configs } = req.body;
+
+      if (!Array.isArray(configs) || configs.length === 0) {
+        throw createError(
+          ERROR_CODES.INVALID_INPUT,
+          "configs must be a non-empty array of { key, value } objects",
+        );
+      }
+
+      if (configs.length > 50) {
+        throw createError(ERROR_CODES.LIMIT_EXCEEDED, "Maximum 50 configs per bulk update");
+      }
+
+      for (const c of configs) {
+        if (!c.key || typeof c.key !== "string") {
+          throw createError(ERROR_CODES.INVALID_INPUT, "Each config must have a string 'key'");
+        }
+        if (c.value === undefined || c.value === null) {
+          throw createError(ERROR_CODES.INVALID_INPUT, `Config '${c.key}' must have a 'value'`);
+        }
+      }
+
+      const { systemConfigService } = await import(
+        "../services/systemConfigService.js"
+      );
+      const results = await systemConfigService.bulkUpsert(
+        configs.map((c: any) => ({
+          key: c.key.trim(),
+          value: String(c.value),
+          category: c.category,
+          description: c.description,
+          value_type: c.value_type,
+          updated_by: adminUser.id,
+        })),
+      );
+
+      res.json({
+        success: true,
+        message: `Bulk upserted ${results.length} configs`,
+        configs: results,
+      });
+    } catch (err) {
+      if ((err as any).statusCode) throw err;
+      logger.error("Error bulk upserting system config:", err);
+      throw createError(ERROR_CODES.INTERNAL_ERROR, "Failed to bulk update system configuration");
+    }
+  },
+);
+
 /**
  * =========================
  * METRICS
@@ -263,6 +555,34 @@ router.get(
     }
   },
 );
+
+// GET /api/admin/metrics/telecom-latency
+router.get(
+  "/metrics/telecom-latency",
+  requireAdmin,
+  logAdminAction("GET_TELECOM_LATENCY_METRICS"),
+  async (req: Request, res: Response) => {
+    try {
+      const provider = req.query.provider as string | undefined;
+      const metrics = getTelecomAverageMetrics(provider);
+      res.json({
+        success: true,
+        timestamp: new Date().toISOString(),
+        data: metrics,
+      });
+    } catch (err) {
+      logger.error("Error fetching telecom latency metrics:", err);
+      throw createError(
+        ERROR_CODES.INTERNAL_ERROR,
+        "Failed to retrieve telecom latency metrics",
+        {
+          message: err instanceof Error ? err.message : "Unknown error",
+        },
+      );
+    }
+  },
+);
+
 
 // POST /api/admin/users/bulk/freeze
 router.post(
@@ -2092,10 +2412,16 @@ router.get(
  <div id="status"></div>
 <script>
 const fmt = (n) => '$' + n.toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2});
+let pollInterval = null;
 
 async function load() {
   try {
     const r = await fetch('/api/admin/financial/pnl', {credentials:'include'});
+    if (r.status === 401 || r.status === 403) {
+      if (pollInterval) clearInterval(pollInterval);
+      document.querySelector('.chart-box').innerHTML = '<div class="error" style="text-align:center;padding:24px;"><h3>Session Expired</h3><p style="margin:12px 0 16px;color:#94a3b8;">Your administrative session has timed out. Please log in again to continue.</p><a href="/api/auth/login" style="display:inline-block;background:#3b82f6;color:white;padding:8px 16px;border-radius:6px;text-decoration:none;font-weight:600;">Log In</a></div>';
+      return;
+    }
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const {rows, totals} = await r.json();
 
@@ -2156,6 +2482,10 @@ function copyRef(ref) {
   
   try {
     const r = await fetch('/api/admin/transactions?reference=' + encodeURIComponent(ref), {credentials:'include'});
+    if (r.status === 401 || r.status === 403) {
+      empty.innerHTML = 'Session expired. Please <a href="/api/auth/login" style="color:#60a5fa;">log in</a> again.';
+      return;
+    }
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const {data} = await r.json();
     
@@ -2198,7 +2528,7 @@ function copyRef(ref) {
 document.getElementById('txSearch').onkeydown = (e) => { if(e.key === 'Enter') searchTx(); };
 
 load();
-setInterval(load, 60000);
+pollInterval = setInterval(load, 60000);
 </script>
 </body>
 </html>`);
@@ -2512,7 +2842,7 @@ function params(){const p = new URLSearchParams();['search','country','provider'
 function setMessage(text, cls){el('message').className = 'message ' + (cls || ''); el('message').textContent = text;}
 async function loadFacets(){const r = await fetch(api + '/facets', {credentials:'include'}); if(!r.ok) return; const f = await r.json(); fill('country', f.countries); fill('provider', f.providers); fill('tag', f.tags);}
 function fill(id, values){const first = el(id).options[0].outerHTML; el(id).innerHTML = first + (values || []).map(v => '<option value="' + esc(v) + '">' + esc(v) + '</option>').join('');}
-async function loadDocs(){const r = await fetch(api + '?' + params().toString(), {credentials:'include'}); const box = el('docs'); if(!r.ok){box.innerHTML='<div class="empty error">Failed to load documents</div>'; return;} const json = await r.json(); if(!json.data.length){box.innerHTML='<div class="empty">No documents found</div>'; return;} box.innerHTML = json.data.map(d => '<div class="doc" onclick="openDoc(\'' + d.id + '\')"><span class="status">' + esc(d.status) + '</span><h3>' + esc(d.title) + '</h3><div class="meta">' + esc(d.countryCode || 'Global') + ' · ' + esc(d.provider || 'Any provider') + '</div><div>' + (d.tags || []).map(t => '<span class="pill">' + esc(t) + '</span>').join('') + '</div></div>').join('');}
+async function loadDocs(){const r = await fetch(api + '?' + params().toString(), {credentials:'include'}); const box = el('docs'); if(r.status===401||r.status===403){box.innerHTML='<div class="empty error">Session expired. Please <a href="/api/auth/login" style="color:#60a5fa;">log in</a> again.</div>'; return;} if(!r.ok){box.innerHTML='<div class="empty error">Failed to load documents</div>'; return;} const json = await r.json(); if(!json.data.length){box.innerHTML='<div class="empty">No documents found</div>'; return;} box.innerHTML = json.data.map(d => '<div class="doc" onclick="openDoc(\'' + d.id + '\')"><span class="status">' + esc(d.status) + '</span><h3>' + esc(d.title) + '</h3><div class="meta">' + esc(d.countryCode || 'Global') + ' · ' + esc(d.provider || 'Any provider') + '</div><div>' + (d.tags || []).map(t => '<span class="pill">' + esc(t) + '</span>').join('') + '</div></div>').join('');}
 async function openDoc(id){const r = await fetch(api + '/' + encodeURIComponent(id), {credentials:'include'}); if(!r.ok){setMessage('Document not found','error'); return;} const d = await r.json(); el('docId').value=d.id; el('title').value=d.title || ''; el('docStatus').value=d.status || 'published'; el('docCountry').value=d.countryCode || ''; el('docProvider').value=d.provider || ''; el('docTags').value=(d.tags || []).join(', '); el('sourceUrl').value=d.sourceUrl || ''; el('summary').value=d.summary || ''; el('body').value=d.body || ''; setMessage('Loaded document','');}
 async function saveDoc(){const id = el('docId').value; const payload = {title:el('title').value, status:el('docStatus').value, country:el('docCountry').value, provider:el('docProvider').value, tags:el('docTags').value, sourceUrl:el('sourceUrl').value, summary:el('summary').value, body:el('body').value}; const r = await fetch(id ? api + '/' + encodeURIComponent(id) : api, {method:id?'PATCH':'POST', headers:{'Content-Type':'application/json'}, credentials:'include', body:JSON.stringify(payload)}); const json = await r.json().catch(()=>({})); if(!r.ok){setMessage(json.message || 'Save failed','error'); return;} setMessage('Saved','success'); el('docId').value=json.id; await loadFacets(); await loadDocs();}
 async function archiveDoc(){const id = el('docId').value; if(!id) return setMessage('Select a document first','error'); const r = await fetch(api + '/' + encodeURIComponent(id), {method:'DELETE', credentials:'include'}); if(!r.ok){setMessage('Archive failed','error'); return;} setMessage('Archived','success'); resetForm(); await loadFacets(); await loadDocs();}

@@ -60,7 +60,33 @@ function validateEvents(events: string[]): void {
   }
 }
 
-function mapRow(row: any): MerchantWebhook {
+interface MerchantWebhookRow {
+  id: string;
+  user_id: string;
+  url: string;
+  secret: string;
+  description?: string | null;
+  events: string[] | null;
+  is_active: boolean;
+  created_at: Date | string;
+  updated_at: Date | string;
+}
+
+interface WebhookDeliveryLogRow {
+  id: string;
+  webhook_id: string;
+  event_type: string;
+  payload: Record<string, unknown> | null;
+  status: WebhookDeliveryLog["status"];
+  http_status?: number | null;
+  response_body?: string | null;
+  error_message?: string | null;
+  duration_ms?: number | null;
+  is_test: boolean;
+  created_at: Date | string;
+}
+
+function mapRow(row: MerchantWebhookRow): MerchantWebhook {
   return {
     id: row.id,
     userId: row.user_id,
@@ -74,12 +100,12 @@ function mapRow(row: any): MerchantWebhook {
   };
 }
 
-function mapLogRow(row: any): WebhookDeliveryLog {
+function mapLogRow(row: WebhookDeliveryLogRow): WebhookDeliveryLog {
   return {
     id: row.id,
     webhookId: row.webhook_id,
     eventType: row.event_type,
-    payload: row.payload,
+    payload: row.payload ?? {},
     status: row.status,
     httpStatus: row.http_status ?? undefined,
     responseBody: row.response_body ?? undefined,
@@ -99,7 +125,7 @@ export class MerchantWebhookModel {
     validateEvents(events);
 
     // Enforce per-user limit
-    const countRes = await queryRead(
+    const countRes = await queryRead<{ count: string }>(
       "SELECT COUNT(*) FROM merchant_webhooks WHERE user_id = $1",
       [input.userId],
     );
@@ -109,7 +135,7 @@ export class MerchantWebhookModel {
       );
     }
 
-    const res = await queryWrite(
+    const res = await queryWrite<MerchantWebhookRow>(
       `INSERT INTO merchant_webhooks (user_id, url, secret, description, events)
        VALUES ($1, $2, $3, $4, $5)
        RETURNING *`,
@@ -131,12 +157,12 @@ export class MerchantWebhookModel {
       q += " AND user_id = $2";
       params.push(userId);
     }
-    const res = await queryRead(q, params);
+    const res = await queryRead<MerchantWebhookRow>(q, params);
     return res.rows[0] ? mapRow(res.rows[0]) : null;
   }
 
   async findByUserId(userId: string): Promise<MerchantWebhook[]> {
-    const res = await queryRead(
+    const res = await queryRead<MerchantWebhookRow>(
       "SELECT * FROM merchant_webhooks WHERE user_id = $1 ORDER BY created_at DESC",
       [userId],
     );
@@ -180,7 +206,7 @@ export class MerchantWebhookModel {
     fields.push(`updated_at = NOW()`);
     params.push(id, userId);
 
-    const res = await queryWrite(
+    const res = await queryWrite<MerchantWebhookRow>(
       `UPDATE merchant_webhooks SET ${fields.join(", ")}
        WHERE id = $${idx++} AND user_id = $${idx}
        RETURNING *`,
@@ -202,7 +228,7 @@ export class MerchantWebhookModel {
   async insertDeliveryLog(
     log: Omit<WebhookDeliveryLog, "id" | "createdAt">,
   ): Promise<WebhookDeliveryLog> {
-    const res = await queryWrite(
+    const res = await queryWrite<WebhookDeliveryLogRow>(
       `INSERT INTO webhook_delivery_logs
          (webhook_id, event_type, payload, status, http_status, response_body, error_message, duration_ms, is_test)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
@@ -233,14 +259,14 @@ export class MerchantWebhookModel {
     if (!webhook) return { logs: [], total: 0 };
 
     const [logsRes, countRes] = await Promise.all([
-      queryRead(
+      queryRead<WebhookDeliveryLogRow>(
         `SELECT * FROM webhook_delivery_logs
          WHERE webhook_id = $1
          ORDER BY created_at DESC
          LIMIT $2 OFFSET $3`,
         [webhookId, limit, offset],
       ),
-      queryRead(
+      queryRead<{ count: string }>(
         "SELECT COUNT(*) FROM webhook_delivery_logs WHERE webhook_id = $1",
         [webhookId],
       ),

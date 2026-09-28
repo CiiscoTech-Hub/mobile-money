@@ -2,38 +2,125 @@ import crypto from "crypto";
 import PDFDocument from "pdfkit";
 import { uploadToS3 } from "./s3Upload";
 import { Transaction } from "../models/transaction";
-import { AMLAlert } from "./aml";
+import { AMLAlert, AMLHighValueAssessment } from "./aml";
+import { AES_GCM_ALGORITHM, encryptAesGcmToBuffer } from "../crypto/aesGcm";
 import { DB_ENCRYPTION_KEY } from "../config/env";
 
-const ALGORITHM = "aes-256-gcm";
-const IV_LENGTH = 12;
-const AUTH_TAG_LENGTH = 16;
+const TEMPLATE_VERSION = "1.0";
+
+type ComplianceReportTemplate =
+  "flagged_transaction" | "high_value_transaction";
+
+export interface ComplianceReportResult {
+  pdfUrl: string;
+  storageKey?: string;
+  template: ComplianceReportTemplate;
+  source: string;
+  templateVersion: string;
+}
+
+interface GenerateComplianceReportOptions {
+  template?: ComplianceReportTemplate;
+  highValueAssessment?: AMLHighValueAssessment;
+}
 
 export async function generateFlaggedTransactionComplianceReport(
   transaction: Transaction,
   alert: AMLAlert,
-): Promise<{ pdfUrl: string }> {
+): Promise<ComplianceReportResult> {
+  return generateComplianceReport(transaction, alert, {
+    template: "flagged_transaction",
+  });
+}
+
+export async function generateHighValueTransactionComplianceReport(
+  transaction: Transaction,
+  alert: AMLAlert,
+  highValueAssessment: AMLHighValueAssessment,
+): Promise<ComplianceReportResult> {
+  return generateComplianceReport(transaction, alert, {
+    template: "high_value_transaction",
+    highValueAssessment,
+  });
+}
+
+async function generateComplianceReport(
+  transaction: Transaction,
+  alert: AMLAlert,
+  options: GenerateComplianceReportOptions = {},
+): Promise<ComplianceReportResult> {
   if (!transaction.userId) {
     throw new Error(
       "Transaction is missing userId for compliance report generation",
     );
   }
 
-  const pdfBuffer = await generatePDFBuffer(transaction, alert);
+  const template = options.template ?? "flagged_transaction";
+  const pdfBuffer = await generatePDFBuffer(
+    transaction,
+    alert,
+    template,
+    options.highValueAssessment,
+  );
   const encryptedBuffer = encryptBuffer(pdfBuffer);
-  const pdfUrl = await storeCompliancePdf(
+  const stored = await storeCompliancePdf(
     encryptedBuffer,
     transaction.userId,
     transaction.id,
     alert.id,
+    template,
   );
 
-  return { pdfUrl };
+  return {
+    pdfUrl: stored.pdfUrl,
+    storageKey: stored.storageKey,
+    template,
+    source:
+      template === "high_value_transaction"
+        ? "aml_high_value_transaction"
+        : "flagged_transaction",
+    templateVersion: TEMPLATE_VERSION,
+  };
+}
+
+function buildReportTitle(template: ComplianceReportTemplate): string {
+  return template === "high_value_transaction"
+    ? "High-Value Transaction Compliance Report"
+    : "Flagged Transaction Compliance Report";
+}
+
+function buildNarrative(
+  template: ComplianceReportTemplate,
+  highValueAssessment?: AMLHighValueAssessment,
+): string {
+  if (template === "high_value_transaction" && highValueAssessment) {
+    return `A transaction exceeded the USD-equivalent high-value reporting threshold of ${highValueAssessment.thresholdUsd.toFixed(2)} USD. The system generated this report to capture the transaction details, AML alert metadata, threshold assessment, and compliance context for downstream review and audit.`;
+  }
+
+  return "A transaction was flagged for AML review. The system generated this report to capture the flagged transaction details, alert metadata, and any related compliance context for downstream review and audit.";
+}
+
+function formatTransactionAmount(transaction: Transaction): string {
+  const currency =
+    typeof transaction.currency === "string"
+      ? transaction.currency.toUpperCase()
+      : "USD";
+  const originalAmount = Number(
+    transaction.originalAmount ?? transaction.amount,
+  );
+
+  if (Number.isFinite(originalAmount)) {
+    return `${originalAmount} ${currency}`;
+  }
+
+  return `${transaction.amount} ${currency}`;
 }
 
 async function generatePDFBuffer(
   transaction: Transaction,
   alert: AMLAlert,
+  template: ComplianceReportTemplate,
+  highValueAssessment?: AMLHighValueAssessment,
 ): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const doc = new PDFDocument({ size: "A4", margin: 50 });
@@ -43,17 +130,13 @@ async function generatePDFBuffer(
     doc.on("end", () => resolve(Buffer.concat(chunks)));
     doc.on("error", (err) => reject(err));
 
-    doc
-      .fillColor("#2c3e50")
-      .fontSize(18)
-      .text("Mobile Money", { align: "center" });
+    doc.fillColor("#2c3e50").fontSize(18).text("Mobile Money", {
+      align: "center",
+    });
     doc.moveDown(0.25);
-    doc
-      .fontSize(12)
-      .fillColor("#7f8c8d")
-      .text("Flagged Transaction Compliance Report", {
-        align: "center",
-      });
+    doc.fontSize(12).fillColor("#7f8c8d").text(buildReportTitle(template), {
+      align: "center",
+    });
     doc.moveDown(1);
 
     doc
@@ -67,7 +150,7 @@ async function generatePDFBuffer(
     doc.text(`User ID: ${transaction.userId}`);
     doc.text(`Provider: ${transaction.provider}`);
     doc.text(`Transaction Type: ${transaction.type}`);
-    doc.text(`Amount: ${transaction.amount}`);
+    doc.text(`Amount: ${formatTransactionAmount(transaction)}`);
     doc.text(`Status: ${transaction.status}`);
     doc.text(`Created At: ${new Date(transaction.createdAt).toLocaleString()}`);
     if (transaction.phoneNumber) {
@@ -88,6 +171,23 @@ async function generatePDFBuffer(
         width: 500,
         align: "left",
       });
+    }
+
+    if (template === "high_value_transaction" && highValueAssessment) {
+      doc.moveDown(1);
+      doc
+        .fillColor("#34495e")
+        .fontSize(12)
+        .text("High-Value Threshold Assessment", { underline: true });
+      doc.moveDown(0.5);
+      doc.fontSize(10).fillColor("#000");
+      doc.text(
+        `USD Equivalent: ${highValueAssessment.usdEquivalent.toFixed(2)} USD`,
+      );
+      doc.text(`Threshold: ${highValueAssessment.thresholdUsd.toFixed(2)} USD`);
+      doc.text(
+        `Source Amount: ${highValueAssessment.sourceAmount} ${highValueAssessment.originalCurrency}`,
+      );
     }
 
     doc.moveDown(1);
@@ -128,15 +228,19 @@ async function generatePDFBuffer(
       .text("Compliance Narrative", { underline: true });
     doc.moveDown(0.5);
     doc.fontSize(10).fillColor("#000");
-
-    const narrative = `A transaction was flagged for AML review. The system generated this report to capture the flagged transaction details, alert metadata, and any related compliance context for downstream review and audit.`;
-    doc.text(narrative, { align: "justify", width: 500 });
+    doc.text(buildNarrative(template, highValueAssessment), {
+      align: "justify",
+      width: 500,
+    });
 
     doc.moveDown(2);
     doc
       .fillColor("#999")
       .fontSize(9)
-      .text(`Generated at ${new Date().toLocaleString()}`, { align: "center" });
+      .text(
+        `Generated at ${new Date().toLocaleString()} | Template ${TEMPLATE_VERSION}`,
+        { align: "center" },
+      );
 
     const pageRange = doc.bufferedPageRange();
     for (let i = pageRange.start; i < pageRange.start + pageRange.count; i++) {
@@ -157,18 +261,15 @@ async function generatePDFBuffer(
 }
 
 function encryptBuffer(buffer: Buffer): Buffer {
-  const iv = crypto.randomBytes(IV_LENGTH);
+  // Canonical binary layout [IV][AuthTag][EncryptedData] from src/crypto/aesGcm.ts.
+  // Key is scrypt-derived with the domain salt "compliance-report-salt" so
+  // previously stored reports remain decryptable.
   const secretKey = crypto.scryptSync(
     DB_ENCRYPTION_KEY,
     "compliance-report-salt",
     32,
   );
-  const cipher = crypto.createCipheriv(ALGORITHM, secretKey, iv);
-
-  const encrypted = Buffer.concat([cipher.update(buffer), cipher.final()]);
-  const authTag = cipher.getAuthTag();
-
-  return Buffer.concat([iv, authTag, encrypted]);
+  return encryptAesGcmToBuffer(buffer, secretKey);
 }
 
 async function storeCompliancePdf(
@@ -176,11 +277,13 @@ async function storeCompliancePdf(
   userId: string,
   transactionId: string,
   alertId: string,
-): Promise<string> {
-  const filename = `COMPLIANCE_TX_${transactionId}_${alertId}_${Date.now()}.pdf.enc`;
+  template: ComplianceReportTemplate,
+): Promise<{ pdfUrl: string; storageKey?: string }> {
+  const filenamePrefix =
+    template === "high_value_transaction" ? "HIGH_VALUE_TX" : "COMPLIANCE_TX";
   const file = {
     buffer: encryptedBuffer,
-    originalname: filename,
+    originalname: `${filenamePrefix}_${transactionId}_${alertId}_${Date.now()}.pdf.enc`,
     mimetype: "application/octet-stream",
     size: encryptedBuffer.length,
     fieldname: "file",
@@ -190,13 +293,21 @@ async function storeCompliancePdf(
   const result = await uploadToS3({
     userId,
     file,
+    folder: "compliance",
     metadata: {
-      reportType: "compliance",
-      source: "flagged_transaction",
+      reportType:
+        template === "high_value_transaction"
+          ? "high_value_transaction"
+          : "compliance",
+      source:
+        template === "high_value_transaction"
+          ? "aml_high_value_transaction"
+          : "flagged_transaction",
       transactionId,
       alertId,
       encrypted: "true",
-      algorithm: ALGORITHM,
+      algorithm: AES_GCM_ALGORITHM,
+      templateVersion: TEMPLATE_VERSION,
     },
   });
 
@@ -206,5 +317,5 @@ async function storeCompliancePdf(
     );
   }
 
-  return result.fileUrl;
+  return { pdfUrl: result.fileUrl, storageKey: result.key };
 }

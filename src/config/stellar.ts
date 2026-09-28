@@ -1,4 +1,4 @@
-import * as StellarSdk from "stellar-sdk";
+import * as StellarSdk from "@stellar/stellar-sdk";
 import { HorizonPool } from "../stellar/horizonPool";
 
 export const STELLAR_NETWORKS = {

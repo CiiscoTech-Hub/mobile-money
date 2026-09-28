@@ -1,4 +1,4 @@
-import * as StellarSdk from "stellar-sdk";
+import * as StellarSdk from "@stellar/stellar-sdk";
 import { getStellarServer, getNetworkPassphrase } from "../../config/stellar";
 import { encrypt } from "../../utils/encryption";
 import logger from "../../utils/logger";

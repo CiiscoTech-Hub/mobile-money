@@ -1,6 +1,10 @@
-import { Message as AmqpMessage } from "amqplib";
-import { TransactionJobData, TransactionJobResult } from "./transactionQueue";
-import { rabbitMQManager, EXCHANGES, ROUTING_KEYS, QUEUES } from "./rabbitmq";
+import { Worker } from "bullmq";
+import {
+  TransactionJobData,
+  TransactionJobResult,
+  TRANSACTION_QUEUE_NAME,
+} from "./transactionQueue";
+import { rabbitMQManager, EXCHANGES, ROUTING_KEYS } from "./rabbitmq";
 import {
   natsManager,
   NATS_QUEUE_ENABLED,
@@ -14,9 +18,9 @@ import { StellarService } from "../services/stellar/stellarService";
 import * as highThroughputService from "../services/stellar/highThroughputService";
 import { UserModel } from "../models/users";
 import { EmailService } from "../services/email";
+import { smsService } from "../services/sms";
 import { withRetry } from "../services/retry";
 import { notifyTransactionWebhook, WebhookService } from "../services/webhook";
-import { smsService } from "../services/sms";
 import { notificationRouter } from "../services/notificationRouter";
 import { pushNotificationService } from "../services/push";
 import { capturePersistentFailure } from "./dlq";
@@ -25,7 +29,7 @@ import { queryRead, queryWrite } from "../config/database";
 import subscriptionModel from "../models/subscription";
 import logger from "../utils/logger";
 
-import { getWorkerConcurrency } from "./config";
+import { queueOptions, getWorkerConcurrency } from "./config";
 
 const transactionModel = new TransactionModel();
 const mobileMoneyService = new MobileMoneyService();
@@ -324,41 +328,11 @@ async function processTransaction(
   // Receiver is the mobile money account holder identified by their phone number
   const receiverName = phoneNumber;
 
-  const sendTxnSms = async (
-    kind: "transaction_completed" | "transaction_failed",
-    errorMessage?: string,
-  ) => {
-    try {
-      const txRow = await transactionModel.findById(transactionId);
-      if (!txRow?.userId) return;
-
-      const user = await userModel.findById(txRow.userId);
-      if (user?.smsOptOut) {
-        console.log(
-          `[${transactionId}] SMS notifications skipped (User Opted Out)`,
-        );
-        return;
-      }
-
-      const ref = txRow?.referenceNumber ?? transactionId;
-      await smsService.notifyTransactionEvent(phoneNumber, {
-        referenceNumber: ref,
-        type,
-        amount: String(amount),
-        provider,
-        kind,
-        errorMessage,
-      });
-    } catch (smsErr) {
-      log.error({ smsErr }, "SMS notification error");
-    }
-  };
-
   const stellarResult = await withRetry(() => {
     // Use high-throughput pool service when available; falls back to single-account mode
     const issuerSecret = process.env.STELLAR_ISSUER_SECRET?.trim();
     if (highThroughputService.isServiceInitialized() && issuerSecret) {
-      const issuerKp = require("stellar-sdk").Keypair.fromSecret(issuerSecret);
+      const issuerKp = require("@stellar/stellar-sdk").Keypair.fromSecret(issuerSecret);
       return highThroughputService
         .submitPayment({
           sourceAccount: issuerKp.publicKey(),
@@ -393,78 +367,131 @@ async function processTransaction(
   }
 
   await updateProgress(transactionId, 90);
+  const sendTxnSms = async (
+    kind: "transaction_completed" | "transaction_failed",
+    errorMessage?: string,
+  ) => {
+    try {
+      const txRow = await transactionModel.findById(transactionId);
+      if (!txRow?.userId) return;
+
+      const user = await userModel.findById(txRow.userId);
+      if (user?.smsOptOut) {
+        console.log(
+          `[${transactionId}] SMS notifications skipped (User Opted Out)`,
+        );
+        return;
+      }
+
+      const ref = txRow?.referenceNumber ?? transactionId;
+      await smsService.notifyTransactionEvent(phoneNumber, {
+        referenceNumber: ref,
+        type,
+        amount: String(amount),
+        provider,
+        kind,
+        errorMessage,
+      });
+    } catch (smsErr) {
+      log.error({ smsErr }, "SMS notification error");
+    }
+  };
+
   try {
     await updateProgress(transactionId, 10);
+
+    const currentTx = await transactionModel.findById(transactionId);
+    const metadata = currentTx?.metadata || {};
 
     if (type === "deposit") {
       await updateProgress(transactionId, 20);
 
-      const mobileMoneyResult = await withRetry(async () => {
-        const result = await mobileMoneyService.initiatePayment(
-          provider,
-          phoneNumber,
-          amount,
-        );
-        if (!result.success) {
-          throw new Error(getProviderFailureMessage(result));
-        }
-        return result;
-      }, retryConfig);
-
-      // Issue #515: Log provider response time in transaction metadata
-      if (mobileMoneyResult.providerResponseTimeMs !== undefined) {
-        await (transactionModel as any)
-          .patchMetadata(transactionId, {
-            providerResponseTimeTimeMs:
-              mobileMoneyResult.providerResponseTimeMs,
-            providerRespondedAt: new Date().toISOString(),
-          })
-          .catch((err: any) =>
-            log.warn({ err }, "Failed to log provider response time"),
+      // Check if mobile money payment was already initiated or succeeded
+      let mobileMoneyResult = (metadata as any)?.mobileMoney;
+      if (!mobileMoneyResult?.success) {
+        mobileMoneyResult = await withRetry(async () => {
+          const result = await mobileMoneyService.initiatePayment(
+            provider,
+            phoneNumber,
+            amount,
           );
+          if (!result.success) {
+            throw new Error(getProviderFailureMessage(result));
+          }
+          return result;
+        }, retryConfig);
+
+        // Issue #515: Log provider response time in transaction metadata
+        if (mobileMoneyResult.providerResponseTimeMs !== undefined) {
+          await (transactionModel as any)
+            .patchMetadata(transactionId, {
+              mobileMoney: mobileMoneyResult,
+              providerResponseTimeTimeMs:
+                mobileMoneyResult.providerResponseTimeMs,
+              providerRespondedAt: new Date().toISOString(),
+            })
+            .catch((err: any) =>
+              log.warn({ err }, "Failed to log provider response time"),
+            );
+        } else {
+          await (transactionModel as any)
+            .patchMetadata(transactionId, {
+              mobileMoney: mobileMoneyResult,
+            })
+            .catch((err: any) =>
+              log.warn({ err }, "Failed to patch mobileMoney metadata"),
+            );
+        }
       }
 
       await updateProgress(transactionId, 50);
 
-      if (!mobileMoneyResult.success) {
+      if (!mobileMoneyResult?.success) {
         throw new Error(getProviderFailureMessage(mobileMoneyResult));
       }
       await updateProgress(transactionId, 70);
 
-      await withRetry(() => {
-        // Use high-throughput pool service when available; falls back to single-account mode
-        const issuerSecret = process.env.STELLAR_ISSUER_SECRET?.trim();
-        if (highThroughputService.isServiceInitialized() && issuerSecret) {
-          const issuerKp =
-            require("stellar-sdk").Keypair.fromSecret(issuerSecret);
-          return highThroughputService.submitPayment({
-            sourceAccount: issuerKp.publicKey(),
-            sourceSecret: issuerSecret,
-            destination: stellarAddress,
-            asset: "native",
-            amount: String(amount),
-          });
-        }
-        return stellarService.sendPayment(
-          stellarAddress,
-          amount,
-          senderName,
-          receiverName,
-        );
-      }, retryConfig);
+      // Idempotency: Check if Stellar payment was already submitted on a previous attempt/retry
+      let stellarResult = (metadata as any)?.stellar;
+      if (!stellarResult?.transactionHash) {
+        const stellarSubmission = await withRetry(() => {
+          // Use high-throughput pool service when available; falls back to single-account mode
+          const issuerSecret = process.env.STELLAR_ISSUER_SECRET?.trim();
+          if (highThroughputService.isServiceInitialized() && issuerSecret) {
+            const issuerKp =
+              require("@stellar/stellar-sdk").Keypair.fromSecret(issuerSecret);
+            return highThroughputService
+              .submitPayment({
+                sourceAccount: issuerKp.publicKey(),
+                sourceSecret: issuerSecret,
+                destination: stellarAddress,
+                asset: "native",
+                amount: String(amount),
+              })
+              .then((r) => ({ hash: r.hash, submittedAt: new Date() }));
+          }
+          return stellarService.sendPayment(
+            stellarAddress,
+            amount,
+            senderName,
+            receiverName,
+          );
+        }, retryConfig);
 
-      if (stellarResult.hash) {
-        const currentMetadata =
-          (await transactionModel.findById(transactionId))?.metadata || {};
-        const updatedMetadata = {
-          ...currentMetadata,
-          stellar: {
-            transactionHash: stellarResult.hash,
-            submittedAt: stellarResult.submittedAt?.toISOString(),
-            feeBumps: [],
-          },
+        stellarResult = {
+          transactionHash: stellarSubmission.hash,
+          submittedAt: (
+            stellarSubmission.submittedAt || new Date()
+          ).toISOString(),
+          feeBumps: [],
         };
-        await transactionModel.updateMetadata(transactionId, updatedMetadata);
+
+        const updatedTx = await transactionModel.findById(transactionId);
+        const currentMeta = updatedTx?.metadata || {};
+        await transactionModel.updateMetadata(transactionId, {
+          ...currentMeta,
+          stellar: stellarResult,
+        });
       }
 
       await updateProgress(transactionId, 90);
@@ -571,11 +598,6 @@ async function processTransaction(
       transactionId,
       TransactionStatus.Failed,
     );
-    await notifyTransactionWebhook(transactionId, "transaction.failed", {
-      transactionModel: transactionModel as any,
-      webhookService,
-    });
-
     const transaction = await transactionModel.findById(transactionId);
     if (transaction) {
       await notificationRouter.routeTransactionNotification(
@@ -584,6 +606,11 @@ async function processTransaction(
         getErrorMessage(error),
       );
     }
+
+    await notifyTransactionWebhook(transactionId, "transaction.failed", {
+      transactionModel: transactionModel as any,
+      webhookService,
+    });
 
     // Fan-out event
     await rabbitMQManager.publish(
@@ -599,10 +626,10 @@ async function processTransaction(
     // If this transaction was created by a subscription, record attempt and schedule retry if configured
     try {
       const tx = await transactionModel.findById(transactionId);
-      const subscriptionId =
-        (tx?.metadata &&
-          (tx.metadata.subscription_id || tx.metadata.subscriptionId)) ||
-        null;
+      const subscriptionId = (tx?.metadata &&
+        ((tx.metadata.subscription_id as string | undefined) ||
+          (tx.metadata.subscriptionId as string | undefined))) as
+        string | null | undefined;
       if (subscriptionId) {
         await handleSubscriptionFailure(
           subscriptionId,
@@ -615,20 +642,22 @@ async function processTransaction(
       log.error({ subErr }, "Failed to record subscription retry info");
     }
 
-    // TODO: commented out because I couldn't find the job variable so to clear `rebase/merge` error
-    // if (job) {
-    //   capturePersistentFailure(job).catch(err => logger.error('[DLQ] Error capturing failure:', err));
-    // }
+    // TODO: capture the BullMQ job so permanently-failed jobs can be routed
+    // to the DLQ from the worker 'failed' event listener.
+
+    // BullMQ completes the job with a failure result; the broker-level
+    // `attempts` is left at 1 because retrying the whole job from scratch
+    // could double-send a payment (in-process retries handle transient
+    // failures via `withRetry`).
+    return {
+      success: false,
+      transactionId,
+      error: getErrorMessage(error),
+    };
   }
-  // );
-
-  // throw error;
 }
-// }
 
-// Start consuming
-const consumerLabel = NATS_QUEUE_ENABLED ? "NATS JetStream" : "RabbitMQ";
-
+// Start consuming: NATS JetStream when enabled, otherwise a BullMQ Worker.
 if (NATS_QUEUE_ENABLED) {
   natsManager
     .consume<TransactionJobData>(
@@ -641,26 +670,27 @@ if (NATS_QUEUE_ENABLED) {
       CONCURRENCY,
     )
     .catch((err) => logger.error({ err }, "NATS JetStream Consumer error"));
-} else {
-  rabbitMQManager
-    .consume<TransactionJobData>(
-      QUEUES.TRANSACTION_PROCESSING,
-      async (data) => {
-        await processTransaction(data);
-      },
-      CONCURRENCY,
-    )
-    .catch((err) => logger.error({ err }, "RabbitMQ Consumer error"));
 }
 
-export const transactionWorker = {
-  close: async () => {
-    if (NATS_QUEUE_ENABLED) {
-      await natsManager.close();
+export const transactionWorker:
+  | Worker<TransactionJobData, TransactionJobResult>
+  | {
+      close: () => Promise<void>;
+    } = NATS_QUEUE_ENABLED
+  ? {
+      close: async () => {
+        await natsManager.close();
+      },
     }
-  },
-};
+  : new Worker<TransactionJobData, TransactionJobResult>(
+      TRANSACTION_QUEUE_NAME,
+      async (job) => processTransaction(job.data),
+      { ...queueOptions, concurrency: CONCURRENCY },
+    );
 
-export async function closeWorker() {
+export async function closeWorker(): Promise<void> {
   await transactionWorker.close();
+  if (NATS_QUEUE_ENABLED) {
+    await natsManager.close();
+  }
 }

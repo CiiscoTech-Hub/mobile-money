@@ -1,7 +1,6 @@
 # Mobile Money ↔ Stellar Bridge
 
 [![CI](https://github.com/sublime247/mobile-money/actions/workflows/ci.yml/badge.svg)](https://github.com/sublime247/mobile-money/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/sublime247/mobile-money/branch/main/graph/badge.svg)](https://codecov.io/gh/sublime247/mobile-money)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 A backend service that bridges African mobile money providers (MTN MoMo, Airtel Money, Orange Money) with the [Stellar](https://stellar.org) blockchain network — enabling low-cost cross-border payments and remittances across Africa and beyond.
@@ -199,6 +198,8 @@ SENDGRID_API_KEY=your_sendgrid_key
 TWILIO_ACCOUNT_SID=your_twilio_sid
 ```
 
+> Don't hand-type placeholder secrets. See [Generating Keys and Secrets](#generating-keys-and-secrets) for copy-paste `node` commands that generate real values for `JWT_SECRET`, `ADMIN_API_KEY`, `DB_ENCRYPTION_KEY`, and `PII_MASTER_KEY`.
+
 ### 3. Setup Database
 
 ```bash
@@ -366,8 +367,6 @@ npm run test:mutation       # Mutation testing (Stryker)
 * Stryker mutation testing
 * Fuzz testing
 
-> Coverage reports upload to [Codecov](https://codecov.io/gh/sublime247/mobile-money) on every push to main.
-
 ## 📚 API Documentation
 
 ### Interactive Docs (Development Only)
@@ -378,6 +377,14 @@ Start the dev server and visit:
 * **OpenAPI JSON**: `http://localhost:3000/docs/openapi.json`
 
 The API spec is auto-generated from Zod validation schemas at runtime — no manual YAML to maintain.
+
+### [📖 Glossary](./docs/glossary.md)
+
+A comprehensive glossary defining key concepts in the Mobile Money Bridge, including:
+- African mobile money terminology (MSISDN, USSD, STK Push, MoMo providers)
+- Stellar ecosystem standards (SEP-10, SEP-24, SEP-31, Soroban)
+- Financial and compliance terms (KYC, AML, remittances, escrow)
+- Platform-specific concepts (rate limiting, job queues, audit logging)
 
 ### Core Endpoints
 
@@ -520,6 +527,67 @@ Auto-flagging of suspicious transactions:
 * 24h total > 5,000,000 XAF
 * Rapid structuring (3+ mixed in 15 min)
 * Sanctions list screening on every transaction
+
+<a id="generating-keys-and-secrets"></a>
+
+## 🔑 Generating Keys and Secrets
+
+Every secret in the `# Security` block of `.env.example` needs a real, high-entropy value before you run the app outside of local development. The snippets below use Node's built-in `crypto` module — no extra dependencies — and match how each key is consumed in code.
+
+### JWT Signing Keys
+
+JWTs are signed with `JWT_SECRET` (see [`src/auth/jwtKeys.ts`](src/auth/jwtKeys.ts)). Generate a 256-bit secret:
+
+```bash
+node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+```
+
+Copy the output into `.env`:
+
+```bash
+JWT_SECRET=<paste-generated-value-here>
+```
+
+For zero-downtime key rotation, the app also accepts a versioned `JWT_SECRETS` map plus an `ACTIVE_JWT_KEY_VERSION` pointer. Old versions stay valid for a 24-hour grace period so in-flight tokens don't break:
+
+```bash
+# Generate a second key the same way, then:
+JWT_SECRETS={"v1":"<existing-key>","v2":"<new-generated-key>"}
+ACTIVE_JWT_KEY_VERSION=v2
+```
+
+### Admin API Key
+
+Administrative endpoints accept a static key via the `X-API-Key` header, checked against `ADMIN_API_KEY` (see [`src/middleware/auth.ts`](src/middleware/auth.ts)). It's generated the same way user-scoped API keys are created in [`src/auth/apikeys.ts`](src/auth/apikeys.ts):
+
+```bash
+node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+```
+
+```bash
+ADMIN_API_KEY=<paste-generated-value-here>
+```
+
+The `.env.example` default (`dev-admin-key`) is for local development only — always replace it before deploying anywhere reachable outside your machine.
+
+### Database Encryption Keys
+
+PII fields (phone numbers, Stellar addresses, notes) are encrypted at rest with AES-256-GCM. The raw values of `DB_ENCRYPTION_KEY` and `PII_MASTER_KEY` aren't used directly as AES keys — they're key material fed through HKDF-SHA-256 to derive the actual per-field keys (see [`src/utils/encryption.ts`](src/utils/encryption.ts)). Any high-entropy string works; a random hex string is the simplest way to get one:
+
+```bash
+node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+```
+
+Generate **two separate values** — `PII_MASTER_KEY` must never equal `DB_ENCRYPTION_KEY`:
+
+```bash
+DB_ENCRYPTION_KEY=<paste-first-generated-value-here>
+PII_MASTER_KEY=<paste-second-generated-value-here>
+```
+
+For rotating an in-use encryption key without re-encrypting existing rows immediately, the app also supports a versioned `DB_ENCRYPTION_KEYS` JSON map (or individual `DB_ENCRYPTION_KEY_<VERSION>` variables) with an `ACTIVE_ENCRYPTION_KEY_VERSION` pointer, mirroring the JWT rotation pattern above.
+
+> **Never commit generated secrets to version control**, log them, or paste them into chat/tickets. Store production values in your secrets manager (see [`docs/SECRETS_MANAGEMENT.md`](docs/SECRETS_MANAGEMENT.md)) and inject them as environment variables at deploy time.
 
 ## 🏗️ Architecture
 
@@ -899,12 +967,113 @@ terraform plan -var-file=environments/production.tfvars
 terraform apply
 ```
 
+### Render
+
+Render deploys directly from GitHub and provisions Postgres/Redis as managed add-ons — a fast path for staging environments or small production deployments.
+
+#### 1. Link the repository
+
+1. Push your fork to GitHub (see [Contributing](#-contributing) for the fork workflow)
+2. In the [Render Dashboard](https://dashboard.render.com), click **New → Web Service**
+3. Choose **Build and deploy from a Git repository**, authorize GitHub, and select `mobile-money`
+4. Pick the branch to deploy (typically `main`) — Render redeploys automatically on every push
+
+#### 2. Provision the database and Redis
+
+1. **New → PostgreSQL** → copy the generated **Internal Database URL**
+2. **New → Key Value** (Render's managed Redis-compatible store) → copy the connection string
+
+#### 3. Configure environment variables
+
+Set these under the Web Service's **Environment** tab:
+
+```bash
+DATABASE_URL=<Render PostgreSQL Internal Database URL>
+DATABASE_SSL=true
+
+REDIS_URL=<Render Key Value connection string>
+REDIS_TLS=true
+
+STELLAR_NETWORK=testnet
+STELLAR_HORIZON_URL=https://horizon-testnet.stellar.org
+STELLAR_ISSUER_SECRET=S...
+
+JWT_SECRET=your_jwt_secret_min_32_chars
+SESSION_SECRET=your_session_secret
+```
+
+#### 4. Build, migrate, and deploy
+
+* **Build Command**: `npm install && npm run build`
+* **Start Command**: `npm start`
+* **Pre-Deploy Command**: `npm run migrate:up`
+* **Health Check Path**: `/health`
+
+```bash
+curl https://<your-service>.onrender.com/health
+curl https://<your-service>.onrender.com/ready
+```
+
+### Railway
+
+Railway offers a similarly GitHub-native deploy flow with one-click Postgres and Redis plugins.
+
+#### 1. Link repository in Railway
+
+1. In the [Railway Dashboard](https://railway.app/dashboard), click **New Project → Deploy from GitHub repo**
+2. Authorize the Railway GitHub App and select `mobile-money`
+3. Railway detects the Node.js app and auto-generates a build/start config (or use the CLI below)
+
+```bash
+npm install -g @railway/cli
+railway login
+railway link          # Link this directory to your Railway project
+railway up            # Deploy the current branch
+```
+
+#### 2. Provision database and Redis in Railway
+
+1. In the project canvas, click **New → Database → Add PostgreSQL**
+2. Click **New → Database → Add Redis**
+3. Railway automatically injects `DATABASE_URL` and `REDIS_URL` into your service's environment as reference variables
+
+#### 3. Configure Railway environment variables
+
+Under the service's **Variables** tab, add the remaining required config (Railway auto-fills `DATABASE_URL`/`REDIS_URL` from the plugins above):
+
+```bash
+DATABASE_SSL=true
+REDIS_TLS=false   # Railway's internal Redis network doesn't require TLS
+
+STELLAR_NETWORK=testnet
+STELLAR_HORIZON_URL=https://horizon-testnet.stellar.org
+STELLAR_ISSUER_SECRET=S...
+
+JWT_SECRET=your_jwt_secret_min_32_chars
+SESSION_SECRET=your_session_secret
+```
+
+#### 4. Build, migrate, and deploy in Railway
+
+Railway runs `npm install` and `npm start` by default. To run migrations on each deploy, add a **Deploy Trigger** or **Release Command**:
+
+```bash
+railway run npm run migrate:up
+```
+
+Set the **Healthcheck Path** to `/health` under **Settings → Deploy** so Railway restarts the service on failed checks.
+
+```bash
+railway domain   # Generates a public URL
+curl https://<your-service>.up.railway.app/health
+```
+
 ### CI/CD
 
 GitHub Actions pipeline (`.github/workflows/ci.yml`):
 
 1. **Security** — npm audit, Snyk vulnerability scanning
-2. **Test** — Lint, Jest (with Postgres + Redis services), Playwright E2E, Codecov upload
+2. **Test** — Lint, Jest (with Postgres + Redis services), Playwright E2E
 3. **Build** — TypeScript compilation
 4. **Docker** — Build and push image on main branch
 5. **Deploy** — kubectl apply → rollout status → health check → auto-rollback on failure
@@ -987,6 +1156,47 @@ Pre-commit hooks run ESLint, Prettier, TypeScript checks, and tests automaticall
 ### Good First Issues
 
 Check [`good first issue`](https://github.com/sublime247/mobile-money/labels/good%20first%20issue) label.
+
+## 🛠️ API Integration Tooling (Postman & Bruno)
+
+We provide turnkey API integration collections with pre-configured requests, test assertions, and automated SEP-10 challenge auto-signing.
+
+### Postman Collection
+
+The Postman collection is exported at [`postman/mobile-money-bridge.json`](postman/mobile-money-bridge.json).
+
+#### How to Import
+
+1. Open **Postman** and click **Import** (top left).
+2. Drag and drop `postman/mobile-money-bridge.json` or choose **File** upload.
+3. The collection **Mobile Money Bridge API** will be imported with 5 organized request folders:
+
+   * **1. Auth**: SEP-10 challenge generation, automated pre-request challenge signing, JWT verification, and user profile.
+   * **2. KYC**: SEP-12 customer data submission, status queries, and document uploads.
+   * **3. Quotes**: SEP-38 price discovery, firm quote booking, and pre-flight fee calculation.
+   * **4. Deposits**: SEP-24 interactive deposit initiation, status polling, and core mobile money collections.
+   * **5. Withdrawals**: SEP-24 interactive withdrawal initiation, core mobile money disbursements, and transaction logs.
+
+#### Environment Configuration
+
+Set or override the following collection / environment variables:
+
+* `base_url`: `http://localhost:3000` (or your deployed API gateway)
+* `stellar_public_key`: Client Stellar public key (`G...`)
+* `stellar_secret_key`: Client Stellar secret key (`S...`) used for auto-signing in pre-request script
+* `home_domain`: Anchor domain name (e.g. `localhost:3000` or `stellarwave.io`)
+
+### Bruno Collection
+
+A native [Bruno](https://www.usebruno.com/) collection is available in [`postman/bruno/`](postman/bruno/):
+
+1. In Bruno, click **Open Collection** and select the `postman/bruno` directory.
+2. Select the **Local** environment located in `postman/bruno/environments/Local.bru`.
+3. Run requests individually or run the complete test suite using the Bruno CLI:
+
+   ```bash
+   bru run --env Local
+   ```
 
 ## 🗺️ Roadmap
 

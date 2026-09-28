@@ -4,6 +4,7 @@ import {
   decodeLedgerEntryCursor,
   encodeLedgerEntryCursor,
   LedgerEntryPage,
+  LedgerEntryRow,
 } from "../services/ledgerService";
 
 /**
@@ -59,7 +60,7 @@ export class LedgerModel {
    * Get account by code
    */
   async getAccountByCode(code: string): Promise<Account | null> {
-    const result = await this.pool.query(
+    const result = await this.pool.query<Account>(
       "SELECT * FROM accounts WHERE code = $1 AND is_active = true",
       [code],
     );
@@ -70,7 +71,7 @@ export class LedgerModel {
    * Get account by ID
    */
   async getAccountById(id: string): Promise<Account | null> {
-    const result = await this.pool.query(
+    const result = await this.pool.query<Account>(
       "SELECT * FROM accounts WHERE id = $1",
       [id],
     );
@@ -81,7 +82,7 @@ export class LedgerModel {
    * Get all active accounts
    */
   async getAllAccounts(): Promise<Account[]> {
-    const result = await this.pool.query(
+    const result = await this.pool.query<Account>(
       "SELECT * FROM accounts WHERE is_active = true ORDER BY code",
     );
     return result.rows;
@@ -93,7 +94,7 @@ export class LedgerModel {
   async getAccountsByType(
     type: "asset" | "liability" | "equity" | "revenue" | "expense",
   ): Promise<Account[]> {
-    const result = await this.pool.query(
+    const result = await this.pool.query<Account>(
       "SELECT * FROM accounts WHERE type = $1 AND is_active = true ORDER BY code",
       [type],
     );
@@ -110,9 +111,9 @@ export class LedgerModel {
     normal_balance: "debit" | "credit";
     parent_id?: string;
     description?: string;
-    metadata?: Record<string, any>;
+    metadata?: Record<string, unknown>;
   }): Promise<Account> {
-    const result = await this.pool.query(
+    const result = await this.pool.query<Account>(
       `INSERT INTO accounts (code, name, type, normal_balance, parent_id, description, metadata)
        VALUES ($1, $2, $3, $4, $5, $6, $7)
        RETURNING *`,
@@ -145,7 +146,7 @@ export class LedgerModel {
   async getEntriesByTransactionId(
     transactionId: string,
   ): Promise<LedgerEntryRecord[]> {
-    const result = await this.pool.query(
+    const result = await this.pool.query<LedgerEntryRecord>(
       `SELECT le.*, a.code as account_code, a.name as account_name
        FROM ledger_entries le
        JOIN accounts a ON le.account_id = a.id
@@ -166,7 +167,7 @@ export class LedgerModel {
     limit: number = 100,
     offset: number = 0,
   ): Promise<LedgerEntryRecord[]> {
-    const result = await this.pool.query(
+    const result = await this.pool.query<LedgerEntryRecord>(
       `SELECT le.*, a.code as account_code, a.name as account_name
        FROM ledger_entries le
        JOIN accounts a ON le.account_id = a.id
@@ -196,7 +197,7 @@ export class LedgerModel {
     const cursor = options.cursor
       ? decodeLedgerEntryCursor(options.cursor)
       : null;
-    const result = await this.pool.query(
+    const result = await this.pool.query<LedgerEntryRow>(
       `SELECT le.*, a.code as account_code, a.name as account_name
        FROM ledger_entries le
        JOIN accounts a ON le.account_id = a.id
@@ -238,7 +239,7 @@ export class LedgerModel {
   async getEntriesByReferenceNumber(
     referenceNumber: string,
   ): Promise<LedgerEntryRecord[]> {
-    const result = await this.pool.query(
+    const result = await this.pool.query<LedgerEntryRecord>(
       `SELECT le.*, a.code as account_code, a.name as account_name
        FROM ledger_entries le
        JOIN accounts a ON le.account_id = a.id
@@ -258,7 +259,7 @@ export class LedgerModel {
     limit: number = 1000,
     offset: number = 0,
   ): Promise<LedgerEntryRecord[]> {
-    const result = await this.pool.query(
+    const result = await this.pool.query<LedgerEntryRecord>(
       `SELECT le.*, a.code as account_code, a.name as account_name
        FROM ledger_entries le
        JOIN accounts a ON le.account_id = a.id
@@ -285,7 +286,7 @@ export class LedgerModel {
     const cursor = options.cursor
       ? decodeLedgerEntryCursor(options.cursor)
       : null;
-    const result = await this.pool.query(
+    const result = await this.pool.query<LedgerEntryRow>(
       `SELECT le.*, a.code as account_code, a.name as account_name
        FROM ledger_entries le
        JOIN accounts a ON le.account_id = a.id
@@ -322,7 +323,7 @@ export class LedgerModel {
    * Get account balance from materialized view
    */
   async getAccountBalanceFromView(accountCode: string): Promise<number> {
-    const result = await this.pool.query(
+    const result = await this.pool.query<{ balance: number }>(
       "SELECT balance FROM account_balances WHERE code = $1",
       [accountCode],
     );
@@ -333,29 +334,29 @@ export class LedgerModel {
    * Get available account balance (settled funds)
    */
   async getAvailableAccountBalance(accountCode: string): Promise<number> {
-    const result = await this.pool.query(
+    const result = await this.pool.query<{ balance: number }>(
       "SELECT get_available_balance($1) as balance",
       [accountCode],
     );
-    return parseFloat(result.rows[0]?.balance || 0);
+    return parseFloat(String(result.rows[0]?.balance ?? 0));
   }
 
   /**
    * Get pending account balance (unsettled funds)
    */
   async getPendingAccountBalance(accountCode: string): Promise<number> {
-    const result = await this.pool.query(
+    const result = await this.pool.query<{ balance: number }>(
       "SELECT get_pending_balance($1) as balance",
       [accountCode],
     );
-    return parseFloat(result.rows[0]?.balance || 0);
+    return parseFloat(String(result.rows[0]?.balance ?? 0));
   }
 
   /**
    * Get all account balances from materialized view
    */
-  async getAllAccountBalancesFromView(): Promise<any[]> {
-    const result = await this.pool.query(
+  async getAllAccountBalancesFromView(): Promise<AccountBalanceRow[]> {
+    const result = await this.pool.query<AccountBalanceRow>(
       "SELECT * FROM account_balances ORDER BY code",
     );
     return result.rows;
@@ -383,7 +384,13 @@ export class LedgerModel {
     unique_transactions: number;
     unique_accounts: number;
   }> {
-    const result = await this.pool.query(
+    const result = await this.pool.query<{
+      total_entries: string;
+      total_debits: string | null;
+      total_credits: string | null;
+      unique_transactions: string;
+      unique_accounts: string;
+    }>(
       `SELECT 
         COUNT(*) as total_entries,
         SUM(debit_amount) as total_debits,
@@ -399,8 +406,8 @@ export class LedgerModel {
     const row = result.rows[0];
     return {
       total_entries: parseInt(row.total_entries),
-      total_debits: parseFloat(row.total_debits || 0),
-      total_credits: parseFloat(row.total_credits || 0),
+      total_debits: parseFloat(row.total_debits ?? "0"),
+      total_credits: parseFloat(row.total_credits ?? "0"),
       unique_transactions: parseInt(row.unique_transactions),
       unique_accounts: parseInt(row.unique_accounts),
     };
@@ -413,7 +420,7 @@ export class LedgerModel {
     searchTerm: string,
     limit: number = 50,
   ): Promise<LedgerEntryRecord[]> {
-    const result = await this.pool.query(
+    const result = await this.pool.query<LedgerEntryRecord>(
       `SELECT le.*, a.code as account_code, a.name as account_name
        FROM ledger_entries le
        JOIN accounts a ON le.account_id = a.id
@@ -433,10 +440,10 @@ export class LedgerModel {
    */
   async getEntriesWithMetadata(
     metadataKey: string,
-    metadataValue: any,
+    metadataValue: unknown,
     limit: number = 100,
   ): Promise<LedgerEntryRecord[]> {
-    const result = await this.pool.query(
+    const result = await this.pool.query<LedgerEntryRecord>(
       `SELECT le.*, a.code as account_code, a.name as account_name
        FROM ledger_entries le
        JOIN accounts a ON le.account_id = a.id
@@ -452,7 +459,7 @@ export class LedgerModel {
    * Count entries by account
    */
   async countEntriesByAccount(accountCode: string): Promise<number> {
-    const result = await this.pool.query(
+    const result = await this.pool.query<{ count: string }>(
       `SELECT COUNT(*) as count
        FROM ledger_entries le
        JOIN accounts a ON le.account_id = a.id
@@ -465,8 +472,8 @@ export class LedgerModel {
   /**
    * Get daily entry volume
    */
-  async getDailyEntryVolume(days: number = 30): Promise<any[]> {
-    const result = await this.pool.query(
+  async getDailyEntryVolume(days: number = 30): Promise<DailyEntryVolumeRow[]> {
+    const result = await this.pool.query<DailyEntryVolumeRow>(
       `SELECT 
         entry_date,
         COUNT(*) as entry_count,
@@ -480,6 +487,18 @@ export class LedgerModel {
     );
     return result.rows;
   }
+}
+
+export interface AccountBalanceRow {
+  code: string;
+  balance: number;
+}
+
+export interface DailyEntryVolumeRow {
+  entry_date: Date;
+  entry_count: string;
+  total_debits: string | null;
+  total_credits: string | null;
 }
 
 // Export singleton instance

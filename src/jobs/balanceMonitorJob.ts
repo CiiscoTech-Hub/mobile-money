@@ -1,5 +1,5 @@
 import logger from "../utils/logger";
-import * as StellarSdk from "stellar-sdk";
+import * as StellarSdk from "@stellar/stellar-sdk";
 import { getStellarServer } from "../config/stellar";
 import { notifySlackAlert } from "../services/loggers";
 import {

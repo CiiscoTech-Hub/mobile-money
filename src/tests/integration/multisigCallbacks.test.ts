@@ -1,4 +1,4 @@
-import { Keypair } from "stellar-sdk";
+import { Keypair } from "@stellar/stellar-sdk";
 import request from "supertest";
 import crypto from "crypto";
 
@@ -78,15 +78,6 @@ jest.mock("../../middleware/auth", () => ({
     req.user = { id: "merchant-123", role: "merchant" };
     next();
   },
-}));
-
-// Mock spdy to prevent http_parser legacy import issue inside modern Node.js environments
-jest.mock("spdy", () => ({
-  createServer: jest.fn().mockReturnValue({
-    listen: jest.fn((port: any, cb: any) => {
-      if (cb) cb();
-    }),
-  }),
 }));
 
 // Mock Redis & PubSub to prevent connections during tests

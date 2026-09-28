@@ -1,4 +1,4 @@
-import { Request, Response } from "express";
+import { Request, Response, Router } from "express";
 import fs from "fs";
 import path from "path";
 import winston from "winston";
@@ -11,6 +11,13 @@ import {
 import { createError } from "../middleware/errorHandler";
 import { ERROR_CODES } from "../constants/errorCodes";
 import { pool } from "../config/database";
+import { providerSettingsService } from "../services/providerSettingsService";
+import { AuthRequest } from "../middleware/auth";
+import { TransactionModel, TransactionStatus } from "../models/transaction";
+import { coldVaultService } from "../services/stellar/vault";
+import { replayDeadLetterJob, listDeadLetterJobs } from "../config/queue";
+
+const transactionModel = new TransactionModel();
 
 // Ensure logs directory exists
 const LOGS_DIR = path.join(process.cwd(), "logs");
@@ -131,290 +138,271 @@ export const logOutageStatus = async (req: Request, res: Response): Promise<void
     const currentErrorRate = typeof errorRate === "number" ? errorRate : 0;
     const threshold = typeof errorThreshold === "number" ? errorThreshold : 50;
 
-    let circuitState: "OPEN" | "CLOSED" | "HALF-OPEN" = "CLOSED";
-
-    if (status === "OUTAGE" || status === "DOWN" || currentErrorRate >= threshold) {
-      await tripCircuitBreaker(provider, operation);
-      circuitState = "OPEN";
-    } else if (status === "UP" || status === "RESOLVED") {
-      await forceCloseCircuitBreaker(provider, operation);
-      circuitState = "CLOSED";
+    let cbState = "CLOSED";
+    if (status === "OUTAGE" || currentErrorRate >= threshold) {
+      tripCircuitBreaker(provider, operation);
+      cbState = "OPEN";
     }
 
     const logEntry = {
-      event: "TELCO_OUTAGE_STATUS_UPDATE",
-      provider: provider.toLowerCase(),
-      status: status || "UNKNOWN",
-      message: message || `Outage status updated for ${provider}`,
+      timestamp: new Date().toISOString(),
+      provider,
+      status,
+      message,
       errorRate: currentErrorRate,
       errorThreshold: threshold,
-      circuitBreakerState: circuitState,
-      updatedAt: new Date().toISOString(),
+      circuitBreakerState: cbState,
     };
 
-    // Log update to Winston log file
     winstonOutageLogger.info("OUTAGE_STATUS_UPDATE", logEntry);
 
-    // If outage or error threshold exceeded, dispatch warning alert to engineering teams
-    let alertSent: AlertWarning | null = null;
-    if (circuitState === "OPEN" || status === "OUTAGE") {
-      alertSent = dispatchEngineeringAlert({
-        provider: provider.toLowerCase(),
+    let alert;
+    if (cbState === "OPEN") {
+      alert = dispatchEngineeringAlert({
+        provider,
         severity: "CRITICAL",
-        message: message || `CRITICAL: Telco outage detected for ${provider}. Circuit breaker TRIPPED!`,
+        message: message || `Outage reported on ${provider} gateway. Error rate: ${currentErrorRate}%`,
         errorRate: currentErrorRate,
         threshold,
-        circuitBreakerState: circuitState,
+        circuitBreakerState: "OPEN",
       });
     }
 
-    const updatedBreakers = getAllCircuitBreakerStatesInfo();
-
     res.json({
       success: true,
-      message: `Outage status logged for ${provider}`,
       logEntry,
-      alert: alertSent,
-      circuitBreakers: updatedBreakers,
+      alert,
     });
-  } catch (error) {
-    if ((error as any).status) throw error;
-    winstonOutageLogger.error("Failed to log outage status", { error });
-    throw createError(ERROR_CODES.INTERNAL_ERROR, "Failed to log outage status");
+  } catch (error: any) {
+    winstonOutageLogger.error("Failed to log outage status", { error: error.message });
+    throw error.statusCode ? error : createError(ERROR_CODES.INTERNAL_ERROR, "Failed to log outage status");
   }
 };
 
 /**
- * Controller: Confirm alert warnings function correctly
- * Acceptance Criteria: Confirm alert warnings function correctly.
+ * Test alert warning dispatcher for engineering teams
  */
-export const triggerAlertWarning = async (req: Request, res: Response): Promise<void> => {
+export const testEngineeringAlert = async (req: Request, res: Response): Promise<void> => {
   try {
-    const { provider = "mtn", severity = "CRITICAL", message, errorRate = 75, threshold = 50 } = req.body;
+    const { provider, severity = "WARNING", message, errorRate = 60, threshold = 50 } = req.body;
 
-    const alertMessage = message || `ALERT WARNING TEST: High error rate (${errorRate}%) detected on ${provider.toUpperCase()} gateway`;
-
-    // Trip breaker for provider to simulate outage condition if critical
-    if (severity === "CRITICAL") {
-      await tripCircuitBreaker(provider.toLowerCase(), "payment");
+    if (!provider) {
+      throw createError(ERROR_CODES.INVALID_INPUT, "Provider is required for test alert");
     }
 
     const alert = dispatchEngineeringAlert({
-      provider: provider.toLowerCase(),
+      provider,
       severity,
-      message: alertMessage,
+      message: message || `Test alert warning for ${provider}`,
       errorRate,
       threshold,
-      circuitBreakerState: severity === "CRITICAL" ? "OPEN" : "HALF-OPEN",
+      circuitBreakerState: "HALF-OPEN",
     });
-
-    winstonOutageLogger.warn("ALERT_WARNING_TEST_CONFIRMED", { alert });
 
     res.json({
       success: true,
-      message: "Alert warning confirmed and dispatched to engineering team",
       alert,
-      engineeringNotified: alert.engineeringTeamNotified,
     });
-  } catch (error) {
-    winstonOutageLogger.error("Alert warning test failed", { error });
-    throw createError(ERROR_CODES.INTERNAL_ERROR, "Alert warning test failed");
+  } catch (error: any) {
+    throw error.statusCode ? error : createError(ERROR_CODES.INTERNAL_ERROR, "Failed to dispatch test alert");
   }
 };
 
 /**
- * Controller: Get recent Winston outage logs
+ * Reset circuit breaker status
  */
-export const getOutageLogs = async (_req: Request, res: Response): Promise<void> => {
+export const resetCircuitBreakerStatus = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { provider, operation = "payment" } = req.body;
+
+    if (!provider) {
+      throw createError(ERROR_CODES.INVALID_INPUT, "Provider is required to reset circuit breaker");
+    }
+
+    forceCloseCircuitBreaker(provider, operation);
+
+    winstonOutageLogger.info("CIRCUIT_BREAKER_RESET", {
+      provider,
+      operation,
+      timestamp: new Date().toISOString(),
+    });
+
+    res.json({
+      success: true,
+      message: `Circuit breaker for ${provider} (${operation}) reset to CLOSED`,
+    });
+  } catch (error: any) {
+    throw error.statusCode ? error : createError(ERROR_CODES.INTERNAL_ERROR, "Failed to reset circuit breaker");
+  }
+};
+
+/**
+ * Retrieve Winston log records
+ */
+export const getWinstonLogs = async (_req: Request, res: Response): Promise<void> => {
   try {
     let logs: any[] = [];
     if (fs.existsSync(OUTAGE_LOG_FILE)) {
       const content = fs.readFileSync(OUTAGE_LOG_FILE, "utf-8");
-      const lines = content.trim().split("\n").filter(Boolean);
-      logs = lines
+      logs = content
+        .split("\n")
+        .filter(Boolean)
         .map((line) => {
           try {
             return JSON.parse(line);
           } catch {
-            return { message: line };
+            return { raw: line };
           }
-        })
-        .reverse()
-        .slice(0, 100);
+        });
     }
 
     res.json({
       success: true,
-      logFilePath: OUTAGE_LOG_FILE,
-      totalLogs: logs.length,
-      logs,
+      count: logs.length,
+      logs: logs.slice(-100),
     });
   } catch (error) {
-    winstonOutageLogger.error("Failed to read outage logs", { error });
-    throw createError(ERROR_CODES.INTERNAL_ERROR, "Failed to read outage logs");
+    throw createError(ERROR_CODES.INTERNAL_ERROR, "Failed to retrieve logs");
   }
 };
 
 /**
- * Controller: Reset Circuit Breaker for a provider
+ * Admin controller handlers for Cold Wallet Multi-Sig Pipeline
  */
-export const resetCircuitBreakerHandler = async (req: Request, res: Response): Promise<void> => {
+export const createColdVaultTransferHandler = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const { provider, operation = "payment" } = req.body;
-    if (!provider) {
-      throw createError(ERROR_CODES.INVALID_INPUT, "Provider is required");
+    const { vaultPublicKey, destinationPublicKey, amount, assetCode, assetIssuer, memo } = req.body;
+
+    if (!vaultPublicKey || !destinationPublicKey || !amount) {
+      throw createError(ERROR_CODES.MISSING_FIELD, "vaultPublicKey, destinationPublicKey, and amount are required");
     }
 
-    await forceCloseCircuitBreaker(provider.toLowerCase(), operation);
-
-    winstonOutageLogger.info("CIRCUIT_BREAKER_RESET", {
-      provider: provider.toLowerCase(),
-      operation,
-      resetAt: new Date().toISOString(),
-    });
-
-    const updatedBreakers = getAllCircuitBreakerStatesInfo();
-
-    res.json({
-      success: true,
-      message: `Circuit breaker reset for ${provider}`,
-      circuitBreakers: updatedBreakers,
-    });
-  } catch (error) {
-    if ((error as any).status) throw error;
-    winstonOutageLogger.error("Failed to reset circuit breaker", { error });
-    throw createError(ERROR_CODES.INTERNAL_ERROR, "Failed to reset circuit breaker");
-  }
-};
-
-/**
- * Controller: Trip Circuit Breaker manually
- */
-export const tripCircuitBreakerHandler = async (req: Request, res: Response): Promise<void> => {
-  try {
-    const { provider, operation = "payment" } = req.body;
-    if (!provider) {
-      throw createError(ERROR_CODES.INVALID_INPUT, "Provider is required");
-    }
-
-    await tripCircuitBreaker(provider.toLowerCase(), operation);
-
-    const alert = dispatchEngineeringAlert({
-      provider: provider.toLowerCase(),
-      severity: "CRITICAL",
-      message: `MANUAL OVERRIDE: Circuit breaker manually tripped for ${provider.toUpperCase()}`,
-      errorRate: 100,
-      threshold: 50,
-      circuitBreakerState: "OPEN",
-    });
-
-    winstonOutageLogger.warn("CIRCUIT_BREAKER_TRIPPED_MANUALLY", {
-      provider: provider.toLowerCase(),
-      operation,
-      trippedAt: new Date().toISOString(),
-    });
-
-    const updatedBreakers = getAllCircuitBreakerStatesInfo();
-
-    res.json({
-      success: true,
-      message: `Circuit breaker tripped for ${provider}`,
-      alert,
-      circuitBreakers: updatedBreakers,
-    });
-  } catch (error) {
-    if ((error as any).status) throw error;
-    winstonOutageLogger.error("Failed to trip circuit breaker", { error });
-    throw createError(ERROR_CODES.INTERNAL_ERROR, "Failed to trip circuit breaker");
-  }
-};
-
-/**
- * Controller: SLA tracking metrics for deposit approvals.
- * Calculates processing time from deposit initiation (created_at) to completion
- * (updated_at where status = 'completed') over a rolling 24-hour window.
- * SLA breach threshold is 30 seconds per deposit.
- */
-const SLA_BREACH_THRESHOLD_SECONDS = parseInt(
-  process.env.SLA_BREACH_THRESHOLD_SECONDS || "30",
-  10,
-);
-
-export const getSlaMetrics = async (_req: Request, res: Response): Promise<void> => {
-  try {
-    const result = await pool.query<{
-      total_deposits: string;
-      avg_delay_seconds: string | null;
-      min_delay_seconds: string | null;
-      max_delay_seconds: string | null;
-      sla_breached: string;
-      p95_delay_seconds: string | null;
-    }>(
-      `SELECT
-         COUNT(*)                                                          AS total_deposits,
-         AVG(EXTRACT(EPOCH FROM (updated_at - created_at)))               AS avg_delay_seconds,
-         MIN(EXTRACT(EPOCH FROM (updated_at - created_at)))               AS min_delay_seconds,
-         MAX(EXTRACT(EPOCH FROM (updated_at - created_at)))               AS max_delay_seconds,
-         COUNT(*) FILTER (
-           WHERE EXTRACT(EPOCH FROM (updated_at - created_at)) > $1
-         )                                                                 AS sla_breached,
-         PERCENTILE_CONT(0.95) WITHIN GROUP (
-           ORDER BY EXTRACT(EPOCH FROM (updated_at - created_at))
-         )                                                                 AS p95_delay_seconds
-       FROM transactions
-       WHERE type = 'deposit'
-         AND status = 'completed'
-         AND created_at >= NOW() - INTERVAL '24 hours'`,
-      [SLA_BREACH_THRESHOLD_SECONDS],
+    const initiatorId = req.user?.id || "admin-system";
+    const transfer = await coldVaultService.generateTransferEnvelope(
+      vaultPublicKey,
+      { destinationPublicKey, amount, assetCode, assetIssuer, memo },
+      initiatorId
     );
 
-    const row = result.rows[0];
-    const total = parseInt(row.total_deposits, 10);
-    const breached = parseInt(row.sla_breached, 10);
-    const avgDelay = row.avg_delay_seconds !== null ? parseFloat(row.avg_delay_seconds) : null;
-    const minDelay = row.min_delay_seconds !== null ? parseFloat(row.min_delay_seconds) : null;
-    const maxDelay = row.max_delay_seconds !== null ? parseFloat(row.max_delay_seconds) : null;
-    const p95Delay = row.p95_delay_seconds !== null ? parseFloat(row.p95_delay_seconds) : null;
-
-    const slaComplianceRate = total > 0 ? ((total - breached) / total) * 100 : 100;
-
-    res.json({
+    res.status(201).json({
       success: true,
-      window: "24h",
-      sla_breach_threshold_seconds: SLA_BREACH_THRESHOLD_SECONDS,
-      timestamp: new Date().toISOString(),
-      metrics: {
-        total_deposits: total,
-        sla_breached: breached,
-        sla_compliance_rate: Math.round(slaComplianceRate * 100) / 100,
-        avg_delay_seconds: avgDelay !== null ? Math.round(avgDelay * 1000) / 1000 : null,
-        min_delay_seconds: minDelay !== null ? Math.round(minDelay * 1000) / 1000 : null,
-        max_delay_seconds: maxDelay !== null ? Math.round(maxDelay * 1000) / 1000 : null,
-        p95_delay_seconds: p95Delay !== null ? Math.round(p95Delay * 1000) / 1000 : null,
-      },
+      transfer,
     });
-  } catch (error) {
-    winstonOutageLogger.error("Failed to fetch SLA metrics", { error });
-    throw createError(ERROR_CODES.INTERNAL_ERROR, "Failed to fetch SLA metrics");
+  } catch (error: any) {
+    throw error.statusCode ? error : createError(ERROR_CODES.INTERNAL_ERROR, error.message || "Failed to generate cold vault transfer");
   }
 };
 
-/**
- * Express Router mounting all monitoring dashboard endpoints
- */
-import { Router } from "express";
-const router = Router();
+export const listColdVaultTransfersHandler = async (_req: Request, res: Response): Promise<void> => {
+  try {
+    const transfers = await coldVaultService.listTransfers();
+    res.json({
+      success: true,
+      transfers,
+    });
+  } catch (error: any) {
+    throw error.statusCode ? error : createError(ERROR_CODES.INTERNAL_ERROR, "Failed to list cold vault transfers");
+  }
+};
 
-router.get("/dashboard", getCircuitBreakerStatus);
-router.get("/circuit-breaker-status", getCircuitBreakerStatus);
-router.post("/outages", logOutageStatus);
-router.post("/alerts/test", triggerAlertWarning);
-router.get("/alerts", (_req: Request, res: Response) => {
-  res.json({ success: true, alerts: activeAlerts });
-});
-router.get("/logs", getOutageLogs);
-router.post("/circuit-breaker/reset", resetCircuitBreakerHandler);
-router.post("/circuit-breaker/trip", tripCircuitBreakerHandler);
-router.get("/sla", getSlaMetrics);
+export const registerColdVaultSignatureHandler = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const { transferId } = req.params;
+    const { signerPublicKey, signedEnvelopeXdr } = req.body;
 
-export default router;
+    if (!transferId || !signerPublicKey || !signedEnvelopeXdr) {
+      throw createError(ERROR_CODES.MISSING_FIELD, "transferId, signerPublicKey, and signedEnvelopeXdr are required");
+    }
+
+    const transfer = await coldVaultService.registerSignature(transferId, signerPublicKey, signedEnvelopeXdr);
+
+    res.json({
+      success: true,
+      transfer,
+    });
+  } catch (error: any) {
+    throw error.statusCode ? error : createError(ERROR_CODES.INTERNAL_ERROR, error.message || "Failed to register secondary signature");
+  }
+};
+
+export const executeColdVaultTransferHandler = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const { transferId } = req.params;
+
+    if (!transferId) {
+      throw createError(ERROR_CODES.MISSING_FIELD, "transferId is required");
+    }
+
+    const result = await coldVaultService.executeTransfer(transferId);
+
+    res.json({
+      success: true,
+      ...result,
+    });
+  } catch (error: any) {
+    throw error.statusCode ? error : createError(ERROR_CODES.INTERNAL_ERROR, error.message || "Failed to execute cold vault transfer");
+  }
+};
+
+export const getDeadLetterJobsHandler = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const limit = parseInt(req.query.limit as string) || 50;
+    const offset = parseInt(req.query.offset as string) || 0;
+    const queueName = req.query.queueName as string;
+    const status = req.query.status as string;
+
+    const result = await listDeadLetterJobs({ limit, offset, queueName, status });
+    res.json({
+      success: true,
+      ...result,
+    });
+  } catch (error: any) {
+    throw error.statusCode ? error : createError(ERROR_CODES.INTERNAL_ERROR, error.message || "Failed to fetch dead letter jobs");
+  }
+};
+
+export const getDeadLetterJobByIdHandler = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { id } = req.params;
+    const result = await pool.query("SELECT * FROM failed_jobs WHERE id = $1;", [id]);
+    if (!result.rows || result.rows.length === 0) {
+      throw createError(ERROR_CODES.NOT_FOUND, `Failed job not found with ID: ${id}`);
+    }
+    res.json({
+      success: true,
+      job: result.rows[0],
+    });
+  } catch (error: any) {
+    throw error.statusCode ? error : createError(ERROR_CODES.INTERNAL_ERROR, error.message || "Failed to fetch dead letter job");
+  }
+};
+
+export const replayDeadLetterJobHandler = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { id } = req.params;
+    if (!id) {
+      throw createError(ERROR_CODES.MISSING_FIELD, "Failed job ID is required for replay");
+    }
+
+    const result = await replayDeadLetterJob(id);
+    res.json({
+      success: true,
+      message: "Failed dead-letter job replayed successfully",
+      ...result,
+    });
+  } catch (error: any) {
+    throw error.statusCode ? error : createError(ERROR_CODES.INTERNAL_ERROR, error.message || "Failed to replay dead letter job");
+  }
+};
+
+const adminRouter = Router();
+adminRouter.get("/circuit-breakers", getCircuitBreakerStatus);
+adminRouter.post("/outage", logOutageStatus);
+adminRouter.post("/test-alert", testEngineeringAlert);
+adminRouter.post("/circuit-breakers/reset", resetCircuitBreakerStatus);
+adminRouter.get("/logs", getWinstonLogs);
+adminRouter.get("/dlq", getDeadLetterJobsHandler);
+adminRouter.get("/dlq/:id", getDeadLetterJobByIdHandler);
+adminRouter.post("/dlq/replay/:id", replayDeadLetterJobHandler);
+
+export default adminRouter;

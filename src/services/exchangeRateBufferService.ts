@@ -20,8 +20,9 @@
 
 import { pool } from "../config/database";
 import { redisClient } from "../config/redis";
-import { findRange } from "../models/historicalPrice";
 import logger from "../utils/logger";
+import { computeVolatility } from "../utils/volatility";
+import type { CurrencyCode } from "../models/historicalPrice";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -211,34 +212,23 @@ export class ExchangeRateBufferService {
     toCurrency: string,
   ): Promise<number> {
     try {
-      const now = new Date();
-      const oneDayAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000);
-
-      const snapshots = await findRange(
-        fromCurrency as any,
-        toCurrency as any,
-        oneDayAgo,
-        now,
+      const metrics = await computeVolatility(
+        fromCurrency as CurrencyCode,
+        toCurrency as CurrencyCode,
+        24,
       );
 
-      if (!snapshots || snapshots.length < 2) {
+      if (!metrics) {
         // Not enough data — fall back to static buffer
         return config.bufferPercent;
       }
 
-      const prices = snapshots.map((s) => s.price);
-      const mean = prices.reduce((a, b) => a + b, 0) / prices.length;
-      const variance =
-        prices.reduce((sum, p) => sum + (p - mean) ** 2, 0) / prices.length;
-      const stddev = Math.sqrt(variance);
-      const coefficientOfVariation = (stddev / mean) * 100;
-
       // Scale: use 2x the coefficient of variation as the buffer,
       // but respect configured min/max bounds
-      const dynamicBuffer = coefficientOfVariation * 2;
+      const dynamicBuffer = metrics.coefficientOfVariation * 2;
 
       logger.info(
-        `[ERB] Dynamic buffer for ${fromCurrency}/${toCurrency}: CV=${coefficientOfVariation.toFixed(3)}%, buffer=${dynamicBuffer.toFixed(3)}%`,
+        `[ERB] Dynamic buffer for ${fromCurrency}/${toCurrency}: CV=${metrics.coefficientOfVariation.toFixed(3)}%, buffer=${dynamicBuffer.toFixed(3)}%`,
       );
 
       return dynamicBuffer;

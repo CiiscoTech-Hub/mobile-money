@@ -2,6 +2,7 @@ import speakeasy from "speakeasy";
 import QRCode from "qrcode";
 import bcrypt from "bcrypt";
 import crypto from "crypto";
+import { totpService } from "../services/auth/totp";
 
 export interface TOTPSecret {
   secret: string;
@@ -72,12 +73,7 @@ export function verifyTOTPToken(
   token: string,
   window: number = 2,
 ): boolean {
-  return speakeasy.totp.verify({
-    secret,
-    encoding: "base32",
-    token,
-    window,
-  });
+  return totpService.verifyTOTP(secret, token, window);
 }
 
 /**

@@ -13,10 +13,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v4
         with:
           node-version: "20"
           cache: npm
@@ -39,10 +39,10 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v4
         with:
           node-version: "20"
           cache: npm
@@ -146,10 +146,10 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v4
         with:
           node-version: "20"
           cache: npm
@@ -179,8 +179,8 @@ jobs:
             sleep 1
           done
 
-      - name: Run database migrations
-        run: npm run migrate:up 2>&1
+      - name: Run database migrations and rollback test
+        run: bash scripts/testMigrations.sh 2>&1
         continue-on-error: false
         env:
           DATABASE_URL: postgresql://test_user:test_password@localhost:5432/test_db
@@ -209,7 +209,7 @@ jobs:
           CI: true
 
       - name: Upload Pact files as artifacts
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v4
         if: success()
         with:
           name: pact-contracts
@@ -252,22 +252,62 @@ jobs:
           SESSION_SECRET: ci-session-secret
 
       - name: Upload Playwright report
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v4
         if: always()
         with:
           name: playwright-report
           path: playwright-report/
           retention-days: 7
 
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v6
+  migration-dry-run:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: test_user
+          POSTGRES_PASSWORD: test_password
+          POSTGRES_DB: test_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: ./coverage/lcov.info
-          flags: unittests
-          name: codecov-umbrella
-          fail_ci_if_error: false
-          verbose: true
+          node-version: "20"
+          cache: npm
+
+      - name: Verify package-lock.json exists
+        run: |
+          if [ ! -f package-lock.json ]; then
+            npm install --package-lock-only --ignore-scripts
+          fi
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Wait for Postgres
+        run: |
+          for i in $(seq 1 30); do
+            pg_isready -h localhost -p 5432 -U test_user && break
+            echo "Waiting for Postgres... attempt $i/30"
+            sleep 1
+          done
+
+      - name: Dry-run pending migrations
+        run: npm run migrate:dry-run
+        env:
+          DATABASE_URL: postgresql://test_user:test_password@localhost:5432/test_db
+          NODE_ENV: test
 
   build:
     runs-on: ubuntu-latest
@@ -275,10 +315,10 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v4
         with:
           node-version: "20"
           cache: npm
@@ -313,7 +353,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4

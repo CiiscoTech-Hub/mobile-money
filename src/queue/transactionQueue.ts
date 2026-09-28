@@ -1,7 +1,9 @@
-import { rabbitMQManager, EXCHANGES, ROUTING_KEYS } from "./rabbitmq";
+import { Queue } from "bullmq";
+import { queueOptions } from "./config";
 import { TransactionModel, TransactionStatus } from "../models/transaction";
 
 export const TRANSACTION_QUEUE_NAME = "transaction-processing-queue";
+export const TRANSACTION_JOB_NAME = "transaction-process";
 
 const transactionModel = new TransactionModel();
 
@@ -24,12 +26,37 @@ export interface TransactionJobResult {
   error?: string;
 }
 
-// Keeping this for compatibility, but it's no longer a BullMQ.Queue
-export const transactionQueue = {
-  close: async () => {}, // No-op as rabbitMQManager handles it
-  getName: () => TRANSACTION_QUEUE_NAME,
-};
+// Instantiate the BullMQ Queue. The old RabbitMQ work queue has been
+// replaced by BullMQ so all transaction processing shares the same
+// Redis-backed cluster primitives (retries, backoff, retention, DLQ)
+// used by the other queues in this application.
+export const transactionQueue = new Queue<
+  TransactionJobData,
+  TransactionJobResult
+>(TRANSACTION_QUEUE_NAME, {
+  ...queueOptions,
+  defaultJobOptions: {
+    ...queueOptions.defaultJobOptions,
+    // Broker-level retries are intentionally conservative: the worker
+    // performs its own in-process retries (withRetry) so failed jobs are
+    // never re-executed from scratch (which could double-send a payment).
+    attempts: 1,
+    // Retention: clean up completed/failed job records to bound Redis memory
+    removeOnComplete: {
+      count: 1000,
+      age: 24 * 3600, // 24 hours
+    },
+    removeOnFail: {
+      count: 500,
+      age: 7 * 24 * 3600, // 7 days
+    },
+  },
+});
 
+/**
+ * Enqueue a transaction for processing.
+ * Returns a job-shaped result so callers can surface a jobId.
+ */
 export async function addTransactionJob(
   data: TransactionJobData,
   options?: {
@@ -38,65 +65,77 @@ export async function addTransactionJob(
     repeat?: { every: number };
     jobId?: string;
   },
-) {
-  // Use RabbitMQ Topic Exchange for advanced routing
-  await rabbitMQManager.publish(
-    EXCHANGES.TRANSACTIONS,
-    ROUTING_KEYS.TRANSACTION_PROCESS,
-    data,
-  );
+): Promise<{ id: string | undefined }> {
+  const job = await transactionQueue.add(TRANSACTION_JOB_NAME, data, {
+    jobId: options?.jobId ?? data.transactionId,
+    priority: options?.priority,
+    delay: options?.delay,
+    repeat: options?.repeat,
+  });
 
-  console.log(
-    `[Queue] Added transaction job to RabbitMQ: ${data.transactionId}`,
-  );
-  return { id: data.transactionId }; // Return something compatible
+  return { id: job.id ?? data.transactionId };
 }
 
+/**
+ * Fetch a job by ID, falling back to the transaction row when the job has
+ * already been removed from Redis (retention window exceeded).
+ */
 export async function getJobById(jobId: string) {
-  // Try to find in DB as a proxy
+  const job = await transactionQueue.getJob(jobId);
+  if (job) {
+    return job;
+  }
   return await transactionModel.findById(jobId);
 }
 
+/**
+ * Resolve processing progress from the BullMQ job, falling back to the
+ * transaction status when the job is no longer retained.
+ */
 export async function getJobProgress(jobId: string): Promise<number> {
+  const job = await transactionQueue.getJob(jobId);
+  if (job) {
+    const progress = job.progress;
+    if (typeof progress === "number") return progress;
+    return 0;
+  }
+
   const transaction = await transactionModel.findById(jobId);
   if (!transaction) return 0;
 
-  // Try to get from metadata.progress
-  const progress = (transaction.metadata as any)?.progress;
-  if (typeof progress === "number") return progress;
-
-  // Fallback to status proxy
   if (transaction.status === TransactionStatus.Completed) return 100;
   if (transaction.status === TransactionStatus.Failed) return 0;
   return 0;
 }
 
+/**
+ * Get transaction queue health metrics.
+ */
 export async function getQueueStats() {
-  const [pending, completed, failed] = await Promise.all([
-    transactionModel.countByStatuses([TransactionStatus.Pending]),
-    transactionModel.countByStatuses([TransactionStatus.Completed]),
-    transactionModel.countByStatuses([TransactionStatus.Failed]),
+  const [waiting, active, completed, failed] = await Promise.all([
+    transactionQueue.getWaitingCount(),
+    transactionQueue.getActiveCount(),
+    transactionQueue.getCompletedCount(),
+    transactionQueue.getFailedCount(),
   ]);
 
   return {
-    waiting: pending,
-    active: 0, // RabbitMQ doesn't easily expose this through this client
+    waiting,
+    active,
     completed,
     failed,
-    isPaused: false, // RabbitMQ specific pausing needs more setup
+    isPaused: await transactionQueue.isPaused(),
   };
 }
 
 export async function pauseQueue() {
-  // Needs integration with RabbitMQ consumer control
-  console.warn("pauseQueue not fully implemented for RabbitMQ migration");
+  await transactionQueue.pause();
 }
 
 export async function resumeQueue() {
-  console.warn("resumeQueue not fully implemented for RabbitMQ migration");
+  await transactionQueue.resume();
 }
 
 export async function drainQueue() {
-  // Purging a queue in RabbitMQ
-  console.warn("drainQueue not fully implemented for RabbitMQ migration");
+  await transactionQueue.drain();
 }

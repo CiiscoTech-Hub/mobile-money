@@ -14,7 +14,49 @@ export const connection = {
 
 export const queueOptions: QueueOptions = {
   connection,
+  defaultJobOptions: {
+    attempts: 5,
+    backoff: {
+      type: "exponential",
+      delay: 2000, // Start with 2 seconds
+    },
+    removeOnComplete: {
+      age: 86400, // Keep completed jobs for 24 hours
+      count: 1000,
+    },
+    removeOnFail: {
+      age: 604800, // Keep failed jobs for 7 days
+      count: 5000,
+    },
+  },
 };
+
+// ---------------------------------------------------------------------------
+// Telecom Provider Speed & Rate Limit Configurations
+// ---------------------------------------------------------------------------
+export interface ProviderRateLimit {
+  concurrency: number;
+  limiter: {
+    max: number;
+    duration: number;
+  };
+}
+
+export const telecomProviderLimits: Record<string, ProviderRateLimit> = {
+  MTN: { concurrency: 10, limiter: { max: 50, duration: 1000 } },
+  AIRTEL: { concurrency: 5, limiter: { max: 20, duration: 1000 } },
+  VODAFONE: { concurrency: 8, limiter: { max: 30, duration: 1000 } },
+  // Safe default fallback boundary
+  DEFAULT: { concurrency: 3, limiter: { max: 10, duration: 1000 } },
+};
+
+/**
+ * Dynamically resolves rate limits matching a telecom provider's speed capabilities.
+ */
+export function getTelecomProviderLimits(provider?: string): ProviderRateLimit {
+  const activeProvider = (provider || process.env.TELECOM_PROVIDER || "DEFAULT").toUpperCase();
+  return telecomProviderLimits[activeProvider] || telecomProviderLimits.DEFAULT;
+}
 
 // ---------------------------------------------------------------------------
 // Internal helper – parse a positive integer from an env var, returning null
@@ -32,7 +74,6 @@ function parsePositiveInt(value: string | undefined): number | null {
 // ---------------------------------------------------------------------------
 function readConvictConcurrency(key: string): number | null {
   try {
-     
     const convictConfig = require("../config/appConfig").default;
     const value = convictConfig.get(key);
     return typeof value === "number" && value > 0 ? value : null;
@@ -115,9 +156,7 @@ export function getAccountingRetryWorkerConcurrency(): number {
  */
 export function getAccountingTokenRefreshWorkerConcurrency(): number {
   return (
-    parsePositiveInt(
-      process.env.ACCOUNTING_TOKEN_REFRESH_WORKER_CONCURRENCY,
-    ) ??
+    parsePositiveInt(process.env.ACCOUNTING_TOKEN_REFRESH_WORKER_CONCURRENCY) ??
     readConvictConcurrency("worker.accountingTokenRefreshConcurrency") ??
     3
   );
@@ -140,5 +179,19 @@ export function getProviderBalanceAlertWorkerConcurrency(): number {
     parsePositiveInt(process.env.PROVIDER_BALANCE_ALERT_WORKER_CONCURRENCY) ??
     readConvictConcurrency("worker.providerBalanceAlertConcurrency") ??
     1
+  );
+}
+
+/**
+ * Dynamically retrieves the failed payout refund worker concurrency limit.
+ *
+ * Refunds move customer funds, so the worker defaults to low concurrency while
+ * still allowing operators to scale once idempotency and monitoring are tuned.
+ */
+export function getRefundWorkerConcurrency(): number {
+  return (
+    parsePositiveInt(process.env.REFUND_WORKER_CONCURRENCY) ??
+    readConvictConcurrency("worker.refundConcurrency") ??
+    2
   );
 }

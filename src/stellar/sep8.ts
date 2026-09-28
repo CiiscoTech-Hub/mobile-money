@@ -1,6 +1,6 @@
 import logger from "../utils/logger";
 import { Router, Request, Response } from "express";
-import * as StellarSdk from "stellar-sdk";
+import * as StellarSdk from "@stellar/stellar-sdk";
 import { Pool } from "pg";
 import { Sep12Service, Sep12CustomerStatus } from "./sep12";
 import {

@@ -7,7 +7,7 @@
  */
 
 import { Request, Response } from "express";
-import * as StellarSdk from "stellar-sdk";
+import * as StellarSdk from "@stellar/stellar-sdk";
 
 // ── Mock heavy dependencies before importing the controller ──────────────────
 

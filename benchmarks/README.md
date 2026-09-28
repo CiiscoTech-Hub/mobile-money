@@ -1,15 +1,124 @@
-# Soroban Gas Consumption Benchmark CLI Tool
+# Benchmarks
+
+This directory contains performance and load testing tools for the Mobile Money bridge.
+
+## k6 Ingest Load Testing
+
+The k6 suite benchmarks high-throughput callback ingestion services (`ingest-node` on `:3001`, `ingest-go` on `:3002`).
+
+### k6 Ingest Prerequisites
+
+* [k6](https://k6.io/docs/getting-started/installation/) installed
+* Ingest service running locally
+* Redis on `:6379`
+
+### Scenarios
+
+| Script | Purpose |
+| ------ | ------- |
+| `k6-bench.js` | Baseline constant-arrival-rate throughput (1k/5k/10k RPS) |
+| `scenarios/smoke.js` | Quick 5-VU sanity check before full runs |
+| `scenarios/peak-day-spike.js` | 30-min realistic peak-day traffic curve |
+| `scenarios/stress.js` | Breaking-point ramp beyond peak load |
+
+---
+
+## 500 RPS API Load Test — `load_test.js`
+
+Verifies that the three highest-traffic HTTP endpoints sustain **500 requests/second**
+with a **p95 latency below 200 ms**.
+
+### Endpoints under test
+
+| Scenario | Endpoint | Traffic share |
+| -------- | -------- | ------------- |
+| Quote discovery | `GET /sep38/prices` | 40% |
+| Customer lookup | `GET /sep12/customer` | 35% |
+| Transaction status polling | `GET /api/v1/transactions/:id` | 25% |
+
+### Load Test Prerequisites
+
+* [k6](https://k6.io/docs/getting-started/installation/) ≥ v0.47 installed and in `$PATH`
+* The mobile-money server running locally on `http://localhost:3000`
+
+### Acceptance criteria
+
+| Metric | Target |
+| ------ | ------ |
+| p95 response time | **< 200 ms** across all scenarios |
+| Error rate | < 1% per scenario |
+| Throughput | ≥ 500 req/s (steady-state) |
+
+### Running the benchmark
+
+```bash
+# Full 500 RPS run (thresholds enforced — fails on breach)
+npm run bench:load-test-500rps
+
+# Observe-only mode (metrics collected but no threshold failures)
+npm run bench:load-test-observe
+
+# Override base URL or RPS
+k6 run -e BASE_URL=http://staging.example.com -e RPS=500 benchmarks/load_test.js
+
+# Collect raw JSON for post-processing
+k6 run --out json=benchmarks/results/load-test-500rps.json benchmarks/load_test.js
+```
+
+### Generating the HTML report
+
+```bash
+# Generate from the latest JSON result file
+npm run bench:html-report
+
+# Or point to a specific file
+node benchmarks/generate-html-report.js benchmarks/results/load-test-500rps.json
+```
+
+The HTML report is written to `benchmarks/results/load-test-report-<timestamp>.html` and
+contains:
+
+* KPI summary cards (throughput, p95, p99, error rate)
+* Per-scenario latency breakdown table with pass/fail badges
+* Canvas-rendered throughput and latency bar charts
+* Red 200 ms threshold marker on the latency chart
+
+> **Note:** Result JSON files and HTML reports are gitignored (`benchmarks/results/`).
+> Only the scripts themselves are committed.
+
+---
+
+### k6 Ingest Suite Usage
+
+```bash
+# Run the full baseline suite
+./benchmarks/run-bench.sh
+
+# Run individual scenarios
+./benchmarks/run-bench.sh --scenario smoke
+./benchmarks/run-bench.sh --scenario peak-day
+./benchmarks/run-bench.sh --scenario stress
+
+# Direct k6 invocation
+k6 run -e TARGET_URL=http://localhost:3001 benchmarks/scenarios/smoke.js
+```
+
+Results are written to `benchmarks/results/` (JSON exports are gitignored).
+
+---
+
+## Soroban Gas Consumption Benchmark CLI Tool
 
 Automates gas measurement of Soroban smart contract deployments and method invocations.
 Outputs clean gas figures as formatted terminal tables, JSON, and Markdown reports.
 
 ## Features
 
-- **Source Analysis Mode** — Parses Rust contract source to compute gas estimates using Soroban Protocol 20 cost model constants (storage, token, crypto, auth operations)
-- **Rust Benchmark Mode** — When `cargo` is available, compiles and runs a native Soroban SDK `testutils`-based benchmark for precise on-chain measurements
-- **WASM Binary Analysis** — When `.wasm` binaries exist, extracts binary size, code section size, and data section metrics
-- **Multi-Contract Support** — Automatically discovers and benchmarks all contracts under the `contracts/` directory
-- **Multiple Output Formats** — Terminal table, JSON (`soroban-gas-report.json`), and Markdown (`soroban-gas-report.md`)
+* **Source Analysis Mode** — Parses Rust contract source to compute gas estimates using Soroban Protocol 20 cost model constants (storage, token, crypto, auth operations)
+* **Rust Benchmark Mode** — When `cargo` is available, compiles and runs a native Soroban SDK `testutils`-based benchmark for precise on-chain measurements
+* **WASM Binary Analysis** — When `.wasm` binaries exist, extracts binary size, code section size, and data section metrics
+* **Multi-Contract Support** — Automatically discovers and benchmarks all contracts under the `contracts/` directory
+* **Multiple Output Formats** — Terminal table, JSON (`soroban-gas-report.json`), and Markdown (`soroban-gas-report.md`)
 
 ## Quick Start
 
@@ -21,7 +130,7 @@ npm run bench:soroban-gas
 node benchmarks/soroban-gas-bench.js
 ```
 
-## Usage
+## Soroban Gas Usage
 
 ```
 node benchmarks/soroban-gas-bench.js [options]
@@ -128,6 +237,6 @@ Clean structured output in `benchmarks/results/soroban-gas-report.json`:
 
 ## Notes
 
-- No external dependencies required — the tool uses only Node.js built-ins
-- The Rust benchmark binary (`benchmarks/src/main.rs`) provides the highest accuracy when `cargo` is available
-- For CI pipelines, the source analysis mode works without any Rust toolchain installation
+* No external dependencies required — the tool uses only Node.js built-ins
+* The Rust benchmark binary (`benchmarks/src/main.rs`) provides the highest accuracy when `cargo` is available
+* For CI pipelines, the source analysis mode works without any Rust toolchain installation

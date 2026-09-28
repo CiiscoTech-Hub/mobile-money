@@ -146,7 +146,15 @@ export function createFederationRouter(db: Pool): Router {
   const service = new FederationService(db);
 
   router.get("/", async (req: Request, res: Response) => {
-    const parsed = federationQuerySchema.safeParse(req.query);
+    const rawQuery = req.query.q;
+    if (typeof rawQuery !== "string" || rawQuery.trim() === "") {
+      return res.status(400).json({ detail: "q is required" });
+    }
+
+    const parsed = federationQuerySchema.safeParse({
+      q: rawQuery,
+      type: req.query.type,
+    });
     if (!parsed.success) {
       return res.status(400).json({ detail: parsed.error.issues[0].message });
     }

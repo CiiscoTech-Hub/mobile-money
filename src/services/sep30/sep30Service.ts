@@ -1,4 +1,4 @@
-import * as StellarSdk from "stellar-sdk";
+import * as StellarSdk from "@stellar/stellar-sdk";
 import { pool } from "../../config/database";
 import { getStellarServer } from "../../config/stellar";
 import { KeyVault, EncryptedPayload } from "./keyVault";

@@ -17,13 +17,9 @@ import {
 } from "../controllers/transactionController";
 import { validateTransaction } from "../middleware/validateTransaction";
 import { normalizeProvider } from "../middleware/normalizeProvider";
-import { validateNetworkMiddleware } from "../middleware/validateNetworkMiddleware";
 import { TimeoutPresets, haltOnTimedout } from "../middleware/timeout";
 import { authenticateToken } from "../middleware/auth";
 import { cancelTransactionRateLimiter } from "../middleware/rateLimit";
-import { checkAccountStatusStrict } from "../middleware/checkAccountStatus";
-import { geolocateMiddleware } from "../middleware/geolocate";
-import { geoFencingMiddleware } from "../middleware/geoFencing";
 import { validate2FAForWithdrawal } from "../services/twoFactorWithdrawalService";
 import { TransactionModel, TransactionStatus } from "../models/transaction";
 import { generateTransactionPdfBuffer } from "../services/pdfReceipt";
@@ -31,6 +27,8 @@ import { generateShareToken, verifyShareToken } from "../utils/share";
 import { createExportRoutes } from "./export";
 import { ERROR_CODES } from "../constants/errorCodes";
 import { createError } from "../middleware/errorHandler";
+import { complianceMiddlewares } from "../middleware/compliance";
+import { strictIdempotency } from "../middleware/idempotency";
 
 export const transactionRoutes = Router();
 transactionRoutes.use(createExportRoutes());
@@ -53,6 +51,12 @@ transactionRoutes.get(
         throw createError(ERROR_CODES.NOT_FOUND, "Transaction not found", {
           error: "Transaction not found",
         });
+
+      if (transaction.userId !== req.jwtUser?.userId) {
+        throw createError(ERROR_CODES.FORBIDDEN, "Access denied", {
+          error: "You do not have permission to access this transaction",
+        });
+      }
 
       const pdf = await generateTransactionPdfBuffer(transaction);
 
@@ -94,6 +98,10 @@ transactionRoutes.get(
       const transaction = await transactionModel.findById(id);
       if (!transaction)
         return res.status(404).json({ error: "Transaction not found" });
+
+      if (transaction.userId !== req.jwtUser?.userId) {
+        return res.status(403).json({ error: "You do not have permission to access this transaction" });
+      }
 
       if (transaction.status !== TransactionStatus.Completed)
         return res.status(400).json({
@@ -230,28 +238,24 @@ transactionRoutes.patch(
 transactionRoutes.post(
   "/deposit",
   authenticateToken,
-  checkAccountStatusStrict,
-  geoFencingMiddleware,
+  strictIdempotency,
   TimeoutPresets.long,
   haltOnTimedout,
   normalizeProvider,
   validateTransaction,
-  validateNetworkMiddleware,
-  geolocateMiddleware,
+  ...complianceMiddlewares,
   depositHandler,
 );
 
 transactionRoutes.post(
   "/withdraw",
   authenticateToken,
-  checkAccountStatusStrict,
-  geoFencingMiddleware,
+  strictIdempotency,
   TimeoutPresets.long,
   haltOnTimedout,
   normalizeProvider,
   validateTransaction,
-  validateNetworkMiddleware,
-  geolocateMiddleware,
+  ...complianceMiddlewares,
   validate2FAForWithdrawal,
   withdrawHandler,
 );

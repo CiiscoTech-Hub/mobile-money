@@ -126,6 +126,11 @@ export interface VerificationStatusResponse {
   checks: KYCCheck[];
   reports: KYCReport[];
   rejectionReason: KYCRejectionReason | null;
+  zkProofStatus?: string | null;
+  complianceScore?: number | null;
+  complianceChecks?: Array<Record<string, any>>;
+  zkProofReference?: string | null;
+  zkProofVaultId?: string | null;
 }
 
 export interface BinaryDocumentUploadInput {
@@ -373,11 +378,17 @@ export class KYCService {
       const checks = await this.fetchChecks(applicantId);
       const reports = await this.fetchReports(applicantId);
       const normalized = this.normalizeVerification(checks, reports);
+      const proofSnapshot = await this.fetchLatestProofSnapshot(applicantId);
 
       return {
         ...normalized,
         checks,
         reports,
+        zkProofStatus: proofSnapshot?.status ?? null,
+        complianceScore: proofSnapshot?.complianceScore ?? null,
+        complianceChecks: proofSnapshot?.complianceChecks ?? [],
+        zkProofReference: proofSnapshot?.proofId ?? null,
+        zkProofVaultId: proofSnapshot?.vaultId ?? null,
       };
     } catch (error) {
       throw new Error(
@@ -471,6 +482,54 @@ export class KYCService {
     );
 
     return Array.isArray(data.reports) ? (data.reports as KYCReport[]) : [];
+  }
+
+  private async fetchLatestProofSnapshot(applicantId: string): Promise<{
+    proofId: string | null;
+    vaultId: string | null;
+    status: string | null;
+    complianceScore: number | null;
+    complianceChecks: Array<Record<string, any>>;
+  } | null> {
+    try {
+      const result = await this.db.query<{
+        applicant_data: {
+          last_zk_proof?: {
+            proofId?: string | null;
+            vaultId?: string | null;
+            status?: string | null;
+            complianceScore?: number | null;
+            complianceChecks?: Array<Record<string, any>>;
+          };
+        } | null;
+      }>(
+        `SELECT applicant_data
+         FROM kyc_applicants
+         WHERE applicant_id = $1
+         LIMIT 1`,
+        [applicantId],
+      );
+
+      const snapshot = result.rows[0]?.applicant_data?.last_zk_proof;
+      if (!snapshot) {
+        return null;
+      }
+
+      return {
+        proofId: snapshot.proofId ?? null,
+        vaultId: snapshot.vaultId ?? null,
+        status: snapshot.status ?? null,
+        complianceScore: snapshot.complianceScore ?? null,
+        complianceChecks: Array.isArray(snapshot.complianceChecks)
+          ? snapshot.complianceChecks
+          : [],
+      };
+    } catch (error) {
+      logger.warn(
+        `Failed to load latest proof snapshot for applicant ${applicantId}: ${error instanceof Error ? error.message : "Unknown error"}`,
+      );
+      return null;
+    }
   }
 
   private normalizeVerification(
@@ -685,6 +744,11 @@ export class KYCService {
             rejectionReason: verification.rejectionReason,
             checks: verification.checks,
             reports: verification.reports,
+            zkProofStatus: verification.zkProofStatus ?? null,
+            complianceScore: verification.complianceScore ?? null,
+            complianceChecks: verification.complianceChecks ?? [],
+            zkProofReference: verification.zkProofReference ?? null,
+            zkProofVaultId: verification.zkProofVaultId ?? null,
           },
         }),
         applicantId,

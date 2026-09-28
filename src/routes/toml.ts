@@ -73,20 +73,23 @@ function buildAssetEntryFromAnchoredAsset(
   network: string,
 ): AssetEntry {
   const metadata = asset.metadata || {};
-  const desc =
+  const desc = String(
     metadata.desc ||
-    metadata.description ||
-    `${asset.assetCode} issued by this anchor`;
+      metadata.description ||
+      `${asset.assetCode} issued by this anchor`,
+  );
   const displayDecimals = metadata.display_decimals ?? metadata.displayDecimals;
   const isAssetAnchored = parseBoolean(
     metadata.is_asset_anchored ?? metadata.isAssetAnchored,
   );
-  const anchorAssetType =
-    metadata.anchor_asset_type || metadata.anchorAssetType || "fiat";
-  const anchorAsset =
+  const anchorAssetType = String(
+    metadata.anchor_asset_type || metadata.anchorAssetType || "fiat",
+  );
+  const anchorAsset = String(
     metadata.anchor_asset ||
-    metadata.anchorAsset ||
-    asset.assetCode.replace(/[^A-Z]/g, "");
+      metadata.anchorAsset ||
+      asset.assetCode.replace(/[^A-Z]/g, ""),
+  );
 
   return {
     code: asset.assetCode,

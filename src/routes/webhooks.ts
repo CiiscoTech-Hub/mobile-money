@@ -1,11 +1,14 @@
 import logger from "../utils/logger";
 import { Router, Request, Response } from "express";
-import { createHmac, timingSafeEqual, verify, createPublicKey } from "crypto";
-import { Keypair } from "stellar-sdk";
+import { createHmac, timingSafeEqual } from "crypto";
 import { TransactionModel, TransactionStatus } from "../models/transaction";
 import { WebhookService, WebhookEvent } from "../services/webhook";
 import { ingestRateLimiter } from "../middleware/ingestRateLimit";
 import { AirtelSignatureValidator } from "../utils/airtelSignatureValidator";
+import {
+  verifyWebhookPayloadEd25519,
+  derivePublicSigningKey,
+} from "../crypto/webhookSigning";
 
 const router = Router();
 const transactionModel = new TransactionModel();
@@ -81,26 +84,7 @@ function verifyWebhookSignature(
   if (!signature) return false;
 
   if (signature.startsWith("ed25519=")) {
-    const expectedSignature = signature.substring(8);
-    try {
-      if (secret.startsWith("G") && secret.length === 56) {
-        const kp = Keypair.fromPublicKey(secret);
-        return kp.verify(
-          Buffer.from(payload),
-          Buffer.from(expectedSignature, "hex"),
-        );
-      } else {
-        const key = createPublicKey(secret);
-        return verify(
-          null,
-          Buffer.from(payload),
-          key,
-          Buffer.from(expectedSignature, "hex"),
-        );
-      }
-    } catch (e) {
-      return false;
-    }
+    return verifyWebhookPayloadEd25519(payload, signature, secret);
   }
 
   if (signature.startsWith("sha256=")) {
@@ -197,12 +181,12 @@ router.get("/schema", (req: Request, res: Response) => {
       zapier: {
         webhook_url: `${req.protocol}://${req.get("host")}/api/webhooks`,
         authentication:
-          "X-Webhook-Signature header with HMAC-SHA256 (sha256=...) or ED25519 (ed25519=...)",
+          "X-Webhook-Signature header with HMAC-SHA256 (sha256=...) or ED25519 (ed25519=...). See GET /api/webhooks/signing-key for the active scheme and public key.",
       },
       make_com: {
         webhook_url: `${req.protocol}://${req.get("host")}/api/webhooks`,
         authentication:
-          "X-Webhook-Signature header with HMAC-SHA256 (sha256=...) or ED25519 (ed25519=...)",
+          "X-Webhook-Signature header with HMAC-SHA256 (sha256=...) or ED25519 (ed25519=...). See GET /api/webhooks/signing-key for the active scheme and public key.",
       },
     },
   });
@@ -211,6 +195,32 @@ router.get("/schema", (req: Request, res: Response) => {
 router.get("/sample", (req: Request, res: Response) =>
   res.json(SAMPLE_WEBHOOK_PAYLOAD),
 );
+
+/**
+ * GET /signing-key
+ *
+ * Public discovery endpoint so webhook consumers can verify the
+ * `ed25519=<hex>` signature scheme without ever holding a shared secret.
+ * Returns `{ scheme: "sha256", enabled: false }` when no Ed25519 signing
+ * key is configured — in that case deliveries fall back to HMAC-SHA256
+ * using the per-deployment/per-webhook shared secret instead.
+ */
+router.get("/signing-key", (_req: Request, res: Response) => {
+  const signingKey = process.env.WEBHOOK_ED25519_SIGNING_KEY;
+  if (!signingKey) {
+    return res.json({ scheme: "sha256", enabled: false });
+  }
+
+  try {
+    const { publicKey, keyId } = derivePublicSigningKey(signingKey);
+    return res.json({ scheme: "ed25519", enabled: true, keyId, publicKey });
+  } catch (err) {
+    logger.error("[webhook] Failed to derive Ed25519 signing public key", err);
+    return res
+      .status(500)
+      .json({ error: "Signing key misconfigured", enabled: false });
+  }
+});
 
 router.post("/", async (req: Request, res: Response) => {
   const webhookSecret = process.env.WEBHOOK_SECRET;
@@ -236,14 +246,20 @@ router.post("/", async (req: Request, res: Response) => {
         transaction_id: payload.transaction_id,
       });
     }
-    if (payload.status && payload.status !== transaction.status) {
-      await transactionModel.updateStatus(
+    if (payload.status) {
+      const updated = await transactionModel.updateStatus(
         transaction.id,
         payload.status as TransactionStatus,
       );
-      console.log(
-        `[webhook] Updated transaction ${transaction.id} to ${payload.status}`,
-      );
+      if (updated) {
+        console.log(
+          `[webhook] Updated transaction ${transaction.id} to ${payload.status}`,
+        );
+      } else {
+        console.log(
+          `[webhook] Skipped status transition for transaction ${transaction.id} to ${payload.status} (no-op or invalid state transition)`,
+        );
+      }
     }
     console.log(
       `[webhook] Processed event ${payload.event_id} for transaction ${payload.transaction_id}`,
@@ -267,17 +283,22 @@ export async function verifyAirtelWebhookSignature(
   res: Response,
   next: () => void,
 ) {
-  const signature = req.headers["x-airtel-signature"] as string | undefined;
+  const signatureHeader = req.headers["x-airtel-signature"];
+  // Express gives an array when a header is repeated; a repeated
+  // x-airtel-signature is itself a sign of a malformed/spoofed request,
+  // so only a single string value is accepted.
+  const signature =
+    typeof signatureHeader === "string" ? signatureHeader : undefined;
   if (!signature) {
-    console.warn("[webhook-airtel] Missing signature header");
-    return res.status(400).json({ error: "Missing x-airtel-signature header" });
+    console.warn("[webhook-airtel] Missing or malformed signature header");
+    return res.status(401).json({ error: "Missing x-airtel-signature header" });
   }
 
   const rawPayload = JSON.stringify(req.body);
   const isValid = await airtelValidator.verifySignature(rawPayload, signature);
   if (!isValid) {
     console.warn("[webhook-airtel] Invalid signature");
-    return res.status(400).json({ error: "Invalid signature" });
+    return res.status(401).json({ error: "Invalid signature" });
   }
 
   next();
@@ -301,14 +322,20 @@ router.post(
           transaction_id: payload.transaction_id,
         });
       }
-      if (payload.status && payload.status !== transaction.status) {
-        await transactionModel.updateStatus(
+      if (payload.status) {
+        const updated = await transactionModel.updateStatus(
           transaction.id,
           payload.status as TransactionStatus,
         );
-        console.log(
-          `[webhook-airtel] Updated transaction ${transaction.id} to ${payload.status}`,
-        );
+        if (updated) {
+          console.log(
+            `[webhook-airtel] Updated transaction ${transaction.id} to ${payload.status}`,
+          );
+        } else {
+          console.log(
+            `[webhook-airtel] Skipped status transition for transaction ${transaction.id} to ${payload.status} (no-op or invalid state transition)`,
+          );
+        }
       }
       console.log(
         `[webhook-airtel] Processed event ${payload.event_id} for transaction ${payload.transaction_id}`,

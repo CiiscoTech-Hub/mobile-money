@@ -5,8 +5,9 @@ import {
   GetPublicKeyCommand,
   SigningAlgorithmSpec,
 } from "@aws-sdk/client-kms";
-import { Transaction, Keypair, xdr, Networks } from "stellar-sdk";
+import { Transaction, Keypair, xdr, Networks } from "@stellar/stellar-sdk";
 import crypto from "crypto";
+import { getKmsClient } from "../../config/aws";
 
 // ─── File Signing Types ───────────────────────────────────────────────────────
 
@@ -209,8 +210,6 @@ export function createFileSignerFromEnv(): KmsFileSigner | null {
 
 // ─── Stellar HSM (unchanged below) ───────────────────────────────────────────
 
-import { getKmsClient } from "../../config/aws";
-
 /**
  * Interface for HSM Providers to ensure secrets never touch app memory
  */
@@ -248,27 +247,6 @@ export class KmsStellarSigner implements StellarHSMProvider {
         const keypair = new Keypair({ type: 'ed25519', publicKey: rawPublicKey });
         return keypair.publicKey();
     }
-  constructor(region: string, keyId: string) {
-    this.client = new KMSClient({ region });
-    this.keyId = keyId;
-  }
-
-  /**
-   * Fetches the public key from HSM and converts it to Stellar format (G...)
-   */
-  async getPublicKey(): Promise<string> {
-    const command = new GetPublicKeyCommand({ KeyId: this.keyId });
-    const response = await this.client.send(command);
-
-    if (!response.PublicKey)
-      throw new Error("Could not retrieve Public Key from HSM");
-
-    // Note: In a full implementation, you would parse the DER encoded public key
-    // from KMS to extract the raw 32-byte Ed25519 key.
-    // For this wrapper, we assume the public key mapping is managed in config
-    // or via a utility helper.
-    return process.env.STELLAR_HSM_PUBLIC_KEY!;
-  }
 
   /**
    * Signs a transaction using the HSM

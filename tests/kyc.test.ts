@@ -65,6 +65,8 @@ describe("KYCService", () => {
     expect(result.status).toBe(KYCStatus.APPROVED);
     expect(result.level).toBe(KYCLevel.BASIC);
     expect(result.rejectionReason).toBeNull();
+    expect(result.zkProofStatus).toBeNull();
+    expect(result.complianceScore).toBeNull();
   });
 
   it("flags fraudulent documents for manual review", async () => {
@@ -147,6 +149,7 @@ describe("KYCService", () => {
       } as any);
 
     mockPool.query
+      .mockResolvedValueOnce({ rows: [{ applicant_data: null }] } as any)
       .mockResolvedValueOnce({
         rows: [{ user_id: "user-1", kyc_level: "full" }],
       } as any)
@@ -162,7 +165,7 @@ describe("KYCService", () => {
 
     expect(getMock).toHaveBeenCalledWith("/workflow_runs/workflow-run-1");
     expect(mockPool.query).toHaveBeenNthCalledWith(
-      1,
+      2,
       expect.stringContaining("UPDATE kyc_applicants"),
       expect.arrayContaining([
         KYCStatus.APPROVED,
@@ -172,7 +175,7 @@ describe("KYCService", () => {
       ]),
     );
     expect(mockPool.query).toHaveBeenNthCalledWith(
-      2,
+      3,
       expect.stringContaining("UPDATE users"),
       ["full", "user-1"],
     );

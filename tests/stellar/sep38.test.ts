@@ -50,7 +50,7 @@ jest.mock("../../src/services/exchangeRateBufferService", () => ({
   },
 }));
 
-jest.mock("stellar-sdk", () => {
+jest.mock("@stellar/stellar-sdk", () => {
   const mockAsset = jest
     .fn()
     .mockImplementation((code: string, issuer: string) => ({

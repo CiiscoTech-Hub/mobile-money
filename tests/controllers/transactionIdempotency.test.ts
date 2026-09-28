@@ -51,10 +51,14 @@ jest.mock(
 );
 
 jest.mock("../../src/models/transaction", () => {
-  const actual = jest.requireActual("../../src/models/transaction");
   return {
-    ...actual,
     TransactionModel: jest.fn().mockImplementation(() => mockTransactionModel),
+    TransactionStatus: {
+      Pending: "pending",
+      Completed: "completed",
+      Failed: "failed",
+      Cancelled: "cancelled",
+    },
   };
 });
 
@@ -84,22 +88,28 @@ jest.mock("../../src/middleware/timeout", () => ({
 
 jest.mock("../../src/middleware/auth", () => ({
   authenticateToken: (req: any, _res: any, next: () => void) => {
-    req.jwtUser = { userId: "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", role: "user" };
+    req.jwtUser = {
+      userId: "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11",
+      role: "user",
+    };
     req.user = { id: "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", role: "user" };
     next();
   },
 }));
 
 jest.mock("../../src/middleware/checkAccountStatus", () => ({
-  checkAccountStatusStrict: (_req: unknown, _res: unknown, next: () => void) => next(),
+  checkAccountStatusStrict: (_req: unknown, _res: unknown, next: () => void) =>
+    next(),
 }));
 
 jest.mock("../../src/middleware/geoFencing", () => ({
-  geoFencingMiddleware: (_req: unknown, _res: unknown, next: () => void) => next(),
+  geoFencingMiddleware: (_req: unknown, _res: unknown, next: () => void) =>
+    next(),
 }));
 
 jest.mock("../../src/middleware/geolocate", () => ({
-  geolocateMiddleware: (_req: unknown, _res: unknown, next: () => void) => next(),
+  geolocateMiddleware: (_req: unknown, _res: unknown, next: () => void) =>
+    next(),
 }));
 
 import { transactionRoutes } from "../../src/routes/transactions";
@@ -233,6 +243,59 @@ describe("transaction idempotency routes", () => {
       mockTransactionModel.releaseExpiredIdempotencyKey,
     ).toHaveBeenCalledWith("expired-key");
     expect(mockTransactionModel.create).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns 403 with upgrade instructions when the KYC daily limit is exceeded", async () => {
+    mockTransactionLimitService.checkTransactionLimit.mockResolvedValue({
+      allowed: false,
+      kycLevel: "unverified",
+      dailyLimit: 10000,
+      currentDailyTotal: 9000,
+      remainingLimit: 1000,
+      message:
+        "Transaction limit exceeded. Upgrade to Basic KYC for 100,000 XAF daily limit.",
+      upgradeAvailable: true,
+    });
+
+    const response = await request(createApp())
+      .post("/api/transactions/deposit")
+      .send(buildPayload());
+
+    expect(response.status).toBe(403);
+    expect(response.body).toEqual(
+      expect.objectContaining({
+        code: "TRANSACTION_LIMIT_EXCEEDED",
+        message: expect.stringContaining("Upgrade to Basic KYC"),
+        details: expect.objectContaining({
+          kycLevel: "unverified",
+          dailyLimit: 10000,
+          upgradeAvailable: true,
+        }),
+      }),
+    );
+    expect(mockTransactionModel.create).not.toHaveBeenCalled();
+    expect(mockAddTransactionJob).not.toHaveBeenCalled();
+  });
+
+  it("rejects a body userId that does not match the authenticated user", async () => {
+    const response = await request(createApp())
+      .post("/api/transactions/deposit")
+      .send({
+        ...buildPayload(),
+        userId: "different-user",
+      });
+
+    expect(response.status).toBe(403);
+    expect(response.body).toEqual(
+      expect.objectContaining({
+        code: "FORBIDDEN",
+        message: expect.stringContaining("authenticated user"),
+      }),
+    );
+    expect(
+      mockTransactionLimitService.checkTransactionLimit,
+    ).not.toHaveBeenCalled();
+    expect(mockTransactionModel.create).not.toHaveBeenCalled();
   });
 
   it("reuses the stored transaction when the unique constraint detects a race", async () => {

@@ -1,4 +1,4 @@
-import * as StellarSdk from "stellar-sdk";
+import * as StellarSdk from "@stellar/stellar-sdk";
 import { getStellarServer, getNetworkPassphrase } from "../../config/stellar";
 
 export interface HtlcLockParams {
@@ -51,7 +51,7 @@ export class HtlcService {
 
   private bytesNToScVal(hex: string) {
     return StellarSdk.nativeToScVal(Buffer.from(hex, "hex"), {
-      type: "bytesN",
+      type: "bytes",
     });
   }
 
@@ -65,7 +65,7 @@ export class HtlcService {
 
   private addressArrayToScVal(addresses: string[]) {
     const converted = addresses.map((address) => this.addressToScVal(address));
-    return StellarSdk.nativeToScVal(converted, { type: "vec" });
+    return StellarSdk.nativeToScVal(converted);
   }
 
   async buildLockTx(params: HtlcLockParams): Promise<StellarSdk.Transaction> {

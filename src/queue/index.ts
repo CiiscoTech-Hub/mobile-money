@@ -1,4 +1,3 @@
-import { rabbitMQManager } from "./rabbitmq";
 import { transactionQueue } from "./transactionQueue";
 import { transactionWorker, closeWorker } from "./worker";
 import { syncQueue } from "./syncQueue";
@@ -22,6 +21,12 @@ import {
   startWebhookRetryWorker,
   closeWebhookRetryWorker,
 } from "./webhookRetryWorker";
+import { closeRefundWorker, refundQueue, refundWorker } from "./refundWorker";
+import {
+  closeReceivingAnchorWebhookWorker,
+  startReceivingAnchorWebhookWorker,
+} from "./receivingAnchorWebhookWorker";
+import { closeReceivingAnchorWebhookQueue } from "../services/webhookService";
 
 export async function shutdownQueue(): Promise<void> {
   await Promise.all([
@@ -31,6 +36,9 @@ export async function shutdownQueue(): Promise<void> {
     transactionQueue.close().catch(() => undefined),
     syncQueue.close().catch(() => undefined),
     closeWebhookRetryWorker().catch(() => undefined),
+    closeRefundWorker().catch(() => undefined),
+    closeReceivingAnchorWebhookWorker().catch(() => undefined),
+    closeReceivingAnchorWebhookQueue().catch(() => undefined),
   ]);
 }
 
@@ -115,11 +123,26 @@ export {
 } from "./accountMergeWorker";
 
 export { startAccountingTokenRefreshWorker, closeAccountingTokenRefreshWorker };
+export {
+  startReceivingAnchorWebhookWorker,
+  closeReceivingAnchorWebhookWorker,
+} from "./receivingAnchorWebhookWorker";
 
 export {
   startWebhookRetryWorker,
   closeWebhookRetryWorker,
 } from "./webhookRetryWorker";
+
+export {
+  REFUND_QUEUE_NAME,
+  refundQueue,
+  refundWorker,
+  addRefundJob,
+  enqueueFailedPayoutRefunds,
+  startRefundWorker,
+  closeRefundWorker,
+} from "./refundWorker";
+export type { RefundJobData, RefundJobResult } from "./refundWorker";
 
 // Trace-ID propagation utilities
 export {

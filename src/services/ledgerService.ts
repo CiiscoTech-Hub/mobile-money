@@ -436,6 +436,52 @@ export class LedgerService {
   }
 
   /**
+   * Post an automatic refund for a permanently failed telecom payout.
+   * The entries restore the user's wallet balance and record the blockchain
+   * refund hash in metadata for later reconciliation.
+   */
+  async postWithdrawalRefund(
+    amount: number,
+    referenceNumber: string,
+    transactionId: string,
+    userId: string,
+    reason: string,
+    refundHash?: string,
+  ): Promise<PostedEntry[]> {
+    const refundReference = `REFUND-${referenceNumber}`;
+    const entries: LedgerEntry[] = [
+      {
+        account_code: "1100", // Mobile Money Float
+        debit_amount: amount,
+        description: "Failed payout funds returned",
+        metadata: {
+          originalReferenceNumber: referenceNumber,
+          reason,
+          refundHash,
+        },
+      },
+      {
+        account_code: "2000", // Customer Balances
+        credit_amount: amount,
+        description: "Customer wallet refund credited",
+        metadata: {
+          originalReferenceNumber: referenceNumber,
+          reason,
+          refundHash,
+        },
+      },
+    ];
+
+    return this.postTransaction(
+      refundReference,
+      `Failed payout refund: ${amount} - Reason: ${reason}`,
+      entries,
+      transactionId,
+      userId,
+    );
+  }
+
+  /**
    * Post a clawback transaction (reversal due to fraud)
    * Debit: Customer Balances (liability decreases)
    * Credit: Mobile Money Float (asset decreases)
@@ -507,9 +553,12 @@ export class LedgerService {
     accountCode: string,
     asOfDate?: Date,
   ): Promise<number> {
+    // Same DATE-parameter timezone concern as getTrialBalance above —
+    // pass an explicit UTC "YYYY-MM-DD" string, not a raw JS Date.
+    const dateParam = (asOfDate ?? new Date()).toISOString().slice(0, 10);
     const result = await this.pool.query(
       "SELECT get_account_balance($1, $2) as balance",
-      [accountCode, asOfDate || new Date()],
+      [accountCode, dateParam],
     );
     return parseFloat(result.rows[0].balance);
   }
@@ -545,9 +594,18 @@ export class LedgerService {
    * Get trial balance (all account balances at a point in time)
    */
   async getTrialBalance(asOfDate?: Date): Promise<TrialBalance[]> {
+    // get_trial_balance's p_as_of_date parameter is a plain SQL DATE (no
+    // time/timezone component). Passing a JS Date object directly here lets
+    // the pg driver's timezone-sensitive serialization shift the calendar
+    // date by ±1 day depending on the server process's local timezone
+    // offset relative to UTC — especially near midnight. Extracting the
+    // UTC calendar date as an explicit "YYYY-MM-DD" string removes that
+    // ambiguity: the caller's intended calendar date (e.g. CLI --date=)
+    // is always what gets sent, regardless of server timezone.
+    const dateParam = (asOfDate ?? new Date()).toISOString().slice(0, 10);
     const result = await this.pool.query(
       "SELECT * FROM get_trial_balance($1)",
-      [asOfDate || new Date()],
+      [dateParam],
     );
     return result.rows.map((row) => ({
       account_code: row.account_code,

@@ -313,6 +313,11 @@ export class FraudService {
 
   private async loadHighRiskNumbers(): Promise<void> {
     try {
+      if (!redisClient.isOpen) {
+        const sampleNumbers = ["+1234567890", "+0987654321", "+5555555555"];
+        this.highRiskNumbers = new Set(sampleNumbers);
+        return;
+      }
       const cached = await redisClient.get("fraud:high_risk_numbers");
       if (cached && typeof cached === "string") {
         const numbers = JSON.parse(cached) as string[];
@@ -501,8 +506,12 @@ export class FraudService {
         (t) => t.locationMetadata && t.locationMetadata.status === "resolved",
       );
       if (lastTxnWithLocation && lastTxnWithLocation.locationMetadata) {
+        const previousLocation = lastTxnWithLocation.locationMetadata as {
+          country: string;
+          city: string;
+        };
         const distance = this.calculateDistance(
-          lastTxnWithLocation.locationMetadata,
+          previousLocation,
           transactionInput.location,
         );
         const timeDiff =

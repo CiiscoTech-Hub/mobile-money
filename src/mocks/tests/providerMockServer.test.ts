@@ -501,3 +501,89 @@ describe("provider mock server – scenario normalization", () => {
     expect(res.body.status).toBe("PENDING");
   });
 });
+
+describe("provider mock server – Moov payment simulations", () => {
+  const app = createProviderMockApp();
+
+  describe("POST /moov/oauth/token", () => {
+    it("returns an access_token matching the Moov CI OAuth shape", async () => {
+      const res = await request(app).post("/moov/oauth/token");
+
+      expect(res.status).toBe(200);
+      expect(typeof res.body.access_token).toBe("string");
+      expect(res.body.expires_in).toBe(3600);
+    });
+  });
+
+  describe("POST /moov/payments/deposit", () => {
+    it("returns SUCCESS with transactionId on default scenario", async () => {
+      const res = await request(app)
+        .post("/moov/payments/deposit")
+        .send({ referenceId: "moov-dep-001" });
+
+      expect(res.status).toBe(200);
+      expect(res.body.status).toBe("SUCCESS");
+      expect(res.body.referenceId).toBe("moov-dep-001");
+      expect(res.body.transactionId).toBe("moov-txn-moov-dep-001");
+    });
+
+    it("returns FAILED when scenario=failed", async () => {
+      const res = await request(app)
+        .post("/moov/payments/deposit?scenario=failed")
+        .send({ referenceId: "moov-dep-fail" });
+
+      expect(res.status).toBe(400);
+      expect(res.body.status).toBe("FAILED");
+    });
+
+    it("returns PENDING when scenario=pending", async () => {
+      const res = await request(app)
+        .post("/moov/payments/deposit?scenario=pending")
+        .send({ referenceId: "moov-dep-pend" });
+
+      expect(res.status).toBe(200);
+      expect(res.body.status).toBe("PENDING");
+    });
+  });
+
+  describe("GET /moov/payments/:referenceId", () => {
+    it("returns stored scenario status for deposit lookups", async () => {
+      await request(app)
+        .post("/moov/payments/deposit?scenario=pending")
+        .send({ referenceId: "moov-status-001" });
+
+      const res = await request(app).get("/moov/payments/moov-status-001");
+
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({
+        referenceId: "moov-status-001",
+        status: "PENDING",
+      });
+    });
+  });
+
+  describe("POST /moov/soap", () => {
+    it("returns signed SOAP for RequestPayment", async () => {
+      const res = await request(app)
+        .post("/moov/soap")
+        .set("SOAPAction", "RequestPayment")
+        .send({ referenceId: "moov-soap-001" });
+
+      expect(res.status).toBe(200);
+      expect(res.headers["content-type"]).toMatch(/xml/);
+      expect(res.text).toContain("RequestPaymentResponse");
+      expect(res.text).toContain("<Status>SUCCESS</Status>");
+    });
+
+    it("returns FAILED status in SOAP when scenario=failed", async () => {
+      const res = await request(app)
+        .post("/moov/soap?scenario=failed")
+        .set("SOAPAction", "SendPayout")
+        .send({ referenceId: "moov-soap-fail" });
+
+      expect(res.status).toBe(200);
+      expect(res.text).toContain("SendPayoutResponse");
+      expect(res.text).toContain("<Status>FAILED</Status>");
+    });
+  });
+});

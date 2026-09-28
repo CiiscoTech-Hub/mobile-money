@@ -1,8 +1,8 @@
 import { AssetIssuanceService } from "../issuanceService";
-import * as StellarSdk from "stellar-sdk";
+import * as StellarSdk from "@stellar/stellar-sdk";
 import axios from "axios";
 
-jest.mock("stellar-sdk");
+jest.mock("@stellar/stellar-sdk");
 jest.mock("axios");
 jest.mock("../../utils/logger");
 jest.mock("../../utils/encryption", () => ({

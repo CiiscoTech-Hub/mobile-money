@@ -11,7 +11,6 @@ import express, { NextFunction, Request, Response } from "express";
 import { IncomingMessage, Server } from "http";
 import compression from "compression";
 import dotenv from "dotenv";
-import helmet from "helmet";
 import axios from "axios";
 import * as Sentry from "@sentry/node";
 import http2 from "http2";
@@ -23,6 +22,7 @@ import {
   validateVersionMiddleware,
   VersionedRequest,
 } from "./middleware/apiVersion";
+import { createGracefulShutdownHandler } from "./server";
 import {
   bulkRoutesV1,
   disputeRoutesV1,
@@ -40,6 +40,7 @@ import { statsRoutes } from "./routes/stats";
 import { contactsRoutes } from "./routes/contacts";
 import { reportsRoutes } from "./routes/reports";
 import feesRoutes from "./routes/fees";
+import { docsRouter } from "./routes/docs";
 import { createKYCRoutes } from "./routes/kycRoutes";
 import { adminRoutes } from "./routes/admin";
 import kycTierUpgradeRoutes from "./routes/kycTierUpgradeRoutes";
@@ -55,6 +56,10 @@ import {
 import { createOAuthRouter } from "./auth/oauth";
 import { pool } from "./config/database";
 import {
+  getSessionCookieOptions,
+  getSessionTrustProxy,
+} from "./config/session";
+import {
   globalTimeout,
   haltOnTimedout,
   timeoutErrorHandler,
@@ -62,7 +67,6 @@ import {
 import { requireAuth } from "./middleware/auth";
 import { responseTime } from "./middleware/responseTime";
 import { requestId } from "./middleware/requestId";
-import { createCorsMiddleware } from "./middleware/cors";
 import { readReplicaRoutingMiddleware } from "./middleware/readReplicaRouting";
 import { dbConnectionLeakDetector } from "./middleware/dbConnectionLeakDetector";
 import { i18nMiddleware } from "./utils/i18n";
@@ -75,9 +79,13 @@ import { privacyRoutes } from "./routes/privacy";
 import { developerDashboardRoutes } from "./routes/developerDashboard";
 import { travelRuleRoutes } from "./routes/travelRule";
 import mtnCallbacksRouter from "./routes/mtnCallbacks";
+import mpesaCallbacksRouter from "./routes/mpesaCallbacks";
+import { createMpesaC2BRouter } from "./providers/mpesa/c2b";
 import orangeMadagascarCallbacksRouter from "./routes/orangeMadagascarCallbacks";
 import orangeGuineaCallbacksRouter from "./routes/orangeGuineaCallbacks";
+import { createOrangeQrRouter } from "./providers/orange/qrCode";
 import multisigCallbacksRouter from "./routes/multisigCallbacks";
+import adminWithdrawalsRouter from "./routes/adminWithdrawals";
 import { createMetricsRouter } from "./routes/metrics";
 import sep31Router from "./stellar/sep31";
 import sep24Router from "./stellar/sep24";
@@ -99,8 +107,8 @@ import exchangeRateBufferRoutes from "./routes/exchangeRateBuffers";
 import adminAssetRoutes from "./routes/admin/assets";
 import settingsRoutes from "./routes/settings";
 import { statementsRoutes } from "./routes/statements";
-import { paymentLinkRoutes } from "./routes/paymentLinkRoutes.js";
-import { SEP24_INTERACTIVE_HTML } from "./services/sep24InteractivePage.js";
+import { paymentLinkRoutes } from "./routes/paymentLinkRoutes";
+import { SEP24_INTERACTIVE_HTML } from "./services/sep24InteractivePage";
 import providerStatusRouter from "./routes/providerStatus";
 import adminControllerRouter from "./controllers/adminController";
 import {
@@ -116,6 +124,8 @@ import { WebSocketManager } from "./websocket";
 import { layeredCache } from "./services/layeredCache";
 import { ERROR_CODES } from "./constants/errorCodes";
 import { startApolloServer } from "./graphql/server";
+import { applySecurityMiddleware } from "./config/express";
+import { createCorsMiddleware } from "./middleware/cors";
 
 dotenv.config();
 
@@ -139,15 +149,30 @@ validateStellarNetwork();
 logStellarNetwork();
 
 const app = express();
+app.set("trust proxy", getSessionTrustProxy());
 const PORT = process.env.PORT || 3000;
 const SHUTDOWN_TIMEOUT_MS = parseInt(
-  process.env.SHUTDOWN_TIMEOUT_MS || "30000",
+  process.env.SHUTDOWN_TIMEOUT_MS || "10000",
+  10,
 );
 
 let server: Server | null = null;
-let isShuttingDown = false;
-let shutdownInProgress = false;
-let activeRequests = 0;
+
+export const shutdownHandler = createGracefulShutdownHandler({
+  pool,
+  disconnectRedis,
+  timeoutMs: SHUTDOWN_TIMEOUT_MS,
+  onCleanup: async () => {
+    console.log("[Shutdown] Draining queue resources");
+    const { shutdownQueue } = await import("./queue/index.js");
+    await shutdownQueue();
+    console.log("[Shutdown] Queue resources closed");
+
+    console.log("[Shutdown] Stopping heartbeat service");
+    stopHeartbeatService();
+    console.log("[Shutdown] Heartbeat service stopped");
+  },
+});
 
 if (process.env.SENTRY_DSN) {
   Sentry.setupExpressErrorHandler(app);
@@ -159,9 +184,9 @@ app.use(sentryBreadcrumbMiddleware);
 
 app.use(metricsMiddleware);
 app.use(tracingMetricsMiddleware);
+// Helmet, CORS, and related security headers are applied inside
+// applySecurityMiddleware() imported from "./config/express".
 applySecurityMiddleware(app);
-app.use(helmet());
-app.use(createCorsMiddleware());
 
 // Compression middleware
 if (process.env.COMPRESSION_ENABLED !== "false") {
@@ -216,31 +241,7 @@ app.use(ipBlacklistMiddleware);
 app.use(dbConnectionLeakDetector);
 app.use(providerLogMaskingMiddleware);
 
-app.use((req: Request, res: Response, next: NextFunction) => {
-  if (isShuttingDown) {
-    res.setHeader("Connection", "close");
-    throw createError(ERROR_CODES.SERVICE_UNAVAILABLE, "Service Unavailable", {
-      error: "Service Unavailable",
-      message: "Server is shutting down. Please retry shortly.",
-    });
-  }
-
-  activeRequests += 1;
-  let completed = false;
-
-  const onRequestFinished = () => {
-    if (completed) {
-      return;
-    }
-    completed = true;
-    activeRequests = Math.max(0, activeRequests - 1);
-  };
-
-  res.on("finish", onRequestFinished);
-  res.on("close", onRequestFinished);
-
-  next();
-});
+app.use(shutdownHandler.middleware);
 
 const sessionSecret =
   process.env.SESSION_SECRET || "default-secret-change-in-production";
@@ -252,11 +253,7 @@ app.use(
     secret: sessionSecret,
     resave: false,
     saveUninitialized: false,
-    cookie: {
-      secure: process.env.NODE_ENV === "production",
-      httpOnly: true,
-      maxAge: SESSION_TTL_SECONDS * 1000,
-    },
+    cookie: getSessionCookieOptions(),
   }),
 );
 app.use(sessionAnomalyLogger);
@@ -308,6 +305,7 @@ app.get("/api/live-rates", async (_req: Request, res: Response) => {
 });
 
 app.get("/ready", async (_req: Request, res: Response) => {
+  const isShuttingDown = shutdownHandler.getIsShuttingDown();
   const checks: Record<string, string> = {
     database: "down",
     redis: "down",
@@ -368,7 +366,7 @@ app.get("/health/lb", async (req: Request, res: Response) => {
   };
   let healthy = true;
 
-  if (isShuttingDown) {
+  if (shutdownHandler.getIsShuttingDown()) {
     healthy = false;
   }
 
@@ -416,6 +414,7 @@ app.use(haltOnTimedout);
 app.use(apiVersionMiddleware);
 app.use(validateVersionMiddleware);
 app.use("/oauth", createOAuthRouter());
+app.use("/api/docs", docsRouter);
 app.use("/api/auth", authRoutes);
 
 app.use("/api/v1/transactions", transactionRoutesV1);
@@ -450,9 +449,16 @@ app.use("/api/disputes", disputeRoutes);
 app.use("/api/stats", statsRoutes);
 app.use("/api/contacts", contactsRoutes);
 app.use("/api/mtn", mtnCallbacksRouter);
+app.use("/api/mpesa", mpesaCallbacksRouter);
+app.use("/api/mpesa/c2b", createMpesaC2BRouter());
 app.use("/api/orange-madagascar", orangeMadagascarCallbacksRouter);
 app.use("/api/orange-guinea", orangeGuineaCallbacksRouter);
+app.use("/api/orange/qr", createOrangeQrRouter());
 app.use("/api/multisig", multisigCallbacksRouter);
+
+// Apply custom configurable CORS allowlist for admin routes
+app.use("/api/admin", createCorsMiddleware());
+app.use("/api/admin/withdrawals", adminWithdrawalsRouter);
 app.use("/api/reports", reportsRoutes);
 app.use("/api/fees", feesRoutes);
 app.use("/api/users", userRoutes);
@@ -515,98 +521,7 @@ if (process.env.SENTRY_DSN) {
 app.use(timeoutErrorHandler);
 app.use(errorHandler);
 
-function waitForActiveRequests(timeoutMs: number): Promise<void> {
-  if (activeRequests === 0) {
-    return Promise.resolve();
-  }
-
-  return new Promise((resolve) => {
-    const startedAt = Date.now();
-    const interval = setInterval(() => {
-      if (activeRequests === 0 || Date.now() - startedAt >= timeoutMs) {
-        clearInterval(interval);
-        resolve();
-      }
-    }, 100);
-  });
-}
-
-async function gracefulShutdown(signal: NodeJS.Signals): Promise<void> {
-  if (shutdownInProgress) {
-    console.log(`[Shutdown] ${signal} received; shutdown already in progress`);
-    return;
-  }
-
-  shutdownInProgress = true;
-  isShuttingDown = true;
-  console.log(`[Shutdown] Received ${signal}. Starting graceful shutdown...`);
-
-  try {
-    if (server) {
-      console.log(
-        "[Shutdown] Stopping HTTP server from accepting new requests",
-      );
-      await new Promise<void>((resolve, reject) => {
-        server?.close((error) => {
-          if (error) {
-            reject(error);
-            return;
-          }
-          resolve();
-        });
-      });
-      console.log("[Shutdown] HTTP listener closed");
-    }
-
-    const pendingAtStart = activeRequests;
-    if (pendingAtStart > 0) {
-      console.log(
-        `[Shutdown] Waiting for ${pendingAtStart} active request(s) to finish (timeout ${SHUTDOWN_TIMEOUT_MS}ms)`,
-      );
-    }
-
-    await waitForActiveRequests(SHUTDOWN_TIMEOUT_MS);
-
-    if (activeRequests > 0) {
-      console.warn(
-        `[Shutdown] Timed out waiting for active requests. Remaining: ${activeRequests}`,
-      );
-    } else {
-      console.log("[Shutdown] All active requests finished");
-    }
-
-    console.log("[Shutdown] Draining queue resources");
-    const { shutdownQueue } = await import("./queue/index.js");
-    await shutdownQueue();
-    console.log("[Shutdown] Queue resources closed");
-
-    console.log("[Shutdown] Stopping heartbeat service");
-    stopHeartbeatService();
-    console.log("[Shutdown] Heartbeat service stopped");
-
-    console.log("[Shutdown] Closing PostgreSQL pool");
-    await pool.end();
-    console.log("[Shutdown] PostgreSQL pool closed");
-
-    console.log("[Shutdown] Closing Redis client");
-    await disconnectRedis();
-    console.log("[Shutdown] Redis client closed");
-
-    console.log("[Shutdown] Graceful shutdown complete");
-    process.exit(0);
-  } catch (error) {
-    logger.error("[Shutdown] Shutdown sequence failed", error);
-    process.exit(1);
-  }
-}
-
-process.once("SIGTERM", () => {
-  void gracefulShutdown("SIGTERM");
-});
-
-process.once("SIGINT", () => {
-  void gracefulShutdown("SIGINT");
-});
+shutdownHandler.registerSignalHandlers();
 
 export let wsManager: WebSocketManager | null = null;
 
@@ -618,6 +533,11 @@ async function initializeRuntime(): Promise<void> {
   // Initialize background jobs and monitoring
   const { startJobs } = await import("./jobs/scheduler.js");
   startJobs();
+
+  // Start JWT key rotation worker (issue #1971): rotates the signing key
+  // on schedule and deprecates old secrets after the grace window.
+  const { startKeyRotationWorker } = await import("./workers/keyRotation.js");
+  startKeyRotationWorker();
 
   // Initialize Prometheus Horizon Scraper
   startStellarExporter();
@@ -646,6 +566,39 @@ async function initializeRuntime(): Promise<void> {
   app.post("/admin/queues/pause", pauseQueueEndpoint);
   app.post("/admin/queues/resume", resumeQueueEndpoint);
 
+  const useHTTP2 = process.env.USE_HTTP2 === "true";
+
+  if (useHTTP2) {
+    const sslOptions = {
+      key: fs.readFileSync(path.join(__dirname, "../certs/key.pem")),
+      cert: fs.readFileSync(path.join(__dirname, "../certs/cert.pem")),
+      requestCert: true,
+      rejectUnauthorized: false,
+    };
+
+    const http2Server = http2.createSecureServer(
+      { ...sslOptions, allowHTTP1: true },
+      app as any,
+    );
+    http2Server.listen(PORT, () => {
+      console.log(`HTTP/2 server running on https://localhost:${PORT}`);
+    });
+    server = http2Server as unknown as Server;
+    shutdownHandler.setServer(server);
+  } else {
+    server = app.listen(PORT, () => {
+      console.log(`HTTP/1.1 server running on http://localhost:${PORT}`);
+    });
+    shutdownHandler.setServer(server);
+
+    wsManager = new WebSocketManager(server);
+    console.log("WebSocket server attached");
+
+    // Start Apollo Server with APQ enabled (must run after HTTP server is created)
+    await startApolloServer(app, server);
+    console.log("Apollo GraphQL server started at /graphql with Redis APQ");
+  }
+
   try {
     await connectRedis();
     console.log("Redis initialized");
@@ -663,12 +616,25 @@ async function initializeRuntime(): Promise<void> {
       scheduleProviderBalanceAlertJob,
       startAccountingTokenRefreshWorker,
       startWebhookRetryWorker,
+      startRefundWorker,
+      startReceivingAnchorWebhookWorker,
     } = await import("./queue/index.js");
     startProviderBalanceAlertWorker();
     startAccountingTokenRefreshWorker();
     startWebhookRetryWorker();
+    startRefundWorker();
+    startReceivingAnchorWebhookWorker();
     await scheduleProviderBalanceAlertJob();
     console.log("Provider balance alert queue initialized");
+
+    // STK push query polling fallback (#1969): poll `stkpushquery` when the
+    // callback does not arrive within 30s. Safe to start unconditionally —
+    // it only schedules work when `onStkPushInitiated` is called.
+    const { mpesaStkQueryWorker } = await import(
+      "./workers/mpesaStkQueryWorker.js"
+    );
+    mpesaStkQueryWorker.start();
+    console.log("M-Pesa STK query worker started");
   } catch (err) {
     logger.error("Redis failed", err);
     console.warn("Distributed locks not available");
@@ -676,36 +642,6 @@ async function initializeRuntime(): Promise<void> {
 
   const { createQueueDashboard } = await import("./queue/dashboard.js");
   app.use("/admin/queues", createQueueDashboard());
-
-  //
-  const useHTTP2 = process.env.USE_HTTP2 === "true";
-
-  if (useHTTP2) {
-    const sslOptions = {
-      key: fs.readFileSync(path.join(__dirname, "../certs/key.pem")),
-      cert: fs.readFileSync(path.join(__dirname, "../certs/cert.pem")),
-    };
-
-    const http2Server = http2.createSecureServer(
-      { ...sslOptions, allowHTTP1: true },
-      app as any,
-    );
-    http2Server.listen(PORT, () => {
-      console.log(`HTTP/2 server running on https://localhost:${PORT}`);
-    });
-    server = http2Server as unknown as Server;
-  } else {
-    server = app.listen(PORT, () => {
-      console.log(`HTTP/1.1 server running on http://localhost:${PORT}`);
-    });
-
-    wsManager = new WebSocketManager(server);
-    console.log("WebSocket server attached");
-
-    // Start Apollo Server with APQ enabled (must run after HTTP server is created)
-    await startApolloServer(app, server);
-    console.log("Apollo GraphQL server started at /graphql with Redis APQ");
-  }
 }
 
 if (process.env.NODE_ENV !== "test") {

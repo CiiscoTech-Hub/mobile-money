@@ -47,7 +47,13 @@ const createStrategySchema = z
   .object({
     name: z.string().min(1).max(100),
     description: z.string().optional(),
-    strategyType: z.enum(["flat", "percentage", "time_based", "volume_based"]),
+    strategyType: z.enum([
+      "flat",
+      "percentage",
+      "time_based",
+      "volume_based",
+      "volatility_based",
+    ]),
     scope: z.enum(["user", "provider", "global"]),
     userId: z.string().uuid().optional(),
     provider: z.string().min(1).max(100).optional(),
@@ -76,6 +82,17 @@ const createStrategySchema = z
 
     // Volume-based
     volumeTiers: z.array(volumeTierSchema).min(1).optional(),
+
+    // Volatility-based
+    volatilityBaseCurrency: z.string().min(1).max(10).optional(),
+    volatilityQuoteCurrency: z.string().min(1).max(10).optional(),
+    volatilityMultiplier: z.number().min(0).optional(),
+    volatilityWindowHours: z
+      .number()
+      .int()
+      .min(1)
+      .max(24 * 30)
+      .optional(),
   })
   .superRefine((data, ctx) => {
     if (data.scope === "user" && !data.userId) {
@@ -130,6 +147,17 @@ const createStrategySchema = z
       });
     }
     if (
+      data.strategyType === "volatility_based" &&
+      (!data.volatilityBaseCurrency || !data.volatilityQuoteCurrency)
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "volatilityBaseCurrency and volatilityQuoteCurrency are required for volatility_based strategies",
+        path: ["volatilityBaseCurrency"],
+      });
+    }
+    if (
       data.feeMaximum !== undefined &&
       data.feeMinimum !== undefined &&
       data.feeMaximum < data.feeMinimum
@@ -164,6 +192,15 @@ const updateStrategySchema = z
     overridePercentage: z.number().min(0).max(100).optional(),
     overrideFlatAmount: z.number().min(0).optional(),
     volumeTiers: z.array(volumeTierSchema).min(1).optional(),
+    volatilityBaseCurrency: z.string().min(1).max(10).optional(),
+    volatilityQuoteCurrency: z.string().min(1).max(10).optional(),
+    volatilityMultiplier: z.number().min(0).optional(),
+    volatilityWindowHours: z
+      .number()
+      .int()
+      .min(1)
+      .max(24 * 30)
+      .optional(),
   })
   .refine(
     (d) =>

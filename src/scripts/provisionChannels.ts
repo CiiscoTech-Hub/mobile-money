@@ -4,7 +4,7 @@ import { printError } from "./momo-cli";
  * Issue: #843
  */
 
-import * as StellarSdk from "stellar-sdk";
+import * as StellarSdk from "@stellar/stellar-sdk";
 import dotenv from "dotenv";
 
 dotenv.config();

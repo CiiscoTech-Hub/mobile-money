@@ -1,5 +1,5 @@
 import { HtlcService } from "../../src/services/stellar/htlcService";
-import * as StellarSdk from "stellar-sdk";
+import * as StellarSdk from "@stellar/stellar-sdk";
 
 jest.mock("../../src/config/stellar", () => ({
   getStellarServer: jest.fn().mockReturnValue({

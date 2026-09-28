@@ -10,6 +10,8 @@ import {
   DynamicSpreadService,
   SpreadInputs,
 } from "../../services/dynamicSpreadService";
+import { rateController } from "../rateController";
+import { AIRTEL_FEE_TIERS } from "../../services/currency";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Mock heavy dependencies so tests run without DB / Redis
@@ -259,5 +261,86 @@ describe("DynamicSpreadService.getSpreadParameters()", () => {
 
     expect(params.liquidityVolumeUsd).toBe(999_999);
     expect(params.settlementTimeMs).toBe(45_000);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Airtel Money tiered transaction fee calculation (#1552)
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("RateController.calculateAirtelFeeQuote()", () => {
+  function mockRes() {
+    const res: any = {};
+    res.status = jest.fn().mockReturnValue(res);
+    res.json = jest.fn().mockReturnValue(res);
+    return res;
+  }
+
+  it("applies the micro tier (1%) for small amounts, floored at the minimum fee", () => {
+    const res = mockRes();
+    rateController.calculateAirtelFeeQuote({ body: { amount: 100 } } as any, res);
+
+    expect(res.json).toHaveBeenCalledWith({
+      success: true,
+      data: {
+        grossAmount: 100,
+        fee: 5, // 1% of 100 = 1, floored at AIRTEL_MIN_FEE (5)
+        netAmount: 95,
+        tier: "micro",
+        rate: 0.01,
+      },
+    });
+  });
+
+  it("applies the standard tier (0.8%) for mid-range amounts", () => {
+    const res = mockRes();
+    rateController.calculateAirtelFeeQuote({ body: { amount: 5000 } } as any, res);
+
+    const data = res.json.mock.calls[0][0].data;
+    expect(data.tier).toBe("standard");
+    expect(data.fee).toBe(40); // 5000 * 0.008
+    expect(data.netAmount).toBe(4960);
+  });
+
+  it("applies the enterprise tier (0.3%) for large amounts", () => {
+    const res = mockRes();
+    rateController.calculateAirtelFeeQuote({ body: { amount: 100_000 } } as any, res);
+
+    const data = res.json.mock.calls[0][0].data;
+    expect(data.tier).toBe("enterprise");
+    expect(data.fee).toBe(300); // 100000 * 0.003
+    expect(data.netAmount).toBe(99_700);
+  });
+
+  it("returns 400 when amount is missing", () => {
+    const res = mockRes();
+    rateController.calculateAirtelFeeQuote({ body: {} } as any, res);
+
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(res.json).toHaveBeenCalledWith(
+      expect.objectContaining({ success: false }),
+    );
+  });
+
+  it("returns 400 when amount is negative", () => {
+    const res = mockRes();
+    rateController.calculateAirtelFeeQuote(
+      { body: { amount: -50 } } as any,
+      res,
+    );
+
+    expect(res.status).toHaveBeenCalledWith(400);
+  });
+});
+
+describe("RateController.getAirtelFeeTiers()", () => {
+  it("returns the full tiered fee schedule", () => {
+    const res: any = { json: jest.fn() };
+    rateController.getAirtelFeeTiers({} as any, res);
+
+    expect(res.json).toHaveBeenCalledWith({
+      success: true,
+      data: { tiers: AIRTEL_FEE_TIERS },
+    });
   });
 });

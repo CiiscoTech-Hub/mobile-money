@@ -22,6 +22,9 @@ describe("encryption fuzz tests (fast-check)", () => {
   test("tampered ciphertext or tag fails to decrypt", () => {
     fc.assert(
       fc.property(fc.uint8Array(), fc.string({ maxLength: 32 }), (arr, pwd) => {
+        // With an empty plaintext the ciphertext is empty too, so flipHex is
+        // a no-op and there is nothing to tamper with.
+        fc.pre(arr.length > 0);
         const plain = Buffer.from(arr);
         const key = deriveKey(pwd);
         const enc = encryptAesGcm(plain, key);

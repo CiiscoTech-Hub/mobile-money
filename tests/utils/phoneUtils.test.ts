@@ -12,6 +12,11 @@ describe("phoneUtils", () => {
       expect(result.valid).toBe(true);
     });
 
+    it("should return valid for a matching Kenya airtel number", () => {
+      const result = validatePhoneProviderMatch("+254730123456", "airtel");
+      expect(result.valid).toBe(true);
+    });
+
     it("should return valid for a matching orange number", () => {
       const result = validatePhoneProviderMatch("+237651234567", "orange");
       expect(result.valid).toBe(true);

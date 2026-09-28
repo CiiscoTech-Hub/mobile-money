@@ -27,12 +27,13 @@ FeeCalculationContext
 
 ### Strategy Types
 
-| Type           | Description                                                                                           |
-| -------------- | ----------------------------------------------------------------------------------------------------- |
-| `flat`         | Fixed fee amount regardless of transaction size                                                       |
-| `percentage`   | Percentage of amount, clamped to `[feeMinimum, feeMaximum]`                                           |
-| `time_based`   | Overrides fee during specific days/hours (e.g. Fee-free Fridays). Falls through if condition not met. |
-| `volume_based` | Tiered fee based on transaction amount brackets                                                       |
+| Type               | Description                                                                                                                                                                                                                                                                           |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `flat`             | Fixed fee amount regardless of transaction size                                                                                                                                                                                                                                       |
+| `percentage`       | Percentage of amount, clamped to `[feeMinimum, feeMaximum]`                                                                                                                                                                                                                           |
+| `time_based`       | Overrides fee during specific days/hours (e.g. Fee-free Fridays). Falls through if condition not met.                                                                                                                                                                                 |
+| `volume_based`     | Tiered fee based on transaction amount brackets                                                                                                                                                                                                                                       |
+| `volatility_based` | Base `feePercentage` plus a surcharge proportional to the coefficient of variation of recent prices for `volatilityBaseCurrency`/`volatilityQuoteCurrency` over `volatilityWindowHours` (default 24h). Falls back to the base percentage alone when there isn't enough price history. |
 
 ### Priority Hierarchy
 
@@ -247,6 +248,35 @@ Reduced fee for high-value transactions:
   "feeMaximum": 500
 }
 ```
+
+---
+
+### 7. Volatility-Based Fee (XLM/USD bridge asset)
+
+Base fee plus a surcharge that grows with recent price volatility of the
+bridged asset, so the platform is compensated for holding volatility risk
+during settlement:
+
+```json
+{
+  "name": "XLM Volatility Surcharge",
+  "strategyType": "volatility_based",
+  "scope": "global",
+  "priority": 20,
+  "feePercentage": 0.5,
+  "feeMinimum": 20,
+  "feeMaximum": 2000,
+  "volatilityBaseCurrency": "XLM",
+  "volatilityQuoteCurrency": "USD",
+  "volatilityMultiplier": 1.5,
+  "volatilityWindowHours": 24
+}
+```
+
+Effective fee percentage = `feePercentage + coefficientOfVariation(XLM/USD, 24h) * volatilityMultiplier`,
+clamped to `[feeMinimum, feeMaximum]`. If fewer than 2 price snapshots exist in the
+window, the strategy falls back to `feePercentage` alone. The resolved
+`coefficientOfVariation` is returned in `breakdown.volatilityCoefficient` for transparency.
 
 ---
 

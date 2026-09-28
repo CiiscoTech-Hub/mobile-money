@@ -207,53 +207,125 @@ async function migrateUp(): Promise<void> {
   console.log(`Migration complete. Applied ${pending.length} migration(s).`);
 }
 
-async function migrateDown(): Promise<void> {
+async function migrateDown(options?: { all?: boolean; count?: number }): Promise<void> {
   await ensureMigrationsTable();
   const all = discoverMigrations();
   await normalizeLegacyAppliedVersions(all);
 
+  const queryLimit = options?.all
+    ? ""
+    : `LIMIT ${options?.count && options.count > 0 ? options.count : 1}`;
   const result = await pool.query<{ version: string }>(
-    "SELECT version FROM schema_migrations ORDER BY applied_at DESC LIMIT 1",
+    `SELECT version FROM schema_migrations ORDER BY applied_at DESC ${queryLimit}`,
   );
   if (result.rows.length === 0) {
     console.log("No migrations to roll back.");
     return;
   }
 
-  const lastVersion = result.rows[0].version;
-  const migration = all.find((m) => m.version === lastVersion);
+  for (const row of result.rows) {
+    const lastVersion = row.version;
+    const migration = all.find((m) => m.version === lastVersion);
 
-  if (!migration) {
-    printError(`Could not find migration file for version: ${lastVersion}`);
+    if (!migration) {
+      printError(`Could not find migration file for version: ${lastVersion}`);
+      process.exit(1);
+    }
+
+    if (!migration.downPath) {
+      printError(
+        `No rollback file found for ${migration.name}. Expected: ${migration.version}_*.down.sql`,
+      );
+      process.exit(1);
+    }
+
+    const sql = fs.readFileSync(migration.downPath, "utf-8");
+    console.log(`Rolling back migration ${migration.version}: ${migration.name}`);
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(sql);
+      await client.query("DELETE FROM schema_migrations WHERE version = $1", [
+        migration.version,
+      ]);
+      await client.query("COMMIT");
+      console.log(`  Rolled back: ${migration.name}`);
+    } catch (err) {
+      await client.query("ROLLBACK");
+      printError(`  Failed to roll back ${migration.name}:`, err);
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+}
+
+async function migrateDryRun(): Promise<void> {
+  await ensureMigrationsTable();
+  const all = discoverMigrations();
+  await normalizeLegacyAppliedVersions(all);
+  const applied = await getAppliedVersions();
+  const pending = all.filter((m) => !applied.has(m.version));
+
+  if (pending.length === 0) {
+    console.log("No pending migrations to validate.");
+    return;
+  }
+
+  let errors = 0;
+  const appliedInDryRun: typeof pending = [];
+
+  for (const migration of pending) {
+    const sql = fs.readFileSync(migration.upPath, "utf-8");
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(sql);
+      await client.query(
+        "INSERT INTO schema_migrations (version) VALUES ($1)",
+        [migration.version],
+      );
+      await client.query("COMMIT");
+      appliedInDryRun.push(migration);
+      console.log(`  [VALID] ${migration.name}`);
+    } catch (err) {
+      await client.query("ROLLBACK");
+      printError(`  [INVALID] ${migration.name}:`, err);
+      errors++;
+      client.release();
+      break;
+    } finally {
+      client.release();
+    }
+  }
+
+  // Roll back all migrations applied during dry-run in reverse order if downPath exists
+  for (const migration of appliedInDryRun.reverse()) {
+    if (migration.downPath) {
+      const client = await pool.connect();
+      try {
+        const sql = fs.readFileSync(migration.downPath, "utf-8");
+        await client.query("BEGIN");
+        await client.query(sql);
+        await client.query(
+          "DELETE FROM schema_migrations WHERE version = $1",
+          [migration.version],
+        );
+        await client.query("COMMIT");
+      } catch (_) {
+        await client.query("ROLLBACK");
+      } finally {
+        client.release();
+      }
+    }
+  }
+
+  if (errors > 0) {
+    printError(`\n${errors} migration(s) failed validation.`);
     process.exit(1);
   }
-
-  if (!migration.downPath) {
-    printError(
-      `No rollback file found for ${migration.name}. Expected: ${migration.version}_*.down.sql`,
-    );
-    process.exit(1);
-  }
-
-  const sql = fs.readFileSync(migration.downPath, "utf-8");
-  console.log(`Rolling back migration ${migration.version}: ${migration.name}`);
-
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-    await client.query(sql);
-    await client.query("DELETE FROM schema_migrations WHERE version = $1", [
-      migration.version,
-    ]);
-    await client.query("COMMIT");
-    console.log(`  Rolled back: ${migration.name}`);
-  } catch (err) {
-    await client.query("ROLLBACK");
-    printError(`  Failed to roll back ${migration.name}:`, err);
-    throw err;
-  } finally {
-    client.release();
-  }
+  console.log(`\nAll ${pending.length} pending migration(s) valid.`);
 }
 
 async function migrateStatus(): Promise<void> {
@@ -289,15 +361,25 @@ const command = process.argv[2];
       case "up":
         await migrateUp();
         break;
-      case "down":
-        await migrateDown();
+      case "down": {
+        const isAll =
+          process.argv.includes("--all") || process.argv.includes("all");
+        const countArg =
+          process.argv[3] && !isNaN(Number(process.argv[3]))
+            ? Number(process.argv[3])
+            : undefined;
+        await migrateDown({ all: isAll, count: countArg });
         break;
+      }
       case "status":
         await migrateStatus();
         break;
+      case "dry-run":
+        await migrateDryRun();
+        break;
       default:
         printError(
-          `Unknown command: ${command ?? "(none)"}.\nUsage: migrate <up|down|status>`,
+          `Unknown command: ${command ?? "(none)"}.\nUsage: migrate <up|down [--all]|status|dry-run>`,
         );
         process.exit(1);
     }

@@ -41,12 +41,12 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v4
         with:
-          node-version: "24"
+          node-version: "20"
           cache: "npm"
 
       - name: Verify package-lock.json exists
@@ -114,10 +114,10 @@ jobs:
           echo "lines=$LINES" >> "$GITHUB_OUTPUT"
 
           # Thresholds — keep in sync with jest.config.js
-          THRESHOLD_STMTS=20
-          THRESHOLD_BRANCHES=15
-          THRESHOLD_FUNCS=25
-          THRESHOLD_LINES=20
+          THRESHOLD_STMTS=70
+          THRESHOLD_BRANCHES=70
+          THRESHOLD_FUNCS=70
+          THRESHOLD_LINES=70
 
           PASSED=true
           if [ "$STMTS" != "N/A" ]; then
@@ -135,7 +135,7 @@ jobs:
       - name: Comment coverage on PR
         if: github.event_name == 'pull_request'
         continue-on-error: true
-        uses: actions/github-script@v8
+        uses: actions/github-script@v7
         with:
           script: |
             const stmts = '${{ steps.metrics.outputs.statements }}';
@@ -187,28 +187,6 @@ jobs:
                 body,
               });
             }
-
-      - name: Check if Codecov is configured
-        id: check_codecov
-        run: |
-          if [ -n "${{ secrets.CODECOV_TOKEN }}" ]; then
-            echo "codecov_available=true" >> $GITHUB_OUTPUT
-          else
-            echo "codecov_available=false" >> $GITHUB_OUTPUT
-            echo "⚠️ CODECOV_TOKEN not configured. Skipping Codecov upload."
-            echo "To enable Codecov integration, add CODECOV_TOKEN secret."
-          fi
-
-      - name: Upload coverage to Codecov
-        if: steps.check_codecov.outputs.codecov_available == 'true'
-        uses: codecov/codecov-action@v6
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: ./coverage/lcov.info
-          flags: unittests
-          name: codecov-umbrella
-          fail_ci_if_error: false
-          verbose: true
 
       - name: Enforce coverage thresholds
         if: steps.metrics.outputs.passed == 'false'

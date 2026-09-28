@@ -25,34 +25,30 @@ export interface BatchPayoutResult {
   providerReference?: string;
 }
 
-export class TigoProvider {
-  private apiKey: string;
-  private apiSecret: string;
-  private baseUrl: string;
+import { BaseProvider } from "../../providers/baseProvider";
+
+export class TigoProvider extends BaseProvider {
   private environment: string;
-  private token: string | null = null;
-  private tokenExpiry = 0;
 
   constructor() {
-    this.apiKey = process.env.TIGO_API_KEY || "";
-    this.apiSecret = process.env.TIGO_API_SECRET || "";
-    this.baseUrl = process.env.TIGO_BASE_URL || "https://sandbox.tigo.com";
+    super({
+      apiKey: process.env.TIGO_API_KEY || "",
+      apiSecret: process.env.TIGO_API_SECRET || "",
+      baseUrl: process.env.TIGO_BASE_URL || "https://sandbox.tigo.com",
+    });
     this.environment = process.env.TIGO_TARGET_ENVIRONMENT || "sandbox";
   }
 
-  private async getAccessToken(): Promise<string> {
-    if (this.token && Date.now() < this.tokenExpiry) {
-      return this.token;
+  async getAccessToken(): Promise<string> {
+    if (this.isTokenValid()) {
+      return this.cachedToken!;
     }
-    const authHeader =
-      "Basic " +
-      Buffer.from(`${this.apiKey}:${this.apiSecret}`).toString("base64");
     const response = await axios.post(
       `${this.baseUrl}/oauth/token`,
       undefined,
       {
         headers: {
-          Authorization: authHeader,
+          ...this.buildOAuth2TokenRequestHeaders(),
           "Content-Type": "application/x-www-form-urlencoded",
         },
       },
@@ -64,9 +60,8 @@ export class TigoProvider {
     if (!data.access_token) {
       throw new Error("Tigo token response missing access_token");
     }
-    this.token = data.access_token;
-    this.tokenExpiry = Date.now() + ((data.expires_in ?? 3600) * 1000 - 5000);
-    return this.token;
+    this.cacheToken(data.access_token, data.expires_in ?? 3600);
+    return data.access_token;
   }
 
   async requestPayment(

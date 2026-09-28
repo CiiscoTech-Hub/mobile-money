@@ -6,6 +6,7 @@ import { amlService, AMLAlert } from "../services/aml";
 import { TransactionModel, Transaction } from "../models/transaction";
 import { getUserById, User } from "../services/userService";
 import { uploadToS3, UploadResult } from "../services/s3Upload";
+import { encryptAesGcmToBuffer } from "../crypto/aesGcm";
 import { DB_ENCRYPTION_KEY } from "../config/env";
 
 /**
@@ -284,19 +285,13 @@ async function generatePDFBuffer(data: SARData): Promise<Buffer> {
 
 /**
  * Encrypts a buffer using AES-256-GCM.
+ * Uses the canonical binary layout [IV][AuthTag][EncryptedData] from
+ * src/crypto/aesGcm.ts. The key is derived with scrypt and the domain salt
+ * "sar-salt" so previously stored SAR files remain decryptable.
  */
 function encryptBuffer(buffer: Buffer): Buffer {
-  const ALGORITHM = "aes-256-gcm";
-  const IV_LENGTH = 12;
-
-  const iv = crypto.randomBytes(IV_LENGTH);
   const secretKey = crypto.scryptSync(DB_ENCRYPTION_KEY, "sar-salt", 32);
-  const cipher = crypto.createCipheriv(ALGORITHM, secretKey, iv);
-
-  const encrypted = Buffer.concat([cipher.update(buffer), cipher.final()]);
-  const authTag = cipher.getAuthTag();
-
-  return Buffer.concat([iv, authTag, encrypted]);
+  return encryptAesGcmToBuffer(buffer, secretKey);
 }
 
 /**

@@ -11,6 +11,7 @@ export type ProviderName =
   | "orange"
   | "orange_madagascar"
   | "orange_guinea"
+  | "wave_senegal"
   | "sms_portal";
 export type ProviderStatus = "up" | "down";
 
@@ -77,6 +78,13 @@ export const DEFAULT_PROVIDERS: ProviderConfig[] = [
     pingUrl:
       process.env.ORANGE_GUINEA_HEALTH_URL ??
       "https://api.orange.com/orange-money-webpay/gn/v1/webpayment",
+    timeoutMs: DEFAULT_TIMEOUT_MS,
+  },
+  {
+    name: "wave_senegal",
+    pingUrl:
+      process.env.WAVE_SENEGAL_HEALTH_URL ??
+      `${process.env.WAVE_BASE_URL ?? "https://api.wave.com/v1"}/balance`,
     timeoutMs: DEFAULT_TIMEOUT_MS,
   },
 ];

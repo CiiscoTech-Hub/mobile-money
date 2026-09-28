@@ -11,7 +11,7 @@ import logger from "../../utils/logger";
  * - Fee bumping for sponsored transactions
  */
 
-import * as StellarSdk from "stellar-sdk";
+import * as StellarSdk from "@stellar/stellar-sdk";
 import {
   ChannelAccountsPool,
   initializeDefaultPool,

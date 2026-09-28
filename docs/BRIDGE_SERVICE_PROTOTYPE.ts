@@ -2,7 +2,7 @@
 // Bridge Service Prototype - Core orchestrator
 
 import { BigNumber } from "ethers";
-import { Asset, Keypair, Network, Server } from "stellar-sdk";
+import { Asset, Keypair, Network, Server } from "@stellar/stellar-sdk";
 import logger from "../../logger";
 import { BridgeTransaction, BridgeTransactionStatus } from "./types";
 import { StellarLockService } from "./stellarLockService";

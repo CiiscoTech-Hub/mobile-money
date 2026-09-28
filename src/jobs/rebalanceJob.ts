@@ -1,14 +1,14 @@
-import logger from "../../utils/logger";
+import logger from "../utils/logger";
 import {
   getRebalancePaymentService,
   getBalanceTracker,
   onBalanceHook,
   onRebalanceTriggerHook,
-} from "../../services/stellar/payments";
+} from "../services/stellar/payments";
 import type {
   BalanceSnapshot,
   RebalanceTrigger,
-} from "../../services/stellar/payments";
+} from "../services/stellar/payments";
 
 interface RebalanceJobConfig {
   cronSchedule: string;

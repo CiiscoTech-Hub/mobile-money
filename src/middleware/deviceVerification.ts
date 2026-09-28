@@ -19,7 +19,7 @@ export async function requireDeviceVerification(
   next: NextFunction,
 ): Promise<void> {
   const userId =
-    req.userId || (req as any).user?.id || (req as any).jwtUser?.userId;
+    (req as any).userId || (req as any).user?.id || (req as any).jwtUser?.userId;
 
   if (!userId) {
     // If no user ID, let the auth middleware handle it
@@ -62,7 +62,7 @@ export async function optionalDeviceVerification(
   next: NextFunction,
 ): Promise<void> {
   const userId =
-    req.userId || (req as any).user?.id || (req as any).jwtUser?.userId;
+    (req as any).userId || (req as any).user?.id || (req as any).jwtUser?.userId;
 
   if (!userId) {
     return next();

@@ -67,7 +67,7 @@ describe("Centralized Configuration System", () => {
   });
 
   test("all provider limits should be properly configured", () => {
-    const providers = ["mtn", "airtel", "orange"];
+    const providers = ["mtn", "airtel", "orange", "moovCoteDivoire"];
 
     providers.forEach((provider) => {
       const minAmount = getConfigValue(`providers.${provider}.minAmount`);
@@ -76,5 +76,15 @@ describe("Centralized Configuration System", () => {
       expect(minAmount).toBeGreaterThan(0);
       expect(maxAmount).toBeGreaterThan(minAmount);
     });
+  });
+
+  test("should configure Moov Côte d'Ivoire for XOF deposit pushes", () => {
+    expect(getConfigValue("providers.moovCoteDivoire.currency")).toBe("XOF");
+    expect(getConfigValue("providers.moovCoteDivoire.authPath")).toBe(
+      "/oauth/token",
+    );
+    expect(getConfigValue("providers.moovCoteDivoire.depositPushPath")).toBe(
+      "/payments/deposit",
+    );
   });
 });

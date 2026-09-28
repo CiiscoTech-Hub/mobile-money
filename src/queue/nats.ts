@@ -20,6 +20,58 @@ export const NATS_ACK_WAIT_MS = Math.max(
   parseInt(process.env.NATS_ACK_WAIT_MS || "30000", 10),
 );
 
+/**
+ * A fixed-capacity FIFO semaphore that bounds the number of in-flight
+ * message handlers to `capacity`.
+ *
+ * This replaces the previous `Set<Promise>` + `Promise.race` draining loop:
+ *
+ *  - Memory is strictly bounded — at most `capacity` handler promises are
+ *    ever in flight, so the consumer's queue buffer can never grow with the
+ *    message rate.
+ *  - Scheduling is O(1) acquire/release instead of an O(n) scan of the
+ *    in-flight set on every message (which is O(n²) under sustained load).
+ *  - Handoffs are FIFO, so no message is starved by newer arrivals.
+ */
+export class BoundedSemaphore {
+  private active = 0;
+  private readonly waiters: Array<() => void> = [];
+
+  constructor(private readonly capacity: number) {
+    if (!Number.isInteger(capacity) || capacity < 1) {
+      throw new Error("Semaphore capacity must be a positive integer");
+    }
+  }
+
+  acquire(): Promise<void> {
+    if (this.active < this.capacity) {
+      this.active += 1;
+      return Promise.resolve();
+    }
+    return new Promise<void>((resolve) => {
+      this.waiters.push(resolve);
+    });
+  }
+
+  release(): void {
+    const next = this.waiters.shift();
+    if (next) {
+      // Hand the freed slot directly to the longest-waiting consumer.
+      next();
+    } else {
+      this.active -= 1;
+    }
+  }
+
+  get pending(): number {
+    return this.waiters.length;
+  }
+
+  get inFlight(): number {
+    return this.active;
+  }
+}
+
 class NatsManager {
   private connection: NatsConnection | null = null;
   private sc = StringCodec();
@@ -55,43 +107,45 @@ class NatsManager {
     opts.ackWait(NATS_ACK_WAIT_MS);
     const subscription = await js.subscribe(subject, opts);
 
-    const activeMessages = new Set<Promise<void>>();
-
-    const drainActive = async (): Promise<void> => {
-      if (activeMessages.size < concurrency) {
-        return;
-      }
-      await Promise.race(activeMessages);
-    };
+    // Bounded in-flight buffer: at most `concurrency` handlers are processed
+    // at once, keeping the consumer's memory layout flat regardless of how
+    // fast messages arrive from JetStream.
+    const semaphore = new BoundedSemaphore(concurrency);
+    const inFlight = new Set<Promise<void>>();
 
     for await (const msg of subscription) {
-      await drainActive();
+      await semaphore.acquire();
 
       const handler = (async () => {
-        let payload: T;
-
         try {
-          payload = JSON.parse(this.sc.decode(msg.data)) as T;
-        } catch (error) {
-          logger.error("[NATS] Failed to parse message payload", error);
-          msg.term();
-          return;
-        }
+          let payload: T;
 
-        try {
-          await onMessage(payload, msg);
-          msg.ack();
-        } catch (error) {
-          logger.error("[NATS] Error processing message", error);
-          msg.nak();
+          try {
+            payload = JSON.parse(this.sc.decode(msg.data)) as T;
+          } catch (error) {
+            logger.error("[NATS] Failed to parse message payload", error);
+            msg.term();
+            return;
+          }
+
+          try {
+            await onMessage(payload, msg);
+            msg.ack();
+          } catch (error) {
+            logger.error("[NATS] Error processing message", error);
+            msg.nak();
+          }
+        } finally {
+          semaphore.release();
         }
       })();
 
-      activeMessages.add(handler);
-      handler.finally(() => activeMessages.delete(handler));
+      inFlight.add(handler);
+      handler.finally(() => inFlight.delete(handler));
     }
 
-    await Promise.all(activeMessages);
+    // Drain any handlers still in flight when the subscription ends.
+    await Promise.all(inFlight);
   }
 
   async close(): Promise<void> {

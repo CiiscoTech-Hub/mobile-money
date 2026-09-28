@@ -34,12 +34,94 @@ export interface User {
   idNumber?: string;
 }
 
+/**
+ * Raw `users` table row (snake_case columns as returned by Postgres).
+ * PII columns arrive encrypted and are decrypted in the mapping layer.
+ */
+export interface UsersTableRow {
+  id: string;
+  phone_number: string | null;
+  kyc_level: string;
+  preferred_language?: string | null;
+  language?: string | null;
+  email?: string | null;
+  display_name?: string | null;
+  two_factor_secret?: string | null;
+  backup_codes?: string[] | null;
+  status: string;
+  token_version?: number | null;
+  created_at: Date | string;
+  updated_at: Date | string;
+  sms_opt_out?: boolean | null;
+  mandatory_2fa_withdrawals?: boolean | null;
+  settlement_delay_days?: number | null;
+  first_name?: string | null;
+  last_name?: string | null;
+  address?: string | null;
+  date_of_birth?: string | null;
+  id_number?: string | null;
+}
+
+export interface AuditHistoryEntry {
+  id: string;
+  action: string;
+  oldStatus: string;
+  newStatus: string;
+  reason: string | null;
+  createdAt: Date;
+  ipAddress: string | null;
+  userAgent: string | null;
+  changedByUser: string | null;
+}
+
+function mapUserRow(row: UsersTableRow): User {
+  return {
+    id: row.id,
+    phoneNumber: (decryptField(row.phone_number) ||
+      decrypt(row.phone_number)) as string,
+    kycLevel: row.kyc_level,
+    preferredLanguage: row.preferred_language ?? row.language ?? undefined,
+    email: row.email
+      ? ((decryptField(row.email) || decrypt(row.email)) as string)
+      : undefined,
+    displayName: row.display_name ?? null,
+    two_factor_secret: row.two_factor_secret
+      ? ((decryptField(row.two_factor_secret) ||
+          decrypt(row.two_factor_secret)) as string)
+      : null,
+    backup_codes: row.backup_codes ?? null,
+    status: row.status as User["status"],
+    tokenVersion: row.token_version ?? 0,
+    createdAt: new Date(row.created_at),
+    updatedAt: new Date(row.updated_at),
+    smsOptOut: row.sms_opt_out ?? false,
+    mandatory2FAWithdrawals: row.mandatory_2fa_withdrawals ?? false,
+    settlementDelayDays: row.settlement_delay_days ?? undefined,
+    firstName: row.first_name
+      ? (decryptField(row.first_name) as string)
+      : undefined,
+    lastName: row.last_name
+      ? (decryptField(row.last_name) as string)
+      : undefined,
+    address: row.address ? (decryptField(row.address) as string) : undefined,
+    dateOfBirth: row.date_of_birth
+      ? (decryptField(row.date_of_birth) as string)
+      : undefined,
+    idNumber: row.id_number
+      ? (decryptField(row.id_number) as string)
+      : undefined,
+  };
+}
+
 export class UserModel {
   async findById(
     id: string,
     requester?: { id: string; role: string },
   ): Promise<User | null> {
-    const result = await queryRead("SELECT * FROM users WHERE id = $1", [id]);
+    const result = await queryRead<UsersTableRow>(
+      "SELECT * FROM users WHERE id = $1",
+      [id],
+    );
     if (result.rows.length === 0) return null;
 
     const row = result.rows[0];
@@ -57,10 +139,10 @@ export class UserModel {
       displayName: row.display_name ?? null,
       two_factor_secret: decrypt(row.two_factor_secret) ?? null,
       backup_codes: row.backup_codes ?? null,
-      status: row.status,
+      status: row.status as User["status"],
       tokenVersion: row.token_version ?? 0,
-      createdAt: row.created_at,
-      updatedAt: row.updated_at,
+      createdAt: new Date(row.created_at),
+      updatedAt: new Date(row.updated_at),
       smsOptOut: row.sms_opt_out ?? false,
       mandatory2FAWithdrawals: row.mandatory_2fa_withdrawals ?? false,
 
@@ -93,15 +175,24 @@ export class UserModel {
     idNumber?: string;
     status?: "active" | "frozen" | "suspended";
   }): Promise<User> {
-    const encryptedPhone = encryptField(data.phoneNumber) || encrypt(data.phoneNumber);
-    const encryptedEmail = data.email ? (encryptField(data.email) || encrypt(data.email)) : null;
-    const encryptedFirstName = data.firstName ? encryptField(data.firstName) : null;
-    const encryptedLastName = data.lastName ? encryptField(data.lastName) : null;
+    const encryptedPhone =
+      encryptField(data.phoneNumber) || encrypt(data.phoneNumber);
+    const encryptedEmail = data.email
+      ? encryptField(data.email) || encrypt(data.email)
+      : null;
+    const encryptedFirstName = data.firstName
+      ? encryptField(data.firstName)
+      : null;
+    const encryptedLastName = data.lastName
+      ? encryptField(data.lastName)
+      : null;
     const encryptedAddress = data.address ? encryptField(data.address) : null;
-    const encryptedDOB = data.dateOfBirth ? encryptField(data.dateOfBirth) : null;
+    const encryptedDOB = data.dateOfBirth
+      ? encryptField(data.dateOfBirth)
+      : null;
     const encryptedIdNum = data.idNumber ? encryptField(data.idNumber) : null;
 
-    const result = await queryWrite(
+    const result = await queryWrite<UsersTableRow>(
       `INSERT INTO users (
         phone_number, kyc_level, email, first_name, last_name, address, date_of_birth, id_number, status
       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
@@ -119,23 +210,7 @@ export class UserModel {
       ],
     );
 
-    const row = result.rows[0];
-    return {
-      id: row.id,
-      phoneNumber: (decryptField(row.phone_number) || decrypt(row.phone_number)) as string,
-      kycLevel: row.kyc_level,
-      preferredLanguage: row.preferred_language ?? row.language ?? undefined,
-      email: row.email ? ((decryptField(row.email) || decrypt(row.email)) as string) : undefined,
-      status: row.status,
-      tokenVersion: row.token_version ?? 0,
-      createdAt: row.created_at,
-      updatedAt: row.updated_at,
-      firstName: row.first_name ? (decryptField(row.first_name) as string) : undefined,
-      lastName: row.last_name ? (decryptField(row.last_name) as string) : undefined,
-      address: row.address ? (decryptField(row.address) as string) : undefined,
-      dateOfBirth: row.date_of_birth ? (decryptField(row.date_of_birth) as string) : undefined,
-      idNumber: row.id_number ? (decryptField(row.id_number) as string) : undefined,
-    };
+    return mapUserRow(result.rows[0]);
   }
 
   async updateEmail(id: string, email: string): Promise<void> {
@@ -167,7 +242,7 @@ export class UserModel {
     },
   ): Promise<void> {
     const fields: string[] = [];
-    const values: any[] = [];
+    const values: (string | null)[] = [];
     let paramIdx = 1;
 
     if (data.firstName !== undefined) {
@@ -221,7 +296,10 @@ export class UserModel {
       // Update user status
       const updateQuery =
         "UPDATE users SET status = $1 WHERE id = $2 RETURNING *";
-      const result = await client.query(updateQuery, [status, id]);
+      const result = await client.query<UsersTableRow>(updateQuery, [
+        status,
+        id,
+      ]);
 
       if (result.rows.length === 0) {
         await client.query("ROLLBACK");
@@ -258,22 +336,7 @@ export class UserModel {
       await client.query("COMMIT");
 
       // Return updated user
-      const row = result.rows[0];
-      return {
-        id: row.id,
-        phoneNumber: decrypt(row.phone_number) as string,
-        kycLevel: row.kyc_level,
-        preferredLanguage: row.preferred_language ?? row.language ?? undefined,
-        email: decrypt(row.email) as string,
-        displayName: row.display_name ?? null,
-        two_factor_secret: decrypt(row.two_factor_secret) ?? null,
-        backup_codes: row.backup_codes ?? null,
-        status: row.status,
-        createdAt: row.created_at,
-        updatedAt: row.updated_at,
-        smsOptOut: row.sms_opt_out ?? false,
-        settlementDelayDays: row.settlement_delay_days ?? 0,
-      };
+      return mapUserRow(result.rows[0]);
     } catch (error) {
       await client.query("ROLLBACK");
       throw error;
@@ -282,7 +345,7 @@ export class UserModel {
     }
   }
 
-  async getAuditHistory(userId: string): Promise<any[]> {
+  async getAuditHistory(userId: string): Promise<AuditHistoryEntry[]> {
     const query = `
       SELECT 
         a.id,
@@ -300,7 +363,7 @@ export class UserModel {
       ORDER BY a.created_at DESC
     `;
 
-    const result = await queryRead(query, [userId]);
+    const result = await queryRead<AuditHistoryEntry>(query, [userId]);
     return result.rows;
   }
   async incrementTokenVersion(id: string): Promise<number> {

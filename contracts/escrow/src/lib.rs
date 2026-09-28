@@ -1,7 +1,9 @@
 #![no_std]
 #![allow(clippy::too_many_arguments)]
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, Env};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env, Vec,
+};
 
 mod storage;
 use storage::ESCROW;
@@ -34,6 +36,12 @@ pub enum EscrowError {
     InvalidBeneficiary = 8,
     /// Arbiter address must differ from both depositor and beneficiary.
     InvalidArbiter = 9,
+    /// Upgrade attempted without admin signers configured.
+    UpgradeNotConfigured = 10,
+    /// A signer passed to `upgrade` is not in the approved admin list.
+    InvalidAdminSigner = 11,
+    /// Not enough valid admin signatures to authorise the upgrade.
+    InsufficientAdminSignatures = 12,
 }
 
 // ── State ────────────────────────────────────────────────────────────────────
@@ -57,15 +65,26 @@ pub struct EscrowState {
     pub fee_bps: u32,
     pub fee_recipient: Address,
     pub released: bool,
+    /// Approved addresses that may co-sign a contract upgrade.
+    pub admin_signers: Vec<Address>,
+    /// Minimum number of admin signatures required to perform an upgrade.
+    pub required_admin_signatures: u32,
 }
 
 impl EscrowState {
     /// Compute (fee_amount, net_beneficiary_amount).
-    pub fn split(&self) -> (i128, i128) {
-        let fee = self.amount * self.fee_bps as i128 / 10_000;
-        let net = self.amount - fee;
-        (fee, net)
+    pub fn split(&self) -> Option<(i128, i128)> {
+        let fee = self
+            .amount
+            .checked_mul(self.fee_bps as i128)?
+            .checked_div(10_000)?;
+        let net = self.amount.checked_sub(fee)?;
+        Some((fee, net))
     }
+}
+
+fn ensure_trustline(env: &Env, token: &Address, recipient: &Address) {
+    token::StellarAssetClient::new(env, token).trust(recipient);
 }
 
 // ── Contract ─────────────────────────────────────────────────────────────────
@@ -80,10 +99,12 @@ impl EscrowContract {
     /// Initialise escrow. The depositor must authorise this call; `amount`
     /// tokens are pulled from the depositor into the contract.
     ///
-    /// * `lock_until_ledger` – ledger after which the depositor may self-refund
+    /// * `lock_until_ledger`          – ledger after which the depositor may self-refund
     ///   without the arbiter. Pass `0` to disable self-refund entirely.
-    /// * `fee_bps`           – protocol fee in basis points (0–10 000).
-    /// * `fee_recipient`     – receives the fee portion on release.
+    /// * `fee_bps`                    – protocol fee in basis points (0–10 000).
+    /// * `fee_recipient`              – receives the fee portion on release.
+    /// * `admin_signers`              – approved addresses for multi-sig upgrades (empty = upgrades disabled).
+    /// * `required_admin_signatures`  – minimum cosigners needed for an upgrade.
     pub fn initialize(
         env: Env,
         depositor: Address,
@@ -95,10 +116,16 @@ impl EscrowContract {
         lock_until_ledger: u32,
         fee_bps: u32,
         fee_recipient: Address,
+        admin_signers: Vec<Address>,
+        required_admin_signatures: u32,
     ) {
         depositor.require_auth();
 
         assert!(amount > 0, "amount must be positive");
+        assert!(
+            amount <= i128::MAX / 10_000,
+            "amount is too large to prevent fee overflow"
+        );
 
         assert!(
             !env.storage().instance().has(&ESCROW),
@@ -121,6 +148,13 @@ impl EscrowContract {
             arbiter != depositor && arbiter != beneficiary,
             "arbiter must differ from depositor and beneficiary"
         );
+
+        if !admin_signers.is_empty() {
+            assert!(
+                required_admin_signatures > 0 && required_admin_signatures <= admin_signers.len(),
+                "required_admin_signatures must be between 1 and number of admin signers"
+            );
+        }
 
         // Dynamic token support:
         // Any Stellar asset can be passed through the token address.
@@ -147,10 +181,53 @@ impl EscrowContract {
                 fee_bps,
                 fee_recipient,
                 released: false,
+                admin_signers,
+                required_admin_signatures,
             },
         );
 
         env.storage().instance().extend_ttl(1000, 10000);
+    }
+
+    // ── upgrade ───────────────────────────────────────────────────────────────
+
+    /// Upgrade the contract WASM. Requires at least `required_admin_signatures`
+    /// valid admin signatures. All signers passed must be in the approved list.
+    pub fn upgrade(
+        env: Env,
+        new_wasm_hash: BytesN<32>,
+        admin_signers: Vec<Address>,
+    ) -> Result<(), EscrowError> {
+        let state: EscrowState = env
+            .storage()
+            .instance()
+            .get(&ESCROW)
+            .ok_or(EscrowError::NotInitialised)?;
+
+        if state.admin_signers.is_empty() {
+            return Err(EscrowError::UpgradeNotConfigured);
+        }
+
+        let mut valid_sig_count = 0u32;
+        for signer in admin_signers.iter() {
+            let is_approved = state
+                .admin_signers
+                .iter()
+                .any(|approved| approved == signer);
+            if !is_approved {
+                return Err(EscrowError::InvalidAdminSigner);
+            }
+            signer.require_auth();
+            valid_sig_count += 1;
+        }
+
+        if valid_sig_count < state.required_admin_signatures {
+            return Err(EscrowError::InsufficientAdminSignatures);
+        }
+
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+
+        Ok(())
     }
 
     // ── release ───────────────────────────────────────────────────────────────
@@ -176,9 +253,11 @@ impl EscrowContract {
 
         let tc = token::Client::new(&env, &state.token);
         let contract_addr = env.current_contract_address();
-        let (fee, net) = state.split();
+        let (fee, net) = state.split().ok_or(EscrowError::InvalidAmount)?;
 
+        ensure_trustline(&env, &state.token, &state.beneficiary);
         if fee > 0 {
+            ensure_trustline(&env, &state.token, &state.fee_recipient);
             tc.transfer(&contract_addr, &state.fee_recipient, &fee);
         }
         tc.transfer(&contract_addr, &state.beneficiary, &net);
@@ -300,11 +379,12 @@ impl EscrowContract {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use super::*;
     use soroban_sdk::{
-        testutils::{Address as _, Ledger},
+        testutils::{Address as _, Ledger, MockAuth, MockAuthInvoke},
         token::{Client as TokenClient, StellarAssetClient},
-        Address, Env,
+        Address, Bytes, Env, IntoVal,
     };
 
     const MINT_AMOUNT: i128 = 1_000_000;
@@ -345,7 +425,7 @@ mod tests {
         )
     }
 
-    // Helper: initialise with common defaults
+    // Helper: initialise with common defaults (no admin signers)
     #[allow(clippy::too_many_arguments)]
     fn init(
         client: &EscrowContractClient,
@@ -358,6 +438,8 @@ mod tests {
         fee_bps: u32,
         fee_recipient: &Address,
     ) {
+        let env = &client.env;
+        let admin_signers: Vec<Address> = Vec::new(env);
         client.initialize(
             depositor,
             beneficiary,
@@ -368,7 +450,55 @@ mod tests {
             &lock_until_ledger,
             &fee_bps,
             fee_recipient,
+            &admin_signers,
+            &0,
         );
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn setup_without_mock_auths() -> (
+        Env,
+        Address,
+        Address,
+        Address,
+        Address,
+        Address,
+        EscrowContractClient<'static>,
+    ) {
+        let env = Env::default();
+
+        let depositor = Address::generate(&env);
+        let beneficiary = Address::generate(&env);
+        let arbiter = Address::generate(&env);
+        let fee_recipient = Address::generate(&env);
+
+        let token_admin = Address::generate(&env);
+        let token_id = env.register_stellar_asset_contract_v2(token_admin.clone());
+        let token = token_id.address();
+        let sac = StellarAssetClient::new(&env, &token);
+        sac.mock_auths(&[MockAuth {
+            address: &token_admin,
+            invoke: &MockAuthInvoke {
+                contract: &sac.address,
+                fn_name: "mint",
+                args: (&depositor, MINT_AMOUNT).into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .mint(&depositor, &MINT_AMOUNT);
+
+        let contract_id = env.register(EscrowContract, ());
+        let client = EscrowContractClient::new(&env, &contract_id);
+
+        (
+            env,
+            depositor,
+            beneficiary,
+            arbiter,
+            fee_recipient,
+            token,
+            client,
+        )
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -383,6 +513,7 @@ mod tests {
 
         env.ledger().set_timestamp(100);
 
+        let admin_signers: Vec<Address> = Vec::new(&env);
         client.initialize(
             &depositor,
             &beneficiary,
@@ -393,6 +524,8 @@ mod tests {
             &100, // lock_until_ledger
             &0,   // fee_bps
             &fee_recipient,
+            &admin_signers,
+            &0,
         );
 
         let state = client.get_state();
@@ -470,6 +603,7 @@ mod tests {
 
         env.ledger().set_timestamp(100);
 
+        let admin_signers: Vec<Address> = Vec::new(&env);
         client.initialize(
             &depositor,
             &beneficiary,
@@ -480,6 +614,8 @@ mod tests {
             &100, // lock_until_ledger
             &0,   // fee_bps
             &fee_recipient,
+            &admin_signers,
+            &0,
         );
         client.refund();
 
@@ -495,6 +631,7 @@ mod tests {
 
         env.ledger().set_timestamp(100);
 
+        let admin_signers: Vec<Address> = Vec::new(&env);
         client.initialize(
             &depositor,
             &beneficiary,
@@ -505,6 +642,8 @@ mod tests {
             &100, // lock_until_ledger
             &0,   // fee_bps
             &fee_recipient,
+            &admin_signers,
+            &0,
         );
 
         env.ledger().set_timestamp(emergency_unlock_timestamp);
@@ -514,5 +653,320 @@ mod tests {
         let token_client = TokenClient::new(&env, &token);
         assert_eq!(token_client.balance(&depositor), MINT_AMOUNT);
         assert!(client.get_state().released);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 2. Trustline / auth tests (from upstream)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_release_reverts_without_beneficiary_trustline_auth() {
+        let (env, depositor, beneficiary, arbiter, fee_recipient, token, client) =
+            setup_without_mock_auths();
+        let amount: i128 = 500_000;
+        let fee_bps: u32 = 250;
+        let emergency_unlock_timestamp = 1_000_u64;
+        let lock_until_ledger = 100_u32;
+
+        env.ledger().set_timestamp(100);
+
+        let admin_signers: Vec<Address> = Vec::new(&env);
+        client
+            .mock_auths(&[MockAuth {
+                address: &depositor,
+                invoke: &MockAuthInvoke {
+                    contract: &client.address,
+                    fn_name: "initialize",
+                    args: (
+                        &depositor,
+                        &beneficiary,
+                        &arbiter,
+                        &token,
+                        amount,
+                        emergency_unlock_timestamp,
+                        lock_until_ledger,
+                        fee_bps,
+                        &fee_recipient,
+                        &admin_signers,
+                        0_u32,
+                    )
+                        .into_val(&env),
+                    sub_invokes: &[MockAuthInvoke {
+                        contract: &token,
+                        fn_name: "transfer",
+                        args: (&depositor, &client.address, amount).into_val(&env),
+                        sub_invokes: &[],
+                    }],
+                },
+            }])
+            .initialize(
+                &depositor,
+                &beneficiary,
+                &arbiter,
+                &token,
+                &amount,
+                &emergency_unlock_timestamp,
+                &lock_until_ledger,
+                &fee_bps,
+                &fee_recipient,
+                &admin_signers,
+                &0,
+            );
+
+        let release_result = client
+            .mock_auths(&[MockAuth {
+                address: &arbiter,
+                invoke: &MockAuthInvoke {
+                    contract: &client.address,
+                    fn_name: "release",
+                    args: ().into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_release();
+
+        assert!(release_result.is_ok());
+
+        let state = client.get_state();
+        assert!(state.released);
+
+        let token_client = TokenClient::new(&env, &token);
+        let expected_fee = amount * fee_bps as i128 / 10_000;
+        let expected_net = amount - expected_fee;
+        assert_eq!(token_client.balance(&beneficiary), expected_net);
+        assert_eq!(token_client.balance(&fee_recipient), expected_fee);
+    }
+
+    #[test]
+    fn test_release_with_zero_fee_skips_fee_recipient_trustline_auth() {
+        let (env, depositor, beneficiary, arbiter, fee_recipient, token, client) =
+            setup_without_mock_auths();
+        let amount: i128 = 300_000;
+        let emergency_unlock_timestamp = 1_000_u64;
+        let lock_until_ledger = 50_u32;
+
+        env.ledger().set_timestamp(100);
+
+        let admin_signers: Vec<Address> = Vec::new(&env);
+        client
+            .mock_auths(&[MockAuth {
+                address: &depositor,
+                invoke: &MockAuthInvoke {
+                    contract: &client.address,
+                    fn_name: "initialize",
+                    args: (
+                        &depositor,
+                        &beneficiary,
+                        &arbiter,
+                        &token,
+                        amount,
+                        emergency_unlock_timestamp,
+                        lock_until_ledger,
+                        0_u32,
+                        &fee_recipient,
+                        &admin_signers,
+                        0_u32,
+                    )
+                        .into_val(&env),
+                    sub_invokes: &[MockAuthInvoke {
+                        contract: &token,
+                        fn_name: "transfer",
+                        args: (&depositor, &client.address, amount).into_val(&env),
+                        sub_invokes: &[],
+                    }],
+                },
+            }])
+            .initialize(
+                &depositor,
+                &beneficiary,
+                &arbiter,
+                &token,
+                &amount,
+                &emergency_unlock_timestamp,
+                &lock_until_ledger,
+                &0,
+                &fee_recipient,
+                &admin_signers,
+                &0,
+            );
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &arbiter,
+                invoke: &MockAuthInvoke {
+                    contract: &client.address,
+                    fn_name: "release",
+                    args: ().into_val(&env),
+                    sub_invokes: &[MockAuthInvoke {
+                        contract: &token,
+                        fn_name: "trust",
+                        args: (&beneficiary,).into_val(&env),
+                        sub_invokes: &[],
+                    }],
+                },
+            }])
+            .release();
+
+        let token_client = TokenClient::new(&env, &token);
+        assert_eq!(token_client.balance(&beneficiary), amount);
+        assert_eq!(token_client.balance(&fee_recipient), 0);
+        assert!(client.get_state().released);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 3. Upgrade tests (our branch)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_upgrade_happy_path() {
+        let (env, depositor, beneficiary, arbiter, fee_recipient, token, client) = setup();
+        let amount: i128 = 500_000;
+        env.ledger().set_timestamp(100);
+
+        let admin1 = Address::generate(&env);
+        let admin2 = Address::generate(&env);
+        let admin3 = Address::generate(&env);
+
+        let mut admin_signers: Vec<Address> = Vec::new(&env);
+        admin_signers.push_back(admin1.clone());
+        admin_signers.push_back(admin2.clone());
+        admin_signers.push_back(admin3.clone());
+
+        client.initialize(
+            &depositor,
+            &beneficiary,
+            &arbiter,
+            &token,
+            &amount,
+            &1_000,
+            &100,
+            &0,
+            &fee_recipient,
+            &admin_signers,
+            &2,
+        );
+
+        let dummy_wasm = Bytes::new(&env);
+        let new_wasm_hash = env.deployer().upload_contract_wasm(dummy_wasm);
+
+        let mut upgrade_signers: Vec<Address> = Vec::new(&env);
+        upgrade_signers.push_back(admin1);
+        upgrade_signers.push_back(admin2);
+
+        client.upgrade(&new_wasm_hash, &upgrade_signers);
+    }
+
+    #[test]
+    fn test_upgrade_without_admin_config_fails() {
+        let (env, depositor, beneficiary, arbiter, fee_recipient, token, client) = setup();
+        let amount: i128 = 500_000;
+        env.ledger().set_timestamp(100);
+
+        let admin_signers: Vec<Address> = Vec::new(&env);
+        client.initialize(
+            &depositor,
+            &beneficiary,
+            &arbiter,
+            &token,
+            &amount,
+            &1_000,
+            &100,
+            &0,
+            &fee_recipient,
+            &admin_signers,
+            &0,
+        );
+
+        let dummy_wasm = Bytes::new(&env);
+        let new_wasm_hash = env.deployer().upload_contract_wasm(dummy_wasm);
+
+        let upgrade_signers: Vec<Address> = Vec::new(&env);
+        let res = client.try_upgrade(&new_wasm_hash, &upgrade_signers);
+        assert_eq!(res, Err(Ok(EscrowError::UpgradeNotConfigured)));
+    }
+
+    #[test]
+    fn test_upgrade_unapproved_signer_fails() {
+        let (env, depositor, beneficiary, arbiter, fee_recipient, token, client) = setup();
+        let amount: i128 = 500_000;
+        env.ledger().set_timestamp(100);
+
+        let admin1 = Address::generate(&env);
+        let unapproved = Address::generate(&env);
+
+        let mut admin_signers: Vec<Address> = Vec::new(&env);
+        admin_signers.push_back(admin1);
+
+        client.initialize(
+            &depositor,
+            &beneficiary,
+            &arbiter,
+            &token,
+            &amount,
+            &1_000,
+            &100,
+            &0,
+            &fee_recipient,
+            &admin_signers,
+            &1,
+        );
+
+        let dummy_wasm = Bytes::new(&env);
+        let new_wasm_hash = env.deployer().upload_contract_wasm(dummy_wasm);
+
+        let mut upgrade_signers: Vec<Address> = Vec::new(&env);
+        upgrade_signers.push_back(unapproved);
+
+        let res = client.try_upgrade(&new_wasm_hash, &upgrade_signers);
+        assert_eq!(res, Err(Ok(EscrowError::InvalidAdminSigner)));
+    }
+
+    #[test]
+    fn test_upgrade_insufficient_signatures_fails() {
+        let (env, depositor, beneficiary, arbiter, fee_recipient, token, client) = setup();
+        let amount: i128 = 500_000;
+        env.ledger().set_timestamp(100);
+
+        let admin1 = Address::generate(&env);
+        let admin2 = Address::generate(&env);
+
+        let mut admin_signers: Vec<Address> = Vec::new(&env);
+        admin_signers.push_back(admin1.clone());
+        admin_signers.push_back(admin2);
+
+        client.initialize(
+            &depositor,
+            &beneficiary,
+            &arbiter,
+            &token,
+            &amount,
+            &1_000,
+            &100,
+            &0,
+            &fee_recipient,
+            &admin_signers,
+            &2,
+        );
+
+        let dummy_wasm = Bytes::new(&env);
+        let new_wasm_hash = env.deployer().upload_contract_wasm(dummy_wasm);
+
+        let mut upgrade_signers: Vec<Address> = Vec::new(&env);
+        upgrade_signers.push_back(admin1);
+
+        let res = client.try_upgrade(&new_wasm_hash, &upgrade_signers);
+        assert_eq!(res, Err(Ok(EscrowError::InsufficientAdminSignatures)));
+    }
+
+    #[test]
+    fn test_upgrade_before_initialize_fails() {
+        let (env, _depositor, _beneficiary, _arbiter, _fee_recipient, _token, client) = setup();
+
+        let dummy_wasm = Bytes::new(&env);
+        let new_wasm_hash = env.deployer().upload_contract_wasm(dummy_wasm);
+
+        let upgrade_signers: Vec<Address> = Vec::new(&env);
+        let res = client.try_upgrade(&new_wasm_hash, &upgrade_signers);
+        assert_eq!(res, Err(Ok(EscrowError::NotInitialised)));
     }
 }

@@ -1,6 +1,6 @@
 import logger from "../utils/logger";
 import { Worker, Job } from "bullmq";
-import * as StellarSdk from "stellar-sdk";
+import * as StellarSdk from "@stellar/stellar-sdk";
 import { queueOptions } from "./config";
 import {
   AccountMergeJobData,

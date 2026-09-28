@@ -94,11 +94,12 @@ export const validateVersionMiddleware: RequestHandler = (req, res, next) => {
   const apiVersion = versionedReq.apiVersion || CURRENT_VERSION;
 
   if (!SUPPORTED_VERSIONS.includes(apiVersion)) {
-    return res.status(400).json({
+    res.status(400).json({
       error: "Unsupported API Version",
       message: `API version ${apiVersion} is not supported. Supported versions: ${SUPPORTED_VERSIONS.join(", ")}`,
       supportedVersions: SUPPORTED_VERSIONS,
     });
+    return;
   }
 
   // Check if version is deprecated

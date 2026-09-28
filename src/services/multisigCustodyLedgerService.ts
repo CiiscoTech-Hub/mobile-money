@@ -30,15 +30,21 @@ export interface MultisigSigner {
   updated_at?: Date;
 }
 
+export type MultisigRequestType =
+  "transfer" | "issuance" | "vault_operation" | "withdrawal";
+
+export type MultisigRequestStatus =
+  "pending" | "approved" | "rejected" | "cancelled" | "expired" | "executed";
+
 export interface MultisigRequest {
   id?: string;
   config_id: string;
-  request_type: "transfer" | "issuance" | "vault_operation";
+  request_type: MultisigRequestType;
   account_id: string;
   amount_xaf: number;
   destination: string;
   metadata?: Record<string, unknown>;
-  status: "pending" | "approved" | "rejected" | "cancelled" | "expired";
+  status: MultisigRequestStatus;
   required_signatures: number;
   collected_signatures: number;
   expires_at: Date;
@@ -177,11 +183,59 @@ export class MultisigCustodyLedgerService {
   }
 
   /**
+   * Request an admin withdrawal from a custodial account. Unlike
+   * checkMultisigRequirement()'s cap-based gating (used for regular
+   * transfers), every admin withdrawal always requires an active
+   * multi-sig configuration — there is no "below the cap, execute
+   * immediately" path. If no active config exists for the account, the
+   * withdrawal is rejected rather than silently allowed to proceed
+   * unprotected.
+   */
+  async requestWithdrawal(
+    accountType: "escrow" | "issuance" | "vault",
+    accountId: string,
+    amountXaf: number,
+    destination: string,
+    createdBy: string,
+    metadata?: Record<string, unknown>,
+  ): Promise<MultisigRequest> {
+    const config = await this.getMultisigConfig(accountType, accountId);
+    if (!config) {
+      throw new Error(
+        `No active multi-sig configuration for ${accountType}/${accountId} — admin withdrawals require one`,
+      );
+    }
+
+    if (amountXaf > config.per_transaction_cap_xaf) {
+      throw new Error(
+        `Amount ${amountXaf} XAF exceeds per-transaction cap of ${config.per_transaction_cap_xaf} XAF`,
+      );
+    }
+
+    const dailyTotal = await this.getDailyTotal(accountType, accountId);
+    if (dailyTotal + amountXaf > config.daily_cap_xaf) {
+      throw new Error(
+        `Withdrawal would exceed daily cap of ${config.daily_cap_xaf} XAF (current: ${dailyTotal} XAF)`,
+      );
+    }
+
+    return this.createApprovalRequest(
+      config.id!,
+      "withdrawal",
+      accountId,
+      amountXaf,
+      destination,
+      createdBy,
+      metadata,
+    );
+  }
+
+  /**
    * Create a multi-sig approval request
    */
   async createApprovalRequest(
     configId: string,
-    requestType: "transfer" | "issuance" | "vault_operation",
+    requestType: MultisigRequestType,
     accountId: string,
     amountXaf: number,
     destination: string,
@@ -266,8 +320,7 @@ export class MultisigCustodyLedgerService {
       };
     }
 
-    // Get config and signers
-    const config = await this.getConfigById(request.config_id);
+    // Get signers
     const signers = await this.getSigners(request.config_id);
 
     // Verify signer is authorized
@@ -467,17 +520,6 @@ export class MultisigCustodyLedgerService {
     accountType: string,
     accountId: string,
   ): Promise<number> {
-    const query = `
-      SELECT COALESCE(SUM(amount_xaf), 0) as total
-      FROM multisig_requests
-      WHERE account_type = $1
-        AND account_id = $2
-        AND status IN ('approved', 'executed')
-        AND created_at >= CURRENT_DATE
-    `;
-
-    // Note: This query assumes account_type is stored in the request or we join with config
-    // For now, we'll use a simplified version
     const result = await pool.query(
       `
       SELECT COALESCE(SUM(amount_xaf), 0) as total

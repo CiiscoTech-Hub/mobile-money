@@ -1,6 +1,6 @@
 import logger from "../utils/logger";
 /**
- * Database Backup Service (Issue #553)
+ * Database Backup Service (Issue #1867)
  *
  * Provides automated daily snapshots of the production database with encryption
  * and S3 storage. Implements 30-day retention with automatic cleanup.
@@ -26,6 +26,11 @@ import {
   GetObjectCommand,
   HeadObjectCommand,
 } from "@aws-sdk/client-s3";
+import {
+  AES_GCM_ALGORITHM,
+  encryptAesGcmToBuffer,
+  decryptAesGcmFromBuffer,
+} from "../crypto/aesGcm";
 import { pool } from "../config/database";
 import { env } from "../config/env";
 
@@ -35,12 +40,31 @@ const fsUnlink = promisify(fs.unlink);
 // ─── Configuration ────────────────────────────────────────────────────────
 
 const BACKUP_BUCKET = process.env.BACKUP_BUCKET || "mobile-money-backups";
-const BACKUP_RETENTION_DAYS = 30;
-const ENCRYPTION_ALGORITHM = "aes-256-gcm";
-const IV_LENGTH = 12; // 96-bit IV for GCM
-const AUTH_TAG_LENGTH = 16; // 128-bit auth tag
+const BACKUP_RETENTION_DAYS = parsePositiveInteger(
+  process.env.BACKUP_RETENTION_DAYS,
+  30,
+);
 const TEMP_BACKUP_DIR = process.env.TEMP_BACKUP_DIR || "/tmp/backups";
-const MAX_BACKUP_SIZE_GB = 10; // Fail if backup exceeds this size
+const MAX_BACKUP_SIZE_GB = parsePositiveNumber(
+  process.env.MAX_BACKUP_SIZE_GB,
+  10,
+);
+
+function parsePositiveInteger(
+  value: string | undefined,
+  fallback: number,
+): number {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function parsePositiveNumber(
+  value: string | undefined,
+  fallback: number,
+): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
 
 // ─── Types ────────────────────────────────────────────────────────────────
 
@@ -92,20 +116,13 @@ function deriveBackupKey(): Buffer {
 /**
  * Encrypts a backup dump using AES-256-GCM.
  * Returns buffer: [IV (12 bytes)][AuthTag (16 bytes)][EncryptedData]
+ * (format produced by the canonical encryptAesGcmToBuffer in src/crypto/aesGcm.ts)
  *
  * @param dumpBuffer The pg_dump output as a buffer
  * @returns Encrypted buffer with IV and auth tag prepended
  */
 export function encryptBackup(dumpBuffer: Buffer): Buffer {
-  const key = deriveBackupKey();
-  const iv = crypto.randomBytes(IV_LENGTH);
-
-  const cipher = crypto.createCipheriv(ENCRYPTION_ALGORITHM, key, iv);
-  const encrypted = Buffer.concat([cipher.update(dumpBuffer), cipher.final()]);
-  const authTag = cipher.getAuthTag();
-
-  // Format: [IV][AuthTag][EncryptedData]
-  return Buffer.concat([iv, authTag, encrypted]);
+  return encryptAesGcmToBuffer(dumpBuffer, deriveBackupKey());
 }
 
 /**
@@ -115,17 +132,7 @@ export function encryptBackup(dumpBuffer: Buffer): Buffer {
  * @returns Decrypted pg_dump output
  */
 export function decryptBackup(encryptedBuffer: Buffer): Buffer {
-  const key = deriveBackupKey();
-
-  // Extract IV and auth tag
-  const iv = encryptedBuffer.slice(0, IV_LENGTH);
-  const authTag = encryptedBuffer.slice(IV_LENGTH, IV_LENGTH + AUTH_TAG_LENGTH);
-  const encryptedData = encryptedBuffer.slice(IV_LENGTH + AUTH_TAG_LENGTH);
-
-  const decipher = crypto.createDecipheriv(ENCRYPTION_ALGORITHM, key, iv);
-  decipher.setAuthTag(authTag);
-
-  return Buffer.concat([decipher.update(encryptedData), decipher.final()]);
+  return decryptAesGcmFromBuffer(encryptedBuffer, deriveBackupKey());
 }
 
 /**
@@ -287,7 +294,7 @@ export async function createBackup(): Promise<BackupResult> {
       size: dumpStats.size,
       compressed: false,
       encrypted: true,
-      algorithm: ENCRYPTION_ALGORITHM,
+      algorithm: AES_GCM_ALGORITHM,
       retention_days: BACKUP_RETENTION_DAYS,
       checksum,
     };

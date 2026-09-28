@@ -31,12 +31,14 @@ export async function runSubscriptionJob(): Promise<void> {
       const phoneNumber = phoneEncrypted
         ? decrypt(String(phoneEncrypted))
         : null;
+      const metadataProvider =
+        typeof s.metadata?.provider === "string" ? s.metadata.provider : "";
       const tx = await transactionModel.create({
         type: "deposit",
         amount: s.amount,
         currency: s.currency,
         phoneNumber: phoneNumber,
-        provider: (s.metadata && s.metadata.provider) || "",
+        provider: metadataProvider,
         status: "pending",
         userId: s.user_id ?? null,
         metadata: { subscription_id: s.id },
@@ -52,7 +54,7 @@ export async function runSubscriptionJob(): Promise<void> {
         type: "deposit",
         amount: String(s.amount),
         phoneNumber: tx.phoneNumber || "",
-        provider: tx.provider || (s.metadata && s.metadata.provider) || "",
+        provider: tx.provider || metadataProvider,
         stellarAddress: tx.stellarAddress || "",
       });
 

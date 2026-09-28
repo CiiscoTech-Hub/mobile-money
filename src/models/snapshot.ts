@@ -19,9 +19,19 @@ export interface DailySnapshotInput {
   transactionCount: number;
 }
 
+export interface DailySnapshotRow {
+  snapshotDate: string;
+  totalMainBalance: string;
+  totalVaultBalance: string;
+  totalBalance: string;
+  dailyVolume: string;
+  transactionCount: number;
+  createdAt?: Date;
+}
+
 export class SnapshotModel {
   async create(data: DailySnapshotInput): Promise<DailySnapshot> {
-    const result = await queryWrite(
+    const result = await queryWrite<DailySnapshotRow>(
       `INSERT INTO daily_snapshots (
          snapshot_date, total_main_balance, total_vault_balance, 
          total_balance, daily_volume, transaction_count
@@ -56,7 +66,7 @@ export class SnapshotModel {
   }
 
   async getByDate(date: string): Promise<DailySnapshot | null> {
-    const result = await queryRead(
+    const result = await queryRead<DailySnapshotRow>(
       `SELECT 
          snapshot_date AS "snapshotDate",
          total_main_balance::text AS "totalMainBalance",
@@ -74,7 +84,7 @@ export class SnapshotModel {
   }
 
   async getLatest(limit = 7): Promise<DailySnapshot[]> {
-    const result = await queryRead(
+    const result = await queryRead<DailySnapshotRow>(
       `SELECT 
          snapshot_date AS "snapshotDate",
          total_main_balance::text AS "totalMainBalance",

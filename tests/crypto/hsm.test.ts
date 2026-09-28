@@ -6,7 +6,7 @@ import {
   Asset,
   Operation,
   Account,
-} from "stellar-sdk";
+} from "@stellar/stellar-sdk";
 import hsm, {
   LocalSigner,
   KmsAsymmetricSigner,
@@ -71,7 +71,8 @@ describe("HSM Client Wrapper Interfaces", () => {
       const tx = buildTestTransaction();
       const result = await signer.signTransaction(tx);
 
-      expect(result.hash).toBe(tx.hash().toString("hex"));
+      // v17 `hash()` returns a Uint8Array; wrap in Buffer for hex
+      expect(result.hash).toBe(Buffer.from(tx.hash()).toString("hex"));
       expect(tx.signatures.length).toBe(1);
 
       // Verify the signature on the transaction
@@ -129,7 +130,7 @@ describe("HSM Client Wrapper Interfaces", () => {
       const signer = new KmsAsymmetricSigner({ kmsKeyId: "mock-arn" });
       const result = await signer.signTransaction(tx);
 
-      expect(result.hash).toBe(txHash.toString("hex"));
+      expect(result.hash).toBe(Buffer.from(txHash).toString("hex"));
       expect(tx.signatures.length).toBe(1);
 
       // Verify sign call parameters
@@ -187,7 +188,7 @@ describe("HSM Client Wrapper Interfaces", () => {
       });
 
       const result = await signer.signTransaction(tx);
-      expect(result.hash).toBe(txHash.toString("hex"));
+      expect(result.hash).toBe(Buffer.from(txHash).toString("hex"));
       expect(tx.signatures.length).toBe(1);
     });
 

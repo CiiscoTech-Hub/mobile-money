@@ -7,15 +7,13 @@ import { gzip } from "zlib";
 import { promisify } from "util";
 import { Transaction, WebhookDeliveryUpdate } from "../models/transaction";
 import { enqueueWebhookRetry } from "../queue/webhookRetryQueue";
+import { signWebhookPayload } from "../crypto/webhookSigning";
 
 const gzipAsync = promisify(gzip);
 
 export type WebhookEvent = "transaction.completed" | "transaction.failed";
 export type WebhookDeliveryStatus =
-  | "pending"
-  | "delivered"
-  | "failed"
-  | "skipped";
+  "pending" | "delivered" | "failed" | "skipped";
 
 export interface WebhookPayload {
   event: WebhookEvent;
@@ -24,10 +22,7 @@ export interface WebhookPayload {
 }
 
 export type WebhookOutboxStatus =
-  | "pending"
-  | "processing"
-  | "delivered"
-  | "failed";
+  "pending" | "processing" | "delivered" | "failed";
 
 export interface WebhookOutboxEntry {
   id: string;
@@ -88,11 +83,25 @@ interface WebhookServiceOptions {
   webhookSecret?: string;
   maxAttempts?: number;
   baseDelayMs?: number;
+  /**
+   * Per-request timeout for outbound webhook deliveries, in milliseconds.
+   * Applied via AbortController so a hung/unresponsive endpoint can't block
+   * the caller indefinitely — this matters most for processOutbox, where
+   * entries are delivered sequentially and one stuck connection would
+   * otherwise stall every entry behind it in the batch.
+   */
+  timeoutMs?: number;
   sleep?: (ms: number) => Promise<void>;
   now?: () => Date;
   logger?: WebhookLogger;
   /** When true, payloads are Gzip-compressed before sending (Content-Encoding: gzip) */
   compress?: boolean;
+  /**
+   * Stellar secret seed ("S...") or PEM-encoded Ed25519 private key. When
+   * set, outbound deliveries are cryptographically signed with Ed25519
+   * (`X-Webhook-Signature: ed25519=<hex>`) instead of HMAC-SHA256.
+   */
+  ed25519SigningKey?: string;
 }
 
 interface WebhookTransactionModel {
@@ -162,8 +171,10 @@ export class WebhookService {
   private readonly fetchImpl: typeof fetch;
   private readonly webhookUrl: string;
   private readonly webhookSecret: string;
+  private readonly ed25519SigningKey: string | undefined;
   private readonly maxAttempts: number;
   private readonly baseDelayMs: number;
+  private readonly timeoutMs: number;
   private readonly sleepImpl: (ms: number) => Promise<void>;
   private readonly now: () => Date;
   private readonly logger: WebhookLogger;
@@ -175,8 +186,11 @@ export class WebhookService {
     this.webhookUrl = options.webhookUrl ?? process.env.WEBHOOK_URL ?? "";
     this.webhookSecret =
       options.webhookSecret ?? process.env.WEBHOOK_SECRET ?? "";
+    this.ed25519SigningKey =
+      options.ed25519SigningKey ?? process.env.WEBHOOK_ED25519_SIGNING_KEY;
     this.maxAttempts = options.maxAttempts ?? 3;
     this.baseDelayMs = options.baseDelayMs ?? 500;
+    this.timeoutMs = options.timeoutMs ?? 10_000;
     this.sleepImpl = options.sleep ?? wait;
     this.now = options.now ?? (() => new Date());
     this.logger = options.logger ?? console;
@@ -220,10 +234,7 @@ export class WebhookService {
       provider: transaction.provider,
       stellar_address: transaction.stellarAddress,
       status: transaction.status as
-        | "pending"
-        | "completed"
-        | "failed"
-        | "cancelled",
+        "pending" | "completed" | "failed" | "cancelled",
       user_id: transaction.userId || undefined,
       notes: transaction.notes || undefined,
       tags: transaction.tags ? transaction.tags.join(",") : undefined,
@@ -246,8 +257,18 @@ export class WebhookService {
     return payload;
   }
 
+  /**
+   * Sign a payload for the `X-Webhook-Signature` header. Uses Ed25519
+   * (`ed25519=<hex>`) when `WEBHOOK_ED25519_SIGNING_KEY` is configured,
+   * otherwise falls back to HMAC-SHA256 (`sha256=<hex>`).
+   */
   signPayload(rawPayload: string): string {
-    return `sha256=${createHmac("sha256", this.webhookSecret).update(rawPayload).digest("hex")}`;
+    return signWebhookPayload(
+      rawPayload,
+      (payload) =>
+        `sha256=${createHmac("sha256", this.webhookSecret).update(payload).digest("hex")}`,
+      this.ed25519SigningKey,
+    ).signature;
   }
 
   async sendTransactionEvent(
@@ -463,6 +484,12 @@ export class WebhookService {
       const { body, extraHeaders } = await prepareBody(rawPayload, useCompress);
       const now = this.now();
 
+      const abortController = new AbortController();
+      const timeoutHandle = setTimeout(
+        () => abortController.abort(),
+        this.timeoutMs,
+      );
+
       try {
         const response = await this.fetchImpl(this.webhookUrl, {
           method: "POST",
@@ -472,6 +499,7 @@ export class WebhookService {
             ...extraHeaders,
           },
           body: body as any,
+          signal: abortController.signal,
         });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         this.logger.log(
@@ -523,6 +551,8 @@ export class WebhookService {
         this.logger.warn(
           `[webhook-outbox] Failed to deliver entry=${entry.id} attempt=${attempts}/${entry.maxAttempts}: ${errorMessage}`,
         );
+      } finally {
+        clearTimeout(timeoutHandle);
       }
     }
 

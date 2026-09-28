@@ -21,6 +21,14 @@ export interface RangeProof {
   bitProofs: any[]; // BitProof objects
 }
 
+export interface CommitmentSignatureContext {
+  applicantId: string;
+  proofType: string;
+  proofVersion: string;
+  issuedAt: string;
+  providerReference: string;
+}
+
 /**
  * Generate a ZK Range Proof that the committed value v satisfies: v >= threshold
  * We decompose delta = v - threshold into k bits.
@@ -169,6 +177,46 @@ export function verifyCommitmentSignature(
   try {
     const key = ec.keyFromPublic(publicKeyHex, "hex");
     const msg = `${commitmentHex}:${attributeType}`;
+    const msgHash = createHash("sha256").update(msg).digest();
+    return key.verify(msgHash, signatureHex);
+  } catch {
+    return false;
+  }
+}
+
+function serializeSignatureContext(
+  context: CommitmentSignatureContext,
+): string {
+  return [
+    context.applicantId,
+    context.proofType,
+    context.proofVersion,
+    context.issuedAt,
+    context.providerReference,
+  ].join(":");
+}
+
+export function signCommitmentEnvelope(
+  privateKeyHex: string,
+  commitmentHex: string,
+  context: CommitmentSignatureContext,
+): string {
+  const key = ec.keyFromPrivate(privateKeyHex, "hex");
+  const msg = `${commitmentHex}:${serializeSignatureContext(context)}`;
+  const msgHash = createHash("sha256").update(msg).digest();
+  const signature = key.sign(msgHash);
+  return signature.toDER("hex");
+}
+
+export function verifyCommitmentEnvelopeSignature(
+  publicKeyHex: string,
+  commitmentHex: string,
+  context: CommitmentSignatureContext,
+  signatureHex: string,
+): boolean {
+  try {
+    const key = ec.keyFromPublic(publicKeyHex, "hex");
+    const msg = `${commitmentHex}:${serializeSignatureContext(context)}`;
     const msgHash = createHash("sha256").update(msg).digest();
     return key.verify(msgHash, signatureHex);
   } catch {

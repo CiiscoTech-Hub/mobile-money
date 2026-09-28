@@ -84,7 +84,12 @@ export class EmailService {
     merchantDisplayName?: string | null,
   ): Promise<void> {
     const resolvedLocale = resolveLocale(locale);
-    const transactionHash = transaction.transactionHash;
+    // The Stellar hash lives inside transaction metadata
+    // (see worker.ts metadata.stellar.transactionHash).
+    const stellarMetadata = transaction.metadata?.stellar as
+      | { transactionHash?: string }
+      | undefined;
+    const transactionHash = stellarMetadata?.transactionHash;
     await this.sendEmail({
       to: email,
       templateId: this.resolveTemplateId(

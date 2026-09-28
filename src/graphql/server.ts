@@ -5,7 +5,6 @@ import {
   ApolloServerPluginLandingPageGraphQLPlayground,
   ApolloServerPluginLandingPageProductionDefault,
 } from "apollo-server-core";
-// @ts-expect-error ESM module
 import { makeExecutableSchema } from "@graphql-tools/schema";
 import { WebSocketServer } from "ws";
 import { useServer } from "graphql-ws/use/ws";

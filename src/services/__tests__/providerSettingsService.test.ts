@@ -224,6 +224,90 @@ describe("ProviderSettingsService — Cache Invalidation Strategy", () => {
   });
 
   // -------------------------------------------------------------------------
+  // 3b. setProviderEnabled() — manual failover toggle (#1550)
+  // -------------------------------------------------------------------------
+
+  describe("setProviderEnabled() — manual failover toggle", () => {
+    it("disables a provider and records who disabled it and why", async () => {
+      const disabledAt = new Date();
+      const updated = makeSettings({
+        provider_name: "airtel",
+        is_enabled: false,
+        disabled_reason: "Unplanned outage",
+        disabled_by: "admin-1",
+        disabled_at: disabledAt,
+      });
+      mockedPool.query.mockResolvedValueOnce({ rows: [updated] } as any);
+      mockedCache.del.mockResolvedValue(undefined);
+      mockedCache.set.mockResolvedValue(undefined);
+
+      const result = await service.setProviderEnabled(
+        "airtel",
+        false,
+        "admin-1",
+        "Unplanned outage",
+      );
+
+      expect(result.is_enabled).toBe(false);
+      expect(result.disabled_reason).toBe("Unplanned outage");
+
+      const [, params] = mockedPool.query.mock.calls[0];
+      expect(params).toEqual([
+        "airtel",
+        false,
+        "Unplanned outage",
+        "admin-1",
+        expect.any(Date),
+      ]);
+    });
+
+    it("re-enables a provider and clears the disabled metadata", async () => {
+      const updated = makeSettings({
+        provider_name: "airtel",
+        is_enabled: true,
+        disabled_reason: null,
+        disabled_by: null,
+        disabled_at: null,
+      });
+      mockedPool.query.mockResolvedValueOnce({ rows: [updated] } as any);
+      mockedCache.del.mockResolvedValue(undefined);
+      mockedCache.set.mockResolvedValue(undefined);
+
+      const result = await service.setProviderEnabled(
+        "airtel",
+        true,
+        "admin-1",
+      );
+
+      expect(result.is_enabled).toBe(true);
+
+      const [, params] = mockedPool.query.mock.calls[0];
+      expect(params).toEqual(["airtel", true, null, null, null]);
+    });
+
+    it("invalidates both per-provider and all-settings cache keys", async () => {
+      const updated = makeSettings({ is_enabled: false });
+      mockedPool.query.mockResolvedValueOnce({ rows: [updated] } as any);
+      mockedCache.del.mockResolvedValue(undefined);
+      mockedCache.set.mockResolvedValue(undefined);
+
+      await service.setProviderEnabled("mtn", false, "admin-1", "Testing");
+
+      expect(mockedCache.del).toHaveBeenCalledWith(
+        PROVIDER_CACHE_KEYS.single("mtn"),
+      );
+      expect(mockedCache.del).toHaveBeenCalledWith(PROVIDER_CACHE_KEYS.all());
+    });
+
+    it("throws when providerName is empty", async () => {
+      await expect(
+        service.setProviderEnabled("   ", false, "admin-1"),
+      ).rejects.toThrow("providerName is required");
+      expect(mockedPool.query).not.toHaveBeenCalled();
+    });
+  });
+
+  // -------------------------------------------------------------------------
   // 4. createMaintenanceOutage() — outage cache invalidation
   // -------------------------------------------------------------------------
 

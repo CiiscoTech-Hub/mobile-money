@@ -24,7 +24,7 @@ import logger from "../utils/logger";
  * - Stale lock and disabled account recovery
  */
 
-import * as StellarSdk from "stellar-sdk";
+import * as StellarSdk from "@stellar/stellar-sdk";
 import { getStellarServer, getNetworkPassphrase } from "../config/stellar";
 import {
   ChannelAccountModel,
@@ -346,13 +346,6 @@ export class ChannelAccountsPool {
 
         // Check if this is a sequence error
         if (isSequenceMismatchError(err)) {
-          this.stats.sequenceErrorCount++;
-          // Resync sequence from network immediately before dropping back to 'idle'
-          await this.resyncSequence(account.publicKey);
-          release(false);
-          continue;
-        }
-        if (isSequenceMismatchError(err)) {
           console.warn(
             `[Pool] Sequence error on ${account.publicKey.substring(0, 8)}..., resyncing...`,
           );
@@ -473,7 +466,8 @@ export class ChannelAccountsPool {
       } catch (error: unknown) {
         if (isSequenceMismatchError(error) && attempt < maxRetries) {
           // Resync and retry
-          await this.resyncSequence(account.publicKey);
+          const newSeq = await this.resyncSequence(account.publicKey);
+          account.sequence = newSeq;
           continue;
         }
         release(false);

@@ -45,6 +45,11 @@ export interface ProviderSettings {
   failure_threshold: number;
   timeout_ms: number;
   fallback_order: string | null;
+  /** Manual on/off toggle for unscheduled maintenance (#1550). Defaults to true. */
+  is_enabled?: boolean;
+  disabled_reason?: string | null;
+  disabled_by?: string | null;
+  disabled_at?: Date | null;
   created_at?: Date;
   updated_at?: Date;
 }
@@ -191,6 +196,70 @@ export class ProviderSettingsService {
     logger.info(
       { providerName: pName, failureThreshold, timeoutMs, fallbackOrder },
       "[ProviderSettingsService] Config updated and cache invalidated across all instances",
+    );
+
+    return updated;
+  }
+
+  /**
+   * Manually enables or disables a provider for unscheduled maintenance (#1550).
+   *
+   * Distinct from `createMaintenanceOutage()`, which schedules a time-windowed
+   * outage: this is an immediate toggle an admin flips during an unplanned
+   * incident. If the provider has no settings row yet, one is created with
+   * default threshold/timeout values.
+   *
+   * Invalidation strategy matches `upsertProviderSettings()`: DB write, then
+   * cache eviction + eager repopulation via LayeredCache.
+   */
+  public async setProviderEnabled(
+    providerName: string,
+    enabled: boolean,
+    updatedBy: string | null,
+    reason: string | null = null,
+  ): Promise<ProviderSettings> {
+    const pName = providerName.trim().toLowerCase();
+    if (!pName) {
+      throw new Error("providerName is required");
+    }
+
+    const query = `
+      INSERT INTO provider_settings (
+        provider_name, failure_threshold, timeout_ms, fallback_order,
+        is_enabled, disabled_reason, disabled_by, disabled_at
+      )
+      VALUES ($1, 3, 5000, NULL, $2, $3, $4, $5)
+      ON CONFLICT (provider_name)
+      DO UPDATE SET
+        is_enabled = EXCLUDED.is_enabled,
+        disabled_reason = EXCLUDED.disabled_reason,
+        disabled_by = EXCLUDED.disabled_by,
+        disabled_at = EXCLUDED.disabled_at,
+        updated_at = NOW()
+      RETURNING *;
+    `;
+
+    const disabledAt = enabled ? null : new Date();
+    const result = await pool.query(query, [
+      pName,
+      enabled,
+      enabled ? null : reason,
+      enabled ? null : updatedBy,
+      disabledAt,
+    ]);
+
+    const updated: ProviderSettings = result.rows[0];
+
+    await this._invalidateProviderKeys(pName);
+    await layeredCache.set(
+      PROVIDER_CACHE_KEYS.single(pName),
+      updated,
+      TTL.SETTINGS,
+    );
+
+    logger.info(
+      { providerName: pName, enabled, updatedBy, reason },
+      "[ProviderSettingsService] Manual provider toggle updated and cache invalidated",
     );
 
     return updated;

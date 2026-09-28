@@ -1,11 +1,17 @@
-import { generateFlaggedTransactionComplianceReport } from "../complianceReportService";
+import {
+  generateFlaggedTransactionComplianceReport,
+  generateHighValueTransactionComplianceReport,
+} from "../complianceReportService";
 import * as s3Upload from "../s3Upload";
-import { AMLAlert } from "../aml";
+import { AMLAlert, AMLHighValueAssessment } from "../aml";
 import { Transaction } from "../../models/transaction";
 import crypto from "crypto";
+import zlib from "zlib";
 import { DB_ENCRYPTION_KEY } from "../../config/env";
 
-jest.mock("../s3Upload");
+jest.mock("../s3Upload", () => ({
+  uploadToS3: jest.fn(),
+}));
 
 describe("Compliance Report Service", () => {
   const mockTransaction: Transaction = {
@@ -13,6 +19,9 @@ describe("Compliance Report Service", () => {
     referenceNumber: "REF-123",
     type: "deposit",
     amount: "1500000",
+    originalAmount: 1500000,
+    convertedAmount: 12050.75,
+    currency: "XAF",
     phoneNumber: "+237670000000",
     provider: "mtn",
     status: "pending",
@@ -40,11 +49,20 @@ describe("Compliance Report Service", () => {
     updatedAt: new Date("2026-01-01T12:05:00.000Z").toISOString(),
   };
 
+  const highValueAssessment: AMLHighValueAssessment = {
+    qualifies: true,
+    thresholdUsd: 10000,
+    usdEquivalent: 12050.75,
+    originalCurrency: "XAF",
+    sourceAmount: 1500000,
+  };
+
   beforeEach(() => {
     jest.clearAllMocks();
     (s3Upload.uploadToS3 as jest.Mock).mockResolvedValue({
       success: true,
       fileUrl: "https://s3.amazonaws.com/bucket/compliance-tx-123.pdf.enc",
+      key: "admin/compliance-reports/2026/01/user-123/file.pdf.enc",
     });
   });
 
@@ -57,6 +75,7 @@ describe("Compliance Report Service", () => {
     expect(result.pdfUrl).toBe(
       "https://s3.amazonaws.com/bucket/compliance-tx-123.pdf.enc",
     );
+    expect(result.template).toBe("flagged_transaction");
     expect(s3Upload.uploadToS3).toHaveBeenCalledTimes(1);
 
     const uploadCall = (s3Upload.uploadToS3 as jest.Mock).mock.calls[0][0];
@@ -64,16 +83,42 @@ describe("Compliance Report Service", () => {
       /COMPLIANCE_TX_tx-123_alert-123_\d+\.pdf\.enc$/,
     );
     expect(uploadCall.file.mimetype).toBe("application/octet-stream");
+    expect(uploadCall.folder).toBe("compliance");
 
     const encryptedBuffer: Buffer = uploadCall.file.buffer;
     expect(encryptedBuffer.length).toBeGreaterThan(0);
 
     const decryptedPdf = decryptBuffer(encryptedBuffer);
     expect(decryptedPdf.toString("utf8", 0, 4)).toBe("%PDF");
-    expect(decryptedPdf.toString("utf8")).toContain(
-      "Flagged Transaction Compliance Report",
+    const pdfText = extractPdfText(decryptedPdf);
+    expect(pdfText).toContain("Flagged Transaction Compliance Report");
+    expect(pdfText).toContain("Alert ID: alert-123");
+  });
+
+  it("generates a dedicated high-value compliance template with threshold metadata", async () => {
+    const result = await generateHighValueTransactionComplianceReport(
+      mockTransaction,
+      mockAlert,
+      highValueAssessment,
     );
-    expect(decryptedPdf.toString("utf8")).toContain("Alert ID: alert-123");
+
+    expect(result.template).toBe("high_value_transaction");
+    expect(result.source).toBe("aml_high_value_transaction");
+    expect(result.storageKey).toContain("admin/compliance-reports");
+
+    const uploadCall = (s3Upload.uploadToS3 as jest.Mock).mock.calls[0][0];
+    expect(uploadCall.file.originalname).toMatch(
+      /HIGH_VALUE_TX_tx-123_alert-123_\d+\.pdf\.enc$/,
+    );
+    expect(uploadCall.metadata.reportType).toBe("high_value_transaction");
+    expect(uploadCall.metadata.source).toBe("aml_high_value_transaction");
+    expect(uploadCall.metadata.templateVersion).toBe("1.0");
+
+    const decryptedPdf = decryptBuffer(uploadCall.file.buffer);
+    const pdfText = extractPdfText(decryptedPdf);
+    expect(pdfText).toContain("High-Value Transaction Compliance Report");
+    expect(pdfText).toContain("High-Value Threshold Assessment");
+    expect(pdfText).toContain("USD Equivalent: 12050.75 USD");
   });
 
   it("throws when storage fails", async () => {
@@ -100,4 +145,30 @@ function decryptBuffer(encryptedBuffer: Buffer): Buffer {
   const decipher = crypto.createDecipheriv("aes-256-gcm", secretKey, iv);
   decipher.setAuthTag(authTag);
   return Buffer.concat([decipher.update(encryptedData), decipher.final()]);
+}
+
+function extractPdfText(pdfBuffer: Buffer): string {
+  const binary = pdfBuffer.toString("latin1");
+  const texts: string[] = [];
+  const streamPattern = /stream\r?\n([\s\S]*?)endstream/g;
+
+  for (const match of binary.matchAll(streamPattern)) {
+    const streamData = Buffer.from(match[1], "latin1");
+    const decodedStream = (() => {
+      try {
+        return zlib.inflateSync(streamData).toString("latin1");
+      } catch {
+        return streamData.toString("latin1");
+      }
+    })();
+
+    const hexFragments = Array.from(
+      decodedStream.matchAll(/<([0-9A-Fa-f]+)>/g),
+      (hexMatch) => Buffer.from(hexMatch[1], "hex").toString("utf8"),
+    );
+
+    texts.push(hexFragments.join(""));
+  }
+
+  return texts.join("\n");
 }

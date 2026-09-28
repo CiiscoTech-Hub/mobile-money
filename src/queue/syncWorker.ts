@@ -1,7 +1,7 @@
 import logger from "../utils/logger";
 import tracer from "../tracer";
 import { Worker, Job } from "bullmq";
-import { queueOptions } from "./config";
+import { queueOptions, getTelecomProviderLimits } from "./config";
 import { SyncJobData, SyncJobResult, SYNC_QUEUE_NAME } from "./syncQueue";
 import {
   AccountingService,
@@ -23,7 +23,8 @@ const getSyncConcurrency = (): number => {
 };
 
 export const SYNC_CONCURRENCY = getSyncConcurrency();
-export const NATS_SYNC_SUBJECT = process.env.NATS_SYNC_SUBJECT || "accounting.sync";
+export const NATS_SYNC_SUBJECT =
+  process.env.NATS_SYNC_SUBJECT || "accounting.sync";
 export const NATS_SYNC_DURABLE_CONSUMER =
   process.env.NATS_SYNC_DURABLE_CONSUMER || "accounting-sync-consumer";
 export const NATS_SYNC_CONSUMER_GROUP =
@@ -31,7 +32,59 @@ export const NATS_SYNC_CONSUMER_GROUP =
   process.env.NATS_CONSUMER_GROUP ||
   "accounting-sync-group";
 
-type DatadogSpan = ReturnType<typeof tracer.startSpan>;
+// In-memory lock to prevent duplicate Stellar transaction submissions
+const stellarSubmissionLocks = new Map<string, boolean>();
+
+/**
+ * Acquire a lock for a transaction to prevent duplicate submissions
+ */
+function acquireStellarSubmissionLock(transactionId: string): boolean {
+  if (stellarSubmissionLocks.get(transactionId)) {
+    return false; // Lock already held
+  }
+  stellarSubmissionLocks.set(transactionId, true);
+  return true;
+}
+
+/**
+ * Release the lock for a transaction
+ */
+function releaseStellarSubmissionLock(transactionId: string): void {
+  stellarSubmissionLocks.delete(transactionId);
+}
+
+/**
+ * Calculate backoff delay based on Horizon error codes
+ */
+function getHorizonBackoffDelay(error: unknown, attempt: number): number {
+  const baseDelay = 2000; // 2 seconds
+  const maxDelay = 60000; // 60 seconds
+  
+  // Default exponential backoff
+  let delay = Math.min(baseDelay * Math.pow(2, attempt - 1), maxDelay);
+  
+  // Adjust based on error type
+  if (error instanceof Error) {
+    const message = error.message.toLowerCase();
+    
+    // Rate limit errors - longer backoff
+    if (message.includes('rate limit') || message.includes('429')) {
+      delay = Math.min(baseDelay * Math.pow(3, attempt - 1), maxDelay * 2);
+    }
+    // Network congestion - moderate backoff
+    else if (message.includes('timeout') || message.includes('network')) {
+      delay = Math.min(baseDelay * Math.pow(2, attempt - 1), maxDelay);
+    }
+    // Bad sequence - shorter backoff, likely quick resolution
+    else if (message.includes('bad_seq') || message.includes('sequence')) {
+      delay = Math.min(1000 * Math.pow(1.5, attempt - 1), 10000);
+    }
+  }
+  
+  return delay;
+}
+
+type DatadogSpan = any;
 
 function tagSyncSpan(
   span: DatadogSpan,
@@ -166,22 +219,41 @@ export async function processSyncJob(
   job: Job<SyncJobData, SyncJobResult>,
 ): Promise<SyncJobResult> {
   const { syncId, transactionId, platform, payload } = job.data;
-  const span = tracer.startSpan("mobile_money.queue.sync.process");
+  const span: any = tracer.startSpan("mobile_money.queue.sync.process");
   const logFields = spanLogFields(span);
   const startedAt = Date.now();
   let spanStatus: "success" | "failed" = "failed";
 
   tagSyncSpan(span, job.data, "bullmq");
 
+  // Acquire lock to prevent duplicate submissions
+  if (!acquireStellarSubmissionLock(transactionId)) {
+    logger.warn(
+      {
+        syncId,
+        transactionId,
+        platform,
+      },
+      "Transaction submission already in progress, skipping duplicate",
+    );
+    return { success: true, syncId, platform };
+  }
+
+  // Hoisted once per job so repeated log lines reuse a single base object
+  // instead of reallocating the same keys on every call.
+  const baseLogFields = {
+    ...logFields,
+    queueName: SYNC_QUEUE_NAME,
+    queueSource: "bullmq" as const,
+    jobId: job.id,
+    syncId,
+    transactionId,
+    platform,
+  };
+
   logger.info(
     {
-      ...logFields,
-      queueName: SYNC_QUEUE_NAME,
-      queueSource: "bullmq",
-      jobId: job.id,
-      syncId,
-      transactionId,
-      platform,
+      ...baseLogFields,
       attempt: job.attemptsMade + 1,
     },
     "Processing accounting sync operation",
@@ -211,14 +283,8 @@ export async function processSyncJob(
 
     logger.info(
       {
-        ...logFields,
-        queueName: SYNC_QUEUE_NAME,
-        queueSource: "bullmq",
+        ...baseLogFields,
         latencyMs,
-        jobId: job.id,
-        syncId,
-        transactionId,
-        platform,
       },
       "Successfully synced transaction to accounting platform",
     );
@@ -234,37 +300,31 @@ export async function processSyncJob(
     const latencyMs = Date.now() - startedAt;
 
     if (isTransient) {
-      // Log transient failure. BullMQ will automatically reschedule with exponential backoff.
       logger.warn(
         {
-          ...logFields,
-          queueName: SYNC_QUEUE_NAME,
-          queueSource: "bullmq",
+          ...baseLogFields,
           latencyMs,
-          jobId: job.id,
-          syncId,
-          transactionId,
-          platform,
           attempt: job.attemptsMade + 1,
           maxAttempts,
           error: message,
           isTransient: true,
+          backoffDelay: getHorizonBackoffDelay(error, job.attemptsMade + 1),
         },
         "Transient error during accounting sync - will retry with backoff",
       );
+
+      // Dynamic Throttling: If external API hits a rate limit, safely delay worker processing natively
+      if (error instanceof RateLimitError) {
+        throw Worker.RateLimitError(); // 5 second cool-down period
+      }
+
       throw error;
     } else {
       // Permanent error (e.g. ValidationError)
       logger.error(
         {
-          ...logFields,
-          queueName: SYNC_QUEUE_NAME,
-          queueSource: "bullmq",
+          ...baseLogFields,
           latencyMs,
-          jobId: job.id,
-          syncId,
-          transactionId,
-          platform,
           attempt: job.attemptsMade + 1,
           maxAttempts,
           error: message,
@@ -333,6 +393,8 @@ export async function processSyncJob(
       throw error;
     }
   } finally {
+    // Release lock regardless of success or failure
+    releaseStellarSubmissionLock(transactionId);
     finishSyncSpan(span, startedAt, spanStatus);
   }
 }
@@ -343,26 +405,32 @@ export async function processSyncJob(
  * and swallows permanent errors after logging (triggering an ack to avoid
  * infinite redelivery of unprocessable messages).
  */
-async function processNatsSyncMessage(
+export async function processNatsSyncMessage(
   data: SyncJobData,
   msg: JsMsg,
 ): Promise<void> {
   const { syncId, transactionId, platform } = data;
-  const span = tracer.startSpan("mobile_money.queue.sync.nats.process");
+  const span: any = tracer.startSpan("mobile_money.queue.sync.nats.process");
   const logFields = spanLogFields(span);
   const startedAt = Date.now();
   let spanStatus: "success" | "failed" = "failed";
 
   tagSyncSpan(span, data, "nats");
 
+  // Hoisted once per message — the NATS path shares the same queue buffer
+  // as BullMQ, so log-field allocation is kept flat per message.
+  const baseLogFields = {
+    ...logFields,
+    queueName: SYNC_QUEUE_NAME,
+    queueSource: "nats" as const,
+    syncId,
+    transactionId,
+    platform,
+  };
+
   logger.info(
     {
-      ...logFields,
-      queueName: SYNC_QUEUE_NAME,
-      queueSource: "nats",
-      syncId,
-      transactionId,
-      platform,
+      ...baseLogFields,
     },
     "[SyncWorker] [NATS] Processing accounting sync operation",
   );
@@ -385,12 +453,7 @@ async function processNatsSyncMessage(
       span.setTag("error", true);
       logger.error(
         {
-          ...logFields,
-          queueName: SYNC_QUEUE_NAME,
-          queueSource: "nats",
-          syncId,
-          transactionId,
-          platform,
+          ...baseLogFields,
         },
         "[SyncWorker] [NATS] Unsupported accounting platform. Terminating message.",
       );
@@ -404,13 +467,8 @@ async function processNatsSyncMessage(
 
     logger.info(
       {
-        ...logFields,
-        queueName: SYNC_QUEUE_NAME,
-        queueSource: "nats",
+        ...baseLogFields,
         latencyMs,
-        syncId,
-        transactionId,
-        platform,
       },
       "[SyncWorker] [NATS] Successfully synced transaction to accounting platform.",
     );
@@ -426,13 +484,8 @@ async function processNatsSyncMessage(
       // Re-throw so natsManager.consume issues a nak and JetStream redelivers
       logger.warn(
         {
-          ...logFields,
-          queueName: SYNC_QUEUE_NAME,
-          queueSource: "nats",
+          ...baseLogFields,
           latencyMs,
-          syncId,
-          transactionId,
-          platform,
           error: message,
           isTransient: true,
         },
@@ -443,13 +496,8 @@ async function processNatsSyncMessage(
       // Permanent error — term to avoid infinite redelivery loop
       logger.error(
         {
-          ...logFields,
-          queueName: SYNC_QUEUE_NAME,
-          queueSource: "nats",
+          ...baseLogFields,
           latencyMs,
-          syncId,
-          transactionId,
-          platform,
           error: message,
           isPermanent: true,
         },
@@ -466,13 +514,20 @@ async function processNatsSyncMessage(
 // BullMQ Worker (active when NATS_QUEUE_ENABLED !== "true")
 // ---------------------------------------------------------------------------
 
-// Instantiate the BullMQ Worker
+// Fetch limits specifically matched to the active telecom/provider
+const providerLimits = getTelecomProviderLimits(process.env.ACTIVE_PROVIDER);
+const resolvedConcurrency = process.env.SYNC_WORKER_CONCURRENCY
+  ? SYNC_CONCURRENCY
+  : providerLimits.concurrency;
+
+// Instantiate the BullMQ Worker dynamically restricted to provider API boundaries
 export const syncWorker = new Worker<SyncJobData, SyncJobResult>(
   SYNC_QUEUE_NAME,
   processSyncJob,
   {
     ...queueOptions,
-    concurrency: SYNC_CONCURRENCY, // Safe concurrency limit for accounting API rate-limits
+    concurrency: resolvedConcurrency, // Dynamic concurrency limit set via telecom configs
+    limiter: providerLimits.limiter, // Ensures execution strictly matches provider speed boundaries
   },
 );
 
@@ -485,14 +540,14 @@ export const syncWorker = new Worker<SyncJobData, SyncJobResult>(
 // without duplicate processing.
 // ---------------------------------------------------------------------------
 
-if (NATS_QUEUE_ENABLED) {
+if (process.env.NATS_QUEUE_ENABLED === "true" && natsManager) {
   natsManager
     .consume<SyncJobData>(
       NATS_SYNC_SUBJECT,
       NATS_SYNC_DURABLE_CONSUMER,
       NATS_SYNC_CONSUMER_GROUP,
       processNatsSyncMessage,
-      SYNC_CONCURRENCY,
+      resolvedConcurrency, // Synchronize NATS concurrency with telecom limits
     )
     .catch((err) =>
       console.error("[SyncWorker] [NATS] JetStream consumer error:", err),
@@ -505,7 +560,7 @@ if (NATS_QUEUE_ENABLED) {
 
 export async function closeSyncWorker(): Promise<void> {
   await syncWorker.close();
-  if (NATS_QUEUE_ENABLED) {
+  if (process.env.NATS_QUEUE_ENABLED === "true" && natsManager) {
     await natsManager.close();
   }
 }

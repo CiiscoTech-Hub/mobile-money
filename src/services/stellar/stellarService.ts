@@ -1,5 +1,5 @@
 import logger from "../../utils/logger";
-import * as StellarSdk from "stellar-sdk";
+import * as StellarSdk from "@stellar/stellar-sdk";
 import { getStellarServer, getNetworkPassphrase } from "../../config/stellar";
 import dotenv from "dotenv";
 import { transactionTotal, transactionErrorsTotal } from "../../utils/metrics";
@@ -7,6 +7,7 @@ import { AssetService, getConfiguredPaymentAsset } from "./assetService";
 import { sanctionService } from "../sanctionService";
 import { resolveToBaseAddress } from "../../stellar/muxed";
 import { assertStrictStellarGAddress } from "../../utils/stellarAddressValidator";
+import { getChannelPool } from "../channelPool";
 
 dotenv.config();
 
@@ -82,9 +83,14 @@ export class StellarService {
   private async getNetworkBaseFee(): Promise<number> {
     try {
       if (this.isMockMode) return 100;
-      return await this.server.fetchBaseFee();
+      const feeStats = await this.server.feeStats();
+      return Number(feeStats.fee_charged?.p90 || feeStats.last_ledger_base_fee || 100);
     } catch {
-      return 100; // default base fee
+      try {
+        return await this.server.fetchBaseFee();
+      } catch {
+        return 100; // default base fee
+      }
     }
   }
 
@@ -99,12 +105,14 @@ export class StellarService {
     }
 
     try {
+      let timeoutId: NodeJS.Timeout;
       const callPromise = this.server.fetchBaseFee();
-      const timeoutPromise = new Promise((_, reject) =>
-        setTimeout(() => reject(new Error("Horizon ping timeout")), timeoutMs),
-      );
+      const timeoutPromise = new Promise((_, reject) => {
+        timeoutId = setTimeout(() => reject(new Error("Horizon ping timeout")), timeoutMs);
+      });
 
       await Promise.race([callPromise, timeoutPromise]);
+      clearTimeout(timeoutId!);
     } catch (err) {
       console.error(
         "Horizon server unreachable:",
@@ -226,6 +234,7 @@ export class StellarService {
     senderName?: string,
     receiverName?: string,
     useFeeBump?: boolean,
+    memo?: StellarSdk.Memo,
   ): Promise<{
     hash?: string;
     submittedAt?: Date;
@@ -276,6 +285,7 @@ export class StellarService {
         console.log("Mock Stellar payment:", {
           to: resolvedDestinationAddress,
           amount,
+          memoType: memo?.type,
         });
 
         transactionTotal.inc({
@@ -301,34 +311,52 @@ export class StellarService {
         }
       }
 
-      const account = await this.server.loadAccount(
-        this.issuerKeypair.publicKey(),
-      );
-
+      const issuerKeypair = this.issuerKeypair;
       const baseFee = await this.getNetworkBaseFee();
-      const transaction = new StellarSdk.TransactionBuilder(account, {
-        fee: baseFee.toString(),
-        networkPassphrase: getNetworkPassphrase(),
-      })
-        .addOperation(
-          StellarSdk.Operation.payment({
-            destination: resolvedDestinationAddress,
-            asset: paymentAsset,
-            amount: amount,
-          }),
-        )
-        .setTimeout(30)
-        .build();
 
-      transaction.sign(this.issuerKeypair);
+      // Builds, signs and submits the payment with `source` as the
+      // transaction source. The payment operation always debits the issuer.
+      const submitFrom = async (
+        source: StellarSdk.Account | StellarSdk.Horizon.AccountResponse,
+        channelKeypair?: StellarSdk.Keypair,
+      ) => {
+        const builder = new StellarSdk.TransactionBuilder(source, {
+          fee: baseFee.toString(),
+          networkPassphrase: getNetworkPassphrase(),
+        })
+          .addOperation(
+            StellarSdk.Operation.payment({
+              destination: resolvedDestinationAddress,
+              asset: paymentAsset,
+              amount: amount,
+              ...(channelKeypair && { source: issuerKeypair.publicKey() }),
+            }),
+          )
+          .setTimeout(30);
+        // e.g. the SEP-24 deposit memo a shared exchange address needs.
+        if (memo) builder.addMemo(memo);
+        const transaction = builder.build();
 
-      // Check if fee bumping is requested
-      let response: StellarSdk.Horizon.HorizonApi.SubmitTransactionResponse;
-      if (useFeeBump) {
-        response = await this.submitFeeBumpTransaction(transaction);
-      } else {
-        response = await this.server.submitTransaction(transaction);
-      }
+        transaction.sign(issuerKeypair);
+        if (channelKeypair) transaction.sign(channelKeypair);
+
+        // Check if fee bumping is requested
+        return useFeeBump
+          ? this.submitFeeBumpTransaction(transaction)
+          : this.server.submitTransaction(transaction);
+      };
+
+      // With a channel pool, each payment uses its own leased channel's
+      // sequence number, so concurrent payments never collide on the
+      // issuer's sequence (tx_bad_seq).
+      const channelPool = getChannelPool();
+      const response = channelPool
+        ? await channelPool.withChannel((lease) =>
+            submitFrom(lease.account, lease.keypair),
+          )
+        : await submitFrom(
+            await this.server.loadAccount(issuerKeypair.publicKey()),
+          );
 
       console.log("Stellar payment successful", {
         hash: response.hash,
@@ -507,7 +535,7 @@ export class StellarService {
         .addOperation(
           StellarSdk.Operation.setOptions({
             setFlags:
-              StellarSdk.xdr.AccountFlags.authClawbackEnabledFlag().value,
+              StellarSdk.xdr.AccountFlags.authClawbackEnabledFlag.value,
           }),
         )
         .setTimeout(30)

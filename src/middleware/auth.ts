@@ -91,7 +91,7 @@ export const requireAuth = async (
     // 1. Look up from the database first (scoped keys)
     try {
       const result = await queryRead(
-        `SELECT permissions, is_active, expires_at
+        `SELECT permissions, is_active, expires_at, client_cert_cn, client_cert_fingerprint
            FROM api_keys
           WHERE key = $1
           LIMIT 1`,
@@ -109,6 +109,32 @@ export const requireAuth = async (
           return res
             .status(401)
             .json({ error: "Unauthorized", message: "API key has expired" });
+        }
+
+        // Validate client certificate if mTLS is configured for this key
+        if (row.client_cert_cn || row.client_cert_fingerprint) {
+          const cert = (req.socket as any).getPeerCertificate?.();
+
+          if (!cert || Object.keys(cert).length === 0) {
+            return res.status(401).json({
+              error: "Unauthorized",
+              message: "mTLS validation failed: Client certificate is required for enterprise partner",
+            });
+          }
+
+          if (row.client_cert_cn && cert.subject?.CN !== row.client_cert_cn) {
+            return res.status(401).json({
+              error: "Unauthorized",
+              message: "mTLS validation failed: Client certificate Common Name (CN) mismatch",
+            });
+          }
+
+          if (row.client_cert_fingerprint && cert.fingerprint !== row.client_cert_fingerprint) {
+            return res.status(401).json({
+              error: "Unauthorized",
+              message: "mTLS validation failed: Client certificate fingerprint mismatch",
+            });
+          }
         }
 
         (req as AuthRequest).user = { id: "api-key-user", role: "admin" };

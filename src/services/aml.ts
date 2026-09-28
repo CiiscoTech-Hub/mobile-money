@@ -7,6 +7,7 @@ import {
 } from "./cachedTransactionService";
 import { getDistanceKm } from "./fraud";
 import { sanctionService } from "./sanctionService";
+import { currencyService, type SupportedCurrency } from "./currency";
 
 export type AMLTransactionType = "deposit" | "withdraw";
 export type AMLAlertStatus = "pending_review" | "reviewed" | "dismissed";
@@ -32,6 +33,9 @@ export interface AMLTransactionRecord {
   amount: number;
   createdAt: Date;
   status?: string;
+  currency?: string;
+  originalAmount?: number | null;
+  convertedAmount?: number | null;
   locationMetadata?: Record<string, unknown> | null;
 }
 
@@ -96,6 +100,15 @@ export interface AMLConfig {
   frequencySpikeMultiplier: number;
   geoHopMaxKm: number;
   geoHopMaxHours: number;
+  highValueReportThresholdUsd: number;
+}
+
+export interface AMLHighValueAssessment {
+  qualifies: boolean;
+  thresholdUsd: number;
+  usdEquivalent: number;
+  originalCurrency: SupportedCurrency;
+  sourceAmount: number;
 }
 
 export interface AMLMonitoringResult {
@@ -160,6 +173,9 @@ const defaultConfig: AMLConfig = {
   ),
   geoHopMaxKm: Number(process.env.AML_GEO_HOP_MAX_KM || 250),
   geoHopMaxHours: Number(process.env.AML_GEO_HOP_MAX_HOURS || 6),
+  highValueReportThresholdUsd: Number(
+    process.env.AML_HIGH_VALUE_REPORT_THRESHOLD_USD || 10_000,
+  ),
 };
 
 const PROFILE_SCORE_WEIGHTS = {
@@ -212,6 +228,15 @@ function normalizeLocationMetadata(
   return { lat, lng };
 }
 
+function normalizeSupportedCurrency(value: string | undefined): SupportedCurrency {
+  const normalized = value?.toUpperCase();
+  if (normalized && currencyService.isSupportedCurrency(normalized)) {
+    return normalized;
+  }
+
+  return "USD";
+}
+
 export class AMLService {
   private readonly config: AMLConfig;
   private alerts: AMLAlert[] = [];
@@ -234,6 +259,48 @@ export class AMLService {
     return new Date(now.getTime() - this.config.rapidWindowMinutes * 60 * 1000);
   }
 
+  assessHighValueTransaction(
+    transaction: AMLTransactionRecord,
+  ): AMLHighValueAssessment {
+    const originalCurrency = normalizeSupportedCurrency(transaction.currency);
+    const sourceAmount =
+      toFiniteNumber(transaction.originalAmount) ?? transaction.amount;
+    const storedUsdEquivalent = toFiniteNumber(transaction.convertedAmount);
+
+    let usdEquivalent = sourceAmount;
+    if (storedUsdEquivalent !== null && storedUsdEquivalent >= 0) {
+      usdEquivalent =
+        originalCurrency === "USD" ? sourceAmount : storedUsdEquivalent;
+    } else if (originalCurrency !== "USD") {
+      usdEquivalent = currencyService.convertToBase(
+        sourceAmount,
+        originalCurrency,
+      ).convertedAmount;
+    }
+
+    return {
+      qualifies: usdEquivalent > this.config.highValueReportThresholdUsd,
+      thresholdUsd: this.config.highValueReportThresholdUsd,
+      usdEquivalent,
+      originalCurrency,
+      sourceAmount,
+    };
+  }
+
+  isHighValueAlert(
+    transaction: AMLTransactionRecord,
+    alert: AMLAlert,
+  ): AMLHighValueAssessment | null {
+    if (
+      !alert.ruleHits.some((hit) => hit.rule === "single_transaction_threshold")
+    ) {
+      return null;
+    }
+
+    const assessment = this.assessHighValueTransaction(transaction);
+    return assessment.qualifies ? assessment : null;
+  }
+
   async fetchRecentTransactions(
     userId: string,
     since: Date,
@@ -246,6 +313,9 @@ export class AMLService {
         type,
         amount::text AS amount,
         status,
+        currency,
+        original_amount::text AS "originalAmount",
+        converted_amount::text AS "convertedAmount",
         location_metadata AS "locationMetadata",
         created_at AS "createdAt"
       FROM transactions
@@ -261,6 +331,9 @@ export class AMLService {
       type: AMLTransactionType;
       amount: string;
       status: string;
+      currency: string | null;
+      originalAmount: string | null;
+      convertedAmount: string | null;
       locationMetadata: Record<string, unknown> | null;
       createdAt: Date;
     }>(query, [userId, since, excludeTransactionId ?? null]);
@@ -272,6 +345,9 @@ export class AMLService {
         type: row.type,
         amount: Number(row.amount),
         status: row.status,
+        currency: row.currency ?? undefined,
+        originalAmount: toFiniteNumber(row.originalAmount),
+        convertedAmount: toFiniteNumber(row.convertedAmount),
         locationMetadata: row.locationMetadata,
         createdAt: safeDate(row.createdAt),
       }))
@@ -466,6 +542,7 @@ export class AMLService {
     const windowTxs = recentTransactions.filter(
       (tx) => tx.createdAt >= lookbackStart,
     );
+    const highValueAssessment = this.assessHighValueTransaction(current);
 
     if (current.amount > this.config.singleTransactionThresholdXaf) {
       ruleHits.push({
@@ -473,6 +550,13 @@ export class AMLService {
         message: `Single transaction amount ${current.amount} XAF exceeds ${this.config.singleTransactionThresholdXaf} XAF`,
         observed: current.amount,
         threshold: this.config.singleTransactionThresholdXaf,
+      });
+    } else if (highValueAssessment.qualifies) {
+      ruleHits.push({
+        rule: "single_transaction_threshold",
+        message: `Single transaction USD-equivalent amount ${highValueAssessment.usdEquivalent.toFixed(2)} USD exceeds ${highValueAssessment.thresholdUsd} USD high-value reporting threshold`,
+        observed: highValueAssessment.usdEquivalent,
+        threshold: highValueAssessment.thresholdUsd,
       });
     }
 

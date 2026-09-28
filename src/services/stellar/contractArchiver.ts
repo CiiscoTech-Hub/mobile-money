@@ -1,9 +1,9 @@
-import { getStellarServer } from "../../config/stellar";
 import { insertContractStateArchive } from "../../database/contractStateArchiveRepository";
-import EventSource from "eventsource";
+import { LedgerEventSync } from "./ledgerEventSync";
 
 export interface ContractArchiverConfig {
   contractId?: string;
+  /** @deprecated SSE streaming was replaced by chunked paging (#1857). */
   streamUrl?: string;
 }
 
@@ -20,74 +20,53 @@ export interface ContractStateArchivePayload {
 
 export class ContractArchiverService {
   private readonly contractId: string;
-  private readonly horizon: any;
-  private readonly streamUrl: string;
+  private readonly sync: LedgerEventSync;
 
   constructor(config: ContractArchiverConfig = {}) {
-    this.horizon = getStellarServer();
-    this.contractId = config.contractId || process.env.SOROBAN_CONTRACT_ID || "";
-    const horizonUrl = (this.horizon as any).serverURL || (this.horizon as any).host;
-    this.streamUrl =
-      config.streamUrl ||
-      `${horizonUrl}/accounts/${this.contractId}/transactions?cursor=now&limit=200&order=asc`;
+    this.contractId =
+      config.contractId || process.env.SOROBAN_CONTRACT_ID || "";
+    this.sync = new LedgerEventSync({
+      contractId: this.contractId,
+      streamKey: `archiver:${this.contractId}`,
+    });
   }
 
   start(): void {
     if (!this.contractId) {
-      console.warn("SOROBAN_CONTRACT_ID not set – contract state archiver disabled");
+      console.warn(
+        "SOROBAN_CONTRACT_ID not set – contract state archiver disabled",
+      );
       return;
     }
 
-    const eventSource = new EventSource(this.streamUrl);
+    this.sync.start(async (tx, operation) => {
+      const payload: ContractStateArchivePayload = {
+        contractId: this.contractId,
+        txHash: tx.hash,
+        ledger: tx.ledger_seq,
+        eventType: operation.type,
+        eventName: operation.value?.type || operation.value?.name || null,
+        eventDetails: operation.value?.payload || operation.value || null,
+        snapshotData: {
+          contract: this.contractId,
+          txHash: tx.hash,
+          ledger: tx.ledger_seq,
+          value: operation.value || {},
+        },
+        createdAt: new Date(),
+      };
 
-    eventSource.onmessage = async (msg) => {
-      try {
-        const data = JSON.parse(msg.data);
-        if (!data || !data._embedded?.records) return;
+      await insertContractStateArchive(payload);
+    });
+  }
 
-        for (const tx of data._embedded.records) {
-          const operationsResponse = await this.horizon
-            .operations()
-            .forTransaction(tx.id)
-            .call();
-
-          for (const op of operationsResponse.records) {
-            const operation = op as any;
-            if (operation.type !== "contract_event") continue;
-            if (operation.contract !== this.contractId) continue;
-
-            const payload: ContractStateArchivePayload = {
-              contractId: this.contractId,
-              txHash: tx.hash,
-              ledger: tx.ledger_seq,
-              eventType: operation.type,
-              eventName: operation.value?.type || operation.value?.name || null,
-              eventDetails: operation.value?.payload || operation.value || null,
-              snapshotData: {
-                contract: this.contractId,
-                txHash: tx.hash,
-                ledger: tx.ledger_seq,
-                value: operation.value || {},
-              },
-              createdAt: new Date(),
-            };
-
-            await insertContractStateArchive(payload);
-          }
-        }
-      } catch (error) {
-        console.error("Contract state archiver failed to process event", error);
-      }
-    };
-
-    eventSource.onerror = (error) => {
-      console.error("Contract state archiver stream error", error);
-      setTimeout(() => this.start(), 5000);
-    };
+  stop(): void {
+    this.sync.stop();
   }
 }
 
 export function initializeContractArchiver() {
   const service = new ContractArchiverService();
   service.start();
+  return service;
 }

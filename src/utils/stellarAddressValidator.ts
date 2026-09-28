@@ -1,4 +1,4 @@
-import * as StellarSdk from "stellar-sdk";
+import * as StellarSdk from "@stellar/stellar-sdk";
 
 export const STELLAR_G_ADDRESS_REGEX = /^G[A-Z2-7]{55}$/;
 

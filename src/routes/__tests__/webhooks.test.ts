@@ -70,6 +70,53 @@ describe("Webhooks Routes", () => {
     });
   });
 
+  describe("GET /api/webhooks/signing-key", () => {
+    const originalKey = process.env.WEBHOOK_ED25519_SIGNING_KEY;
+
+    afterEach(() => {
+      if (originalKey === undefined) {
+        delete process.env.WEBHOOK_ED25519_SIGNING_KEY;
+      } else {
+        process.env.WEBHOOK_ED25519_SIGNING_KEY = originalKey;
+      }
+    });
+
+    it("reports HMAC-only when no Ed25519 signing key is configured", async () => {
+      delete process.env.WEBHOOK_ED25519_SIGNING_KEY;
+
+      const response = await request(app)
+        .get("/api/webhooks/signing-key")
+        .expect(200);
+
+      expect(response.body).toEqual({ scheme: "sha256", enabled: false });
+    });
+
+    it("returns the Ed25519 public key and keyId when configured", async () => {
+      // Fixed test-only Stellar secret seed (generated for this test, unused elsewhere)
+      process.env.WEBHOOK_ED25519_SIGNING_KEY =
+        "SAJFT5CO2NKRVLI3LYKSE62UT4H3WFCHZAJUC3AV6FGYNTLOYKP2WFN2";
+
+      const response = await request(app)
+        .get("/api/webhooks/signing-key")
+        .expect(200);
+
+      expect(response.body.scheme).toBe("ed25519");
+      expect(response.body.enabled).toBe(true);
+      expect(response.body.publicKey).toMatch(/^G[A-Z0-9]{55}$/);
+      expect(response.body.keyId).toMatch(/^[0-9a-f]{16}$/);
+    });
+
+    it("returns a 500 with enabled:false when the signing key is misconfigured", async () => {
+      process.env.WEBHOOK_ED25519_SIGNING_KEY = "not-a-valid-key";
+
+      const response = await request(app)
+        .get("/api/webhooks/signing-key")
+        .expect(500);
+
+      expect(response.body.enabled).toBe(false);
+    });
+  });
+
   describe("POST /api/webhooks/test", () => {
     it("should echo back the received payload", async () => {
       const testPayload = {

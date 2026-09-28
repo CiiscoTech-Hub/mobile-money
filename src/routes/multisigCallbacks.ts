@@ -7,18 +7,36 @@ const router = Router();
 const mobileMoneyService = new MobileMoneyService();
 
 router.post("/callback", async (req: Request, res: Response) => {
-  const { requestId, signerId, signature, payload, publicKey } = req.body;
+  const { requestId, signerId, signature, payload } = req.body;
 
-  if (!requestId || !signerId || !signature || !payload || !publicKey) {
+  if (!requestId || !signerId || !signature || !payload) {
     return res.status(400).json({ error: "Missing required fields" });
   }
 
   try {
-    // 1. Verify webhook signature
+    // 1. Verify webhook signature against the *registered* signer's public
+    // key — never a caller-supplied one, otherwise anyone who learns a
+    // valid signerId could forge an "approval" with their own throwaway
+    // keypair and pass verification without ever holding that signer's key.
+    const request =
+      await multisigCustodyLedgerService.getRequestById(requestId);
+    if (!request) {
+      return res.status(404).json({ error: "Request not found" });
+    }
+
+    const signers = await multisigCustodyLedgerService.getSigners(
+      request.config_id,
+    );
+    const signer = signers.find((s) => s.signer_id === signerId && s.is_active);
+    if (!signer) {
+      logger.warn({ requestId, signerId }, "Unknown or inactive signer");
+      return res.status(401).json({ error: "Signer not authorized" });
+    }
+
     const isValid = multisigCustodyLedgerService.verifyWebhookSignature(
       payload,
       signature,
-      publicKey,
+      signer.public_key,
     );
 
     if (!isValid) {
@@ -42,15 +60,6 @@ router.post("/callback", async (req: Request, res: Response) => {
 
     // 3. If fully approved, execute payout
     if (signResult.fullyApproved) {
-      // Get the request details
-      const request =
-        await multisigCustodyLedgerService.getRequestById(requestId);
-      if (!request) {
-        return res
-          .status(404)
-          .json({ error: "Request not found after approval" });
-      }
-
       // Execute approved request in ledger
       const execResult =
         await multisigCustodyLedgerService.executeApprovedRequest(

@@ -12,8 +12,20 @@ const transactionModel = new TransactionModel();
  * Finds transactions stuck in 'pending' for over STALE_TRANSACTION_HOURS (default: 12).
  * For each stale transaction it calls the provider's Get Status endpoint:
  *   - 'completed' → finalises as completed
- *   - 'failed'    → finalises as failed
- *   - 'pending' or 'unknown' → expires as failed (no infinite pending in DB)
+ *   - 'failed'/'rejected' → finalises as failed
+ *   - 'pending', 'unknown', or an unreachable provider → finalises as
+ *     expired (#1793) — the provider never actually reported a failure, so
+ *     recording it as Failed would misrepresent it in disputes/refunds/
+ *     reporting as an active rejection rather than a timeout with no
+ *     infinite pending in DB.
+ *
+ * Follow-up (out of scope here): TransactionModel.findRefundableFailedPayouts
+ * and refundWorker.ts's eligibility check both key on
+ * TransactionStatus.Failed only, so a withdrawal that ends up Expired
+ * (rather than Failed) via this watchdog won't be auto-queued for refund.
+ * Whether an expired withdrawal should be treated the same as a failed one
+ * for refund purposes is a product/financial-risk decision, not a pure
+ * state-mapping fix — left for a follow-up rather than folded in here.
  */
 export async function runStaleTransactionWatchdog(
   service?: InstanceType<typeof MobileMoneyService>,
@@ -81,8 +93,9 @@ export async function runStaleTransactionWatchdog(
           );
           resolved++;
         } else {
-          // Still pending or unknown - expire it as failed
-          await transactionModel.updateStatus(row.id, TransactionStatus.Failed);
+          // Still pending or unknown at the provider - expired, not failed:
+          // the provider never actually rejected it.
+          await transactionModel.updateStatus(row.id, TransactionStatus.Expired);
           logger.warn(
             {
               transactionId: row.id,
@@ -94,8 +107,9 @@ export async function runStaleTransactionWatchdog(
           expired++;
         }
       } else {
-        // Can't verify with provider - mark as failed after stale period
-        await transactionModel.updateStatus(row.id, TransactionStatus.Failed);
+        // Can't verify with provider - expired after stale period (no
+        // failure was actually reported, we just couldn't confirm success).
+        await transactionModel.updateStatus(row.id, TransactionStatus.Expired);
         logger.warn(
           {
             transactionId: row.id,

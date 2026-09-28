@@ -1,4 +1,4 @@
-import * as StellarSdk from "stellar-sdk";
+import * as StellarSdk from "@stellar/stellar-sdk";
 import logger from "../utils/logger";
 import {
   horizonNodeFailuresTotal,
@@ -142,7 +142,9 @@ export class HorizonPool {
     this.config = { ...DEFAULT_CONFIG, ...config };
     this.nodes = urls.map((url) => ({
       url,
-      server: new StellarSdk.Horizon.Server(url),
+      server: new StellarSdk.Horizon.Server(url, {
+        allowHttp: url.startsWith("http://") || process.env.NODE_ENV === "test",
+      }),
       consecutiveFailures: 0,
       downUntil: 0,
     }));

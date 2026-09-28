@@ -10,6 +10,7 @@ import { runBalanceMonitorJob } from "./balanceMonitorJob";
 import { runSep31MonitorJob } from "./sep31MonitorJob";
 import { runFeeBumpJob } from "./feeBumpJob";
 import { runSep31FeeBumpJob } from "./sep31FeeBumpJob";
+import { runSponsorWalletMonitorJob } from "../services/stellar/feeBump";
 import { MonitoringService } from "../services/monitoringService";
 import { createPagerDutyService } from "../services/pagerDutyService";
 import { runProviderBalanceAlertJob } from "./balances";
@@ -20,6 +21,7 @@ import { runCrossChainMonitorJob } from "./crossChainMonitorJob";
 import { runDailySettlementJob } from "./dailySettlementJob";
 import { runDailyProviderReconciliation } from "./providerReconciliationJob";
 import { runReconciliationJob } from "./reconciliationJob";
+import { runLedgerReconciliationJob } from "./ledgerReconciliationJob";
 import { runDatabaseBackupJob } from "./databaseBackupJob";
 import { runDatabaseBackupVerifyJob } from "./databaseBackupVerifyJob";
 import { INDEX_REINDEX_CRON, INDEX_REINDEX_JOB_ENABLED } from "../config/env";
@@ -30,6 +32,8 @@ import { runRebalanceJobHandler } from "./rebalanceJob";
 import { startNotificationWorker } from "../workers/notificationWorker";
 import { runTravelRuleExportJob } from "../services/compliance/travelRuleExport";
 import { runDlqCleanupJob } from "../queue/dlq";
+import { runHighValueComplianceReportJob } from "./highValueComplianceReportJob";
+import { runStellarReconciliationJob } from "../workers/stellarReconciliation";
 
 interface JobConfig {
   name: string;
@@ -91,6 +95,12 @@ const JOBS: JobConfig[] = [
     // Every 30 seconds - bumps fees for stuck SEP-31 transactions
     schedule: process.env.SEP31_FEE_BUMP_CRON || "*/30 * * * * *",
     handler: runSep31FeeBumpJob,
+  },
+  {
+    name: "sponsor-wallet-monitor",
+    // Hourly - monitors dedicated Stellar fee-bump sponsor wallet balance
+    schedule: process.env.SPONSOR_WALLET_MONITOR_CRON || "0 * * * *",
+    handler: runSponsorWalletMonitorJob,
   },
   {
     name: "provider-balance-alert",
@@ -158,6 +168,18 @@ const JOBS: JobConfig[] = [
     handler: runReconciliationJob,
   },
   {
+    name: "ledger-reconciliation",
+    // Every 15 minutes - checks internal double-entry ledger consistency
+    schedule: process.env.LEDGER_RECONCILIATION_CRON || "*/15 * * * *",
+    handler: runLedgerReconciliationJob,
+  },
+  {
+    name: "stellar-anchor-reconciliation",
+    // Every 10 minutes - reconciles on-chain payment hashes against internal DB records
+    schedule: process.env.STELLAR_RECONCILIATION_CRON || "*/10 * * * *",
+    handler: runStellarReconciliationJob,
+  },
+  {
     name: "database-backup",
     // Daily at 2:00 AM
     schedule: process.env.DATABASE_BACKUP_CRON || "0 2 * * *",
@@ -193,6 +215,12 @@ const JOBS: JobConfig[] = [
     // Hourly - exports pending Travel Rule compliance records to regulatory reporting endpoints
     schedule: process.env.TRAVEL_RULE_EXPORT_CRON || "0 * * * *",
     handler: runTravelRuleExportJob,
+  },
+  {
+    name: "high-value-compliance-report",
+    // Hourly - backfills missing high-value compliance reports for eligible AML alerts
+    schedule: process.env.HIGH_VALUE_COMPLIANCE_REPORT_CRON || "15 * * * *",
+    handler: runHighValueComplianceReportJob,
   },
   {
     name: "dlq-cleanup",

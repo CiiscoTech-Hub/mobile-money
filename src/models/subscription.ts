@@ -17,16 +17,22 @@ export interface SubscriptionRow {
   retry_count: number;
   max_retries: number;
   retry_backoff_seconds: number;
-  metadata: any;
+  metadata: Record<string, unknown> | null;
+}
+
+export interface SubscriptionAttemptRow {
+  retry_count: number;
+  max_retries: number;
+  retry_backoff_seconds: number;
 }
 
 export class SubscriptionModel {
   async getDueSubscriptions(limit = 100): Promise<SubscriptionRow[]> {
-    const res = await queryRead(
+    const res = await queryRead<SubscriptionRow>(
       `SELECT * FROM subscriptions WHERE status = 'active' AND next_run_at <= NOW() ORDER BY next_run_at ASC LIMIT $1`,
       [limit],
     );
-    return res.rows.map((r: any) => ({
+    return res.rows.map((r) => ({
       ...r,
       phone_number: r.phone_number ? r.phone_number : null,
     }));
@@ -40,11 +46,11 @@ export class SubscriptionModel {
     currency?: string;
     interval: SubscriptionInterval;
     next_run_at?: string | null;
-    metadata?: any;
+    metadata?: Record<string, unknown> | null;
     max_retries?: number;
     retry_backoff_seconds?: number;
-  }) {
-    const res = await queryWrite(
+  }): Promise<SubscriptionRow> {
+    const res = await queryWrite<SubscriptionRow>(
       `INSERT INTO subscriptions (
          merchant_id, user_id, phone_number, amount, currency, interval, next_run_at, metadata, max_retries, retry_backoff_seconds
        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
@@ -64,17 +70,20 @@ export class SubscriptionModel {
     return res.rows[0];
   }
 
-  async listByMerchant(merchantId: string) {
-    const res = await queryRead(
+  async listByMerchant(merchantId: string): Promise<SubscriptionRow[]> {
+    const res = await queryRead<SubscriptionRow>(
       `SELECT * FROM subscriptions WHERE merchant_id = $1 ORDER BY created_at DESC`,
       [merchantId],
     );
     return res.rows;
   }
 
-  async update(id: string, fields: Record<string, any>) {
+  async update(
+    id: string,
+    fields: Record<string, unknown>,
+  ): Promise<SubscriptionRow | null> {
     const sets: string[] = [];
-    const params: any[] = [];
+    const params: unknown[] = [];
     let idx = 1;
     for (const [k, v] of Object.entries(fields)) {
       sets.push(`${k} = $${idx}`);
@@ -83,8 +92,8 @@ export class SubscriptionModel {
     }
     params.push(id);
     const q = `UPDATE subscriptions SET ${sets.join(", ")}, updated_at = NOW() WHERE id = $${idx} RETURNING *`;
-    const res = await queryWrite(q, params);
-    return res.rows[0];
+    const res = await queryWrite<SubscriptionRow>(q, params);
+    return res.rows[0] ?? null;
   }
 
   async delete(id: string) {
@@ -115,12 +124,14 @@ export class SubscriptionModel {
     );
   }
 
-  async incrementRetry(subscriptionId: string) {
-    const res = await queryWrite(
+  async incrementRetry(
+    subscriptionId: string,
+  ): Promise<SubscriptionAttemptRow | null> {
+    const res = await queryWrite<SubscriptionAttemptRow>(
       `UPDATE subscriptions SET retry_count = COALESCE(retry_count,0) + 1, updated_at = NOW() WHERE id = $1 RETURNING retry_count, max_retries, retry_backoff_seconds`,
       [subscriptionId],
     );
-    return res.rows[0];
+    return res.rows[0] ?? null;
   }
 
   async pause(subscriptionId: string) {
@@ -137,10 +148,11 @@ export class SubscriptionModel {
     );
   }
 
-  async getById(id: string) {
-    const res = await queryRead(`SELECT * FROM subscriptions WHERE id = $1`, [
-      id,
-    ]);
+  async getById(id: string): Promise<SubscriptionRow | null> {
+    const res = await queryRead<SubscriptionRow>(
+      `SELECT * FROM subscriptions WHERE id = $1`,
+      [id],
+    );
     return res.rows[0] ?? null;
   }
 }

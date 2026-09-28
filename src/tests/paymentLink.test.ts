@@ -7,7 +7,7 @@ import {
   jest,
 } from "@jest/globals";
 import request from "supertest";
-import { Keypair } from "stellar-sdk";
+import { Keypair } from "@stellar/stellar-sdk";
 
 // Initialize valid Stellar keys in environment BEFORE loading the app to satisfy startup config checks
 const randomKeypair = Keypair.random();
@@ -75,15 +75,6 @@ jest.mock("../middleware/auth", () => ({
     req.user = { id: "merchant-123", role: "merchant" };
     next();
   },
-}));
-
-// Mock spdy to prevent http_parser legacy import issue inside modern Node.js environments
-jest.mock("spdy", () => ({
-  createServer: jest.fn<any>().mockReturnValue({
-    listen: jest.fn<any>((port: any, cb: any) => {
-      if (cb) cb();
-    }),
-  }),
 }));
 
 // Mock MobileMoneyService to avoid loading legacy JS files during tests

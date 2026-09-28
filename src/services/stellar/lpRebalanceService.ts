@@ -1,5 +1,5 @@
 import logger from "../../utils/logger";
-import * as StellarSdk from "stellar-sdk";
+import * as StellarSdk from "@stellar/stellar-sdk";
 import { getStellarServer, getNetworkPassphrase } from "../../config/stellar";
 
 export interface ReserveConfig {

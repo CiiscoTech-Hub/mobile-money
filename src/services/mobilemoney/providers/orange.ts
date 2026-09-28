@@ -539,9 +539,6 @@ export class OrangeProvider extends BaseProvider {
             ...requestHeaders,
             Authorization: this.buildBearerAuthHeader(token),
             "Content-Type": requestHeaders["Content-Type"] ?? "application/json",
-            Authorization: `Bearer ${token}`,
-            "Content-Type":
-              requestHeaders["Content-Type"] ?? "application/json",
           },
         });
 

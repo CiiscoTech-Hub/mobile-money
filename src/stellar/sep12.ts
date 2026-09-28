@@ -1,5 +1,5 @@
 import logger from "../utils/logger";
-import { Router, Request, Response } from "express";
+import { Router, Request, Response, NextFunction } from "express";
 import { Pool } from "pg";
 import { sep12RateLimiter } from "../middleware/rateLimit";
 import { upload } from "../middleware/upload";
@@ -13,11 +13,18 @@ const isoCountryCode = z
   .string()
   .refine(
     (val) => validateCountryCode(val).valid,
-    (val) => ({ message: `"${val}" is not a recognised ISO 3166-1 alpha-2 or alpha-3 country code` }),
+    { message: "Invalid ISO 3166-1 country code" },
   );
 import { ERROR_CODES } from "../constants/errorCodes";
 import { createError } from "../middleware/errorHandler";
 import { UserModel } from "../models/users";
+import { CustomerDataMaskingService } from "../services/customerDataMaskingService";
+import { createDeleteCustomerHandler } from "../routes/sep12";
+import {
+  kycSanitizeBody,
+  sanitizeKycPayload,
+  sanitizeKycString,
+} from "../validators/kycSanitizer";
 
 /**
  * SEP-12: KYC API
@@ -146,55 +153,6 @@ const PutCustomerSchema = z.object({
   employer_name: z.string().optional(),
   employer_address: z.string().optional(),
 }).catchall(z.any()); // Catch all unmapped dynamic fields
-const PutCustomerSchema = z
-  .object({
-    account: z.string().optional(),
-    memo: z.string().optional(),
-    memo_type: z.enum(["id", "hash", "text"]).optional(),
-    type: z.string().optional(),
-
-    // Natural person fields
-    first_name: z.string().optional(),
-    last_name: z.string().optional(),
-    email_address: z.string().email().optional(),
-    mobile_number: z.string().optional(),
-    birth_date: z.string().optional(),
-    birth_place: z.string().optional(),
-    birth_country: z.string().optional(),
-
-    // Address
-    address: z.string().optional(),
-    address_country_code: z.string().length(3).optional(),
-    state_or_province: z.string().optional(),
-    city: z.string().optional(),
-    postal_code: z.string().optional(),
-
-    // ID document
-    id_type: z.string().optional(),
-    id_country_code: z.string().length(3).optional(),
-    id_issue_date: z.string().optional(),
-    id_expiration_date: z.string().optional(),
-    id_number: z.string().optional(),
-
-    // Photos (base64 or URLs)
-    photo_id_front: z.string().optional(),
-    photo_id_back: z.string().optional(),
-    photo_proof_residence: z.string().optional(),
-
-    // Organization
-    organization_name: z.string().optional(),
-    organization_registration_number: z.string().optional(),
-    organization_registration_date: z.string().optional(),
-    organization_registered_address: z.string().optional(),
-
-    // Additional
-    tax_id: z.string().optional(),
-    tax_id_name: z.string().optional(),
-    occupation: z.string().optional(),
-    employer_name: z.string().optional(),
-    employer_address: z.string().optional(),
-  })
-  .catchall(z.any()); // Catch all unmapped dynamic fields
 
 // ============================================================================
 // SEP-12 Service
@@ -376,6 +334,7 @@ export class Sep12Service {
         FROM users u
         LEFT JOIN kyc_applicants ka ON u.id = ka.user_id
         WHERE u.stellar_address = $1
+          AND u.anonymized_at IS NULL
         ORDER BY ka.updated_at DESC
         LIMIT 1
       `;
@@ -474,43 +433,67 @@ export class Sep12Service {
   ): Promise<Sep12CustomerResponse> {
     try {
       const validatedData = PutCustomerSchema.parse(data);
-
+      // Sanitize all string fields (issue #1973): reject HTML/SQL/command
+      // injection payloads and escape the surviving values before persistence.
       const {
         account,
         memo,
         memo_type,
         type,
-        first_name,
-        last_name,
+        first_name: rawFirstName,
+        last_name: rawLastName,
         email_address,
         mobile_number,
         birth_date,
         birth_place,
         birth_country,
-        address,
+        address: rawAddress,
         address_country_code,
         state_or_province,
-        city,
+        city: rawCity,
         postal_code,
         id_type,
         id_country_code,
         id_issue_date,
         id_expiration_date,
-        id_number,
+        id_number: rawIdNumber,
         photo_id_front,
         photo_id_back,
         photo_proof_residence,
-        organization_name,
-        organization_registration_number,
+        organization_name: rawOrganizationName,
+        organization_registration_number: rawOrganizationRegNumber,
         organization_registration_date,
-        organization_registered_address,
-        tax_id,
+        organization_registered_address: rawOrganizationAddress,
+        tax_id: rawTaxId,
         tax_id_name,
-        occupation,
-        employer_name,
-        employer_address,
+        occupation: rawOccupation,
+        employer_name: rawEmployerName,
+        employer_address: rawEmployerAddress,
         ...customFields
       } = validatedData;
+
+      const first_name = rawFirstName ? sanitizeKycString("first_name", rawFirstName) : rawFirstName;
+      const last_name = rawLastName ? sanitizeKycString("last_name", rawLastName) : rawLastName;
+      const address = rawAddress ? sanitizeKycString("address", rawAddress) : rawAddress;
+      const city = rawCity ? sanitizeKycString("city", rawCity) : rawCity;
+      const id_number = rawIdNumber ? sanitizeKycString("id_number", rawIdNumber) : rawIdNumber;
+      const organization_name = rawOrganizationName
+        ? sanitizeKycString("organization_name", rawOrganizationName)
+        : rawOrganizationName;
+      const organization_registration_number = rawOrganizationRegNumber
+        ? sanitizeKycString("organization_registration_number", rawOrganizationRegNumber)
+        : rawOrganizationRegNumber;
+      const organization_registered_address = rawOrganizationAddress
+        ? sanitizeKycString("organization_registered_address", rawOrganizationAddress)
+        : rawOrganizationAddress;
+      const tax_id = rawTaxId ? sanitizeKycString("tax_id", rawTaxId) : rawTaxId;
+      const occupation = rawOccupation ? sanitizeKycString("occupation", rawOccupation) : rawOccupation;
+      const employer_name = rawEmployerName
+        ? sanitizeKycString("employer_name", rawEmployerName)
+        : rawEmployerName;
+      const employer_address = rawEmployerAddress
+        ? sanitizeKycString("employer_address", rawEmployerAddress)
+        : rawEmployerAddress;
 
       // Find or create user by Stellar account
       let userId: string;
@@ -568,7 +551,9 @@ export class Sep12Service {
             }
           : undefined,
         custom_fields:
-          Object.keys(customFields).length > 0 ? customFields : undefined,
+          Object.keys(customFields).length > 0
+            ? (sanitizeKycPayload(customFields) as typeof customFields)
+            : undefined,
       };
 
       let applicant;
@@ -658,24 +643,18 @@ export class Sep12Service {
   }
 
   /**
-   * Delete customer information
+   * Delete customer information (GDPR / NDPR erasure).
+   *
+   * Personal data is anonymized rather than hard-deleted so the financial
+   * audit trail survives — see {@link CustomerDataMaskingService}.
+   *
+   * @returns `false` when no customer exists for the account.
    */
-  async deleteCustomer(account: string): Promise<void> {
-    try {
-      const deleteQuery = `
-        DELETE FROM kyc_applicants
-        WHERE user_id IN (
-          SELECT id FROM users WHERE stellar_address = $1
-        )
-      `;
-
-      await this.db.query(deleteQuery, [account]);
-    } catch (error) {
-      logger.error("Error deleting customer:", error);
-      throw new Error(
-        `Failed to delete customer: ${error instanceof Error ? error.message : "Unknown error"}`,
-      );
-    }
+  async deleteCustomer(account: string): Promise<boolean> {
+    const result = await new CustomerDataMaskingService(
+      this.db,
+    ).anonymizeByStellarAccount(account);
+    return result !== null;
   }
 
   /**
@@ -737,6 +716,7 @@ export const createSep12Router = (db: Pool): Router => {
 
       res.json(customer);
     } catch (error: any) {
+      if (error.statusCode) throw error;
       logger.error("[SEP-12] Error getting customer:", error);
       throw createError(
         ERROR_CODES.INTERNAL_ERROR,
@@ -755,16 +735,54 @@ export const createSep12Router = (db: Pool): Router => {
   router.put(
     "/customer",
     sep12Limiter,
-    upload.any(),
+    (req: Request, res: Response, next: NextFunction) => {
+      upload.any()(req, res, (err: any) => {
+        if (err) {
+          return next(
+            createError(
+              ERROR_CODES.INVALID_INPUT,
+              err.message || "File upload failed",
+              { error: err.message || "File upload failed" },
+            ),
+          );
+        }
+        next();
+      });
+    },
+    kycSanitizeBody,
     async (req: Request, res: Response) => {
       try {
         const customerData = { ...req.body };
 
-        // Support multipart upload: parse custom documents and map as base64 fields so KYC validation parses them
+        // Support multipart binary document uploads (#1943)
         if (req.files && Array.isArray(req.files)) {
-          req.files.forEach((file: any) => {
-            customerData[file.fieldname] = file.buffer.toString("base64");
-          });
+          const path = await import("path");
+          const crypto = await import("crypto");
+          const { ALLOWED_MIME_TYPES, ALLOWED_EXTENSIONS } = await import("../middleware/upload.js");
+
+          for (const file of req.files as Express.Multer.File[]) {
+            const ext = path.extname(file.originalname).toLowerCase();
+            if (file.size > 10 * 1024 * 1024) {
+              throw createError(
+                ERROR_CODES.INVALID_INPUT,
+                "File size exceeds 10MB limit",
+                { error: "File size exceeds 10MB limit" },
+              );
+            }
+            if (!ALLOWED_MIME_TYPES.includes(file.mimetype) || !ALLOWED_EXTENSIONS.includes(ext)) {
+              throw createError(
+                ERROR_CODES.INVALID_INPUT,
+                `Invalid file format. Allowed: PDF, PNG, JPEG`,
+                { error: `Invalid file format. Allowed: PDF, PNG, JPEG` },
+              );
+            }
+
+            // Generate secure encrypted reference for stored document asset
+            const hash = crypto.createHash("sha256").update(file.buffer).digest("hex");
+            const base64Data = file.buffer.toString("base64");
+            const encryptedRef = `enc_doc_${hash.substring(0, 16)}:${base64Data}`;
+            customerData[file.fieldname] = encryptedRef;
+          }
         }
 
         const customer = await sep12Service.putCustomer(customerData);
@@ -784,39 +802,12 @@ export const createSep12Router = (db: Pool): Router => {
 
   /**
    * DELETE /customer/:account
-   * * Delete customer information (GDPR compliance)
+   * * Anonymize customer PII (GDPR / NDPR) while keeping the AML audit trail.
    */
   router.delete(
     "/customer/:account",
     sep12Limiter,
-    async (req: Request, res: Response) => {
-      try {
-        const { account } = req.params;
-
-        if (!account) {
-          throw createError(
-            ERROR_CODES.INVALID_INPUT,
-            "account parameter is required",
-            {
-              error: "account parameter is required",
-            },
-          );
-        }
-
-        await sep12Service.deleteCustomer(account);
-
-        res.status(204).send();
-      } catch (error: any) {
-        logger.error("[SEP-12] Error deleting customer:", error);
-        throw createError(
-          ERROR_CODES.INTERNAL_ERROR,
-          error.message || "Failed to delete customer information",
-          {
-            error: error.message || "Failed to delete customer information",
-          },
-        );
-      }
-    },
+    createDeleteCustomerHandler(new CustomerDataMaskingService(db)),
   );
 
   return router;

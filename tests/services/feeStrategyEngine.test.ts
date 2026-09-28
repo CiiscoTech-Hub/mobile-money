@@ -24,9 +24,14 @@ jest.mock("../../src/utils/fees", () => ({
   mapVolumeToTier: jest.fn().mockReturnValue({ discountPercent: 0 }),
 }));
 
+jest.mock("../../src/utils/volatility", () => ({
+  computeVolatility: jest.fn().mockResolvedValue(null),
+}));
+
 import { pool } from "../../src/config/database";
 import { redisClient } from "../../src/config/redis";
 import { getThirtyDayVolume, mapVolumeToTier } from "../../src/utils/fees";
+import { computeVolatility } from "../../src/utils/volatility";
 import {
   FeeStrategyEngine,
   FeeStrategy,
@@ -37,6 +42,7 @@ const mockPool = pool as jest.Mocked<typeof pool>;
 const mockRedis = redisClient as jest.Mocked<typeof redisClient>;
 const mockGetThirtyDayVolume = getThirtyDayVolume as jest.Mock;
 const mockMapVolumeToTier = mapVolumeToTier as jest.Mock;
+const mockComputeVolatility = computeVolatility as jest.Mock;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -87,6 +93,10 @@ function pgResult(strategies: FeeStrategy[]) {
     override_percentage: s.overridePercentage ?? null,
     override_flat_amount: s.overrideFlatAmount ?? null,
     volume_tiers: s.volumeTiers ?? null,
+    volatility_base_currency: s.volatilityBaseCurrency ?? null,
+    volatility_quote_currency: s.volatilityQuoteCurrency ?? null,
+    volatility_multiplier: s.volatilityMultiplier ?? null,
+    volatility_window_hours: s.volatilityWindowHours ?? null,
     created_by: s.createdBy,
     updated_by: s.updatedBy,
     created_at: s.createdAt,
@@ -306,6 +316,106 @@ describe("FeeStrategyEngine", () => {
       );
       const result = await engine.calculateFee({ amount: 100 }); // below all tiers
       expect(result.fee).toBe(0);
+    });
+  });
+
+  // ── Volatility-based strategy ──────────────────────────────────────────────
+
+  describe("VolatilityBasedFeeStrategy", () => {
+    it("applies base percentage alone when volatility data is unavailable", async () => {
+      const strategy = makeStrategy({
+        strategyType: "volatility_based",
+        feePercentage: 0.5,
+        feeMinimum: 0,
+        feeMaximum: 5000,
+        volatilityBaseCurrency: "XLM",
+        volatilityQuoteCurrency: "USD",
+        volatilityMultiplier: 1.5,
+      });
+      mockComputeVolatility.mockResolvedValueOnce(null);
+      mockPool.query.mockResolvedValueOnce(pgResult([strategy]) as any);
+
+      const result = await engine.calculateFee({ amount: 10_000 });
+
+      expect(result.fee).toBe(50); // 10000 * 0.5%, no surcharge
+      expect(result.breakdown.volatilityCoefficient).toBeUndefined();
+    });
+
+    it("adds a volatility surcharge scaled by the configured multiplier", async () => {
+      const strategy = makeStrategy({
+        strategyType: "volatility_based",
+        feePercentage: 0.5,
+        feeMinimum: 0,
+        feeMaximum: 5000,
+        volatilityBaseCurrency: "XLM",
+        volatilityQuoteCurrency: "USD",
+        volatilityMultiplier: 2,
+        volatilityWindowHours: 12,
+      });
+      mockComputeVolatility.mockResolvedValueOnce({
+        mean: 0.15,
+        stddev: 0.05,
+        coefficientOfVariation: 10, // 10%
+        sampleSize: 5,
+      });
+      mockPool.query.mockResolvedValueOnce(pgResult([strategy]) as any);
+
+      // Effective % = 0.5 + 10 * 2 = 20.5%
+      const result = await engine.calculateFee({ amount: 10_000 });
+
+      expect(result.fee).toBe(2050);
+      expect(result.breakdown.volatilityCoefficient).toBe(10);
+      expect(mockComputeVolatility).toHaveBeenCalledWith("XLM", "USD", 12);
+    });
+
+    it("clamps the volatility-surcharged fee to feeMaximum", async () => {
+      const strategy = makeStrategy({
+        strategyType: "volatility_based",
+        feePercentage: 0.5,
+        feeMinimum: 0,
+        feeMaximum: 100,
+        volatilityBaseCurrency: "XLM",
+        volatilityQuoteCurrency: "USD",
+        volatilityMultiplier: 5,
+      });
+      mockComputeVolatility.mockResolvedValueOnce({
+        mean: 1,
+        stddev: 1,
+        coefficientOfVariation: 50,
+        sampleSize: 5,
+      });
+      mockPool.query.mockResolvedValueOnce(pgResult([strategy]) as any);
+
+      const result = await engine.calculateFee({ amount: 10_000 });
+
+      expect(result.fee).toBe(100);
+      expect(result.breakdown.appliedMaximum).toBe(100);
+    });
+
+    it("defaults volatilityMultiplier to 1 and window to 24h when not configured", async () => {
+      const strategy = makeStrategy({
+        strategyType: "volatility_based",
+        feePercentage: 1,
+        feeMinimum: 0,
+        feeMaximum: 5000,
+        volatilityBaseCurrency: "USD",
+        volatilityQuoteCurrency: "XAF",
+        volatilityMultiplier: undefined,
+        volatilityWindowHours: undefined,
+      });
+      mockComputeVolatility.mockResolvedValueOnce({
+        mean: 600,
+        stddev: 6,
+        coefficientOfVariation: 1,
+        sampleSize: 3,
+      });
+      mockPool.query.mockResolvedValueOnce(pgResult([strategy]) as any);
+
+      // Effective % = 1 + 1 * 1 = 2%
+      const result = await engine.calculateFee({ amount: 10_000 });
+
+      expect(result.fee).toBe(200);
+      expect(mockComputeVolatility).toHaveBeenCalledWith("USD", "XAF", 24);
     });
   });
 

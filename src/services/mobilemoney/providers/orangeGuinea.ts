@@ -34,16 +34,14 @@ type OrangeGuineaResult = {
   reference?: string;
 };
 
-export class OrangeGuineaProvider {
-  private readonly baseUrl: string;
+import { BaseProvider } from "../../providers/baseProvider";
+
+export class OrangeGuineaProvider extends BaseProvider {
   private readonly authPath: string;
   private readonly paymentPath: string;
   private readonly payoutPath: string;
   private readonly statusPath: string;
-  private readonly apiKey: string;
-  private readonly apiSecret: string;
   private readonly currency: string;
-  private readonly timeoutMs: number;
   private readonly maxAttempts: number;
   private readonly refreshSkewMs: number;
   private readonly sessionTtlMs: number;
@@ -60,35 +58,23 @@ export class OrangeGuineaProvider {
   private destroyed = false;
 
   constructor() {
+    super({
+      apiKey: process.env.ORANGE_GUINEA_API_KEY || "",
+      apiSecret: process.env.ORANGE_GUINEA_API_SECRET || "",
+      baseUrl: process.env.ORANGE_GUINEA_BASE_URL ?? DEFAULT_BASE_URL,
+      timeoutMs: Number(process.env.ORANGE_GUINEA_TIMEOUT_MS || DEFAULT_TIMEOUT_MS),
+    });
     this.clock = Date.now;
-    this.baseUrl = process.env.ORANGE_GUINEA_BASE_URL ?? DEFAULT_BASE_URL;
-    this.authPath =
-      process.env.ORANGE_GUINEA_AUTH_PATH ?? DEFAULT_AUTH_PATH;
-    this.paymentPath =
-      process.env.ORANGE_GUINEA_PAYMENT_PATH ?? DEFAULT_PAYMENT_PATH;
-    this.payoutPath =
-      process.env.ORANGE_GUINEA_PAYOUT_PATH ?? DEFAULT_PAYOUT_PATH;
-    this.statusPath =
-      process.env.ORANGE_GUINEA_STATUS_PATH ?? DEFAULT_STATUS_PATH;
-    this.apiKey = process.env.ORANGE_GUINEA_API_KEY ?? "";
-    this.apiSecret = process.env.ORANGE_GUINEA_API_SECRET ?? "";
+    this.authPath = process.env.ORANGE_GUINEA_AUTH_PATH ?? DEFAULT_AUTH_PATH;
+    this.paymentPath = process.env.ORANGE_GUINEA_PAYMENT_PATH ?? DEFAULT_PAYMENT_PATH;
+    this.payoutPath = process.env.ORANGE_GUINEA_PAYOUT_PATH ?? DEFAULT_PAYOUT_PATH;
+    this.statusPath = process.env.ORANGE_GUINEA_STATUS_PATH ?? DEFAULT_STATUS_PATH;
     this.currency = process.env.ORANGE_GUINEA_CURRENCY ?? DEFAULT_CURRENCY;
-    this.timeoutMs = Number(
-      process.env.ORANGE_GUINEA_TIMEOUT_MS ?? DEFAULT_TIMEOUT_MS,
-    );
-    this.maxAttempts = Number(
-      process.env.ORANGE_GUINEA_MAX_ATTEMPTS ?? DEFAULT_MAX_ATTEMPTS,
-    );
-    this.refreshSkewMs = Number(
-      process.env.ORANGE_GUINEA_REFRESH_SKEW_MS ?? DEFAULT_REFRESH_SKEW_MS,
-    );
-    this.sessionTtlMs = Number(
-      process.env.ORANGE_GUINEA_SESSION_TTL_MS ?? DEFAULT_SESSION_TTL_MS,
-    );
+    this.maxAttempts = Number(process.env.ORANGE_GUINEA_MAX_ATTEMPTS || DEFAULT_MAX_ATTEMPTS);
+    this.refreshSkewMs = Number(process.env.ORANGE_GUINEA_REFRESH_SKEW_MS || DEFAULT_REFRESH_SKEW_MS);
+    this.sessionTtlMs = Number(process.env.ORANGE_GUINEA_SESSION_TTL_MS || DEFAULT_SESSION_TTL_MS);
     this.callbackSecret = process.env.ORANGE_GUINEA_CALLBACK_SECRET ?? "";
-    this.callbackSignatureHeader =
-      process.env.ORANGE_GUINEA_CALLBACK_SIGNATURE_HEADER?.toLowerCase() ??
-      "x-callback-signature";
+    this.callbackSignatureHeader = process.env.ORANGE_GUINEA_CALLBACK_SIGNATURE_HEADER ?? "X-Oapi-Signature";
 
     this.httpClient = axios.create({
       baseURL: this.baseUrl,
@@ -426,7 +412,7 @@ export class OrangeGuineaProvider {
     throw lastError ?? new Error("OrangeGuinea request failed");
   }
 
-  private async getAccessToken(forceRefresh = false): Promise<string> {
+  async getAccessToken(forceRefresh = false): Promise<string> {
     const now = this.clock();
     if (
       !forceRefresh &&

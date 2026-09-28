@@ -36,7 +36,7 @@ router.post("/lock", async (req: Request, res: Response) => {
 
     res.json({
       xdr: tx.toEnvelope().toXDR("base64"),
-      hash: tx.hash().toString("hex"),
+      hash: Buffer.from(tx.hash()).toString("hex"),
     });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -53,7 +53,7 @@ router.post("/claim", async (req: Request, res: Response) => {
 
     res.json({
       xdr: tx.toEnvelope().toXDR("base64"),
-      hash: tx.hash().toString("hex"),
+      hash: Buffer.from(tx.hash()).toString("hex"),
     });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -70,7 +70,7 @@ router.post("/refund", async (req: Request, res: Response) => {
 
     res.json({
       xdr: tx.toEnvelope().toXDR("base64"),
-      hash: tx.hash().toString("hex"),
+      hash: Buffer.from(tx.hash()).toString("hex"),
     });
   } catch (err: any) {
     res.status(400).json({ error: err.message });

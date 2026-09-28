@@ -1,4 +1,4 @@
-import * as StellarSdk from "stellar-sdk";
+import * as StellarSdk from "@stellar/stellar-sdk";
 import {
   buildTransactionWithFeeBump,
   calculateMaxFee,
@@ -29,6 +29,10 @@ function makeAccount(accountId: string, sequence = "123") {
 function makeServer(overrides: Record<string, unknown> = {}) {
   return {
     fetchBaseFee: jest.fn().mockResolvedValue(100),
+    feeStats: jest.fn().mockResolvedValue({
+      last_ledger_base_fee: "100",
+      fee_charged: { p90: "100" },
+    }),
     fetchTimebounds: jest.fn().mockResolvedValue({
       minTime: "0",
       maxTime: "1700000000",
@@ -121,7 +125,10 @@ describe("stellar fee bump transactions", () => {
 
   it("enforces the configured fee cap for fee-bumped transactions", async () => {
     const server = makeServer({
-      fetchBaseFee: jest.fn().mockResolvedValue(300),
+      feeStats: jest.fn().mockResolvedValue({
+        last_ledger_base_fee: "300",
+        fee_charged: { p90: "300" },
+      }),
     });
     mockGetStellarServer.mockReturnValue(server);
     mockGetFeeBumpConfig.mockReturnValue({

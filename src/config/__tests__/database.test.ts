@@ -112,3 +112,72 @@ describe("Database pool configuration (#1652)", () => {
     });
   });
 });
+
+describe("Transactions and Connection Timeouts (#1596)", () => {
+  const originalEnv = { ...process.env };
+
+  afterEach(() => {
+    process.env = { ...originalEnv };
+    jest.resetModules();
+    jest.restoreAllMocks();
+  });
+
+  it("applies query and statement timeout configurations", () => {
+    process.env.DB_QUERY_TIMEOUT_MS = "15000";
+    process.env.DB_STATEMENT_TIMEOUT_MS = "12000";
+    
+    jest.isolateModules(() => {
+      const config = require("../../config/database");
+      expect(config.pool.options.query_timeout).toBe(15000);
+      expect(config.pool.options.statement_timeout).toBe(12000);
+    });
+  });
+
+  it("should successfully commit a transaction and release the client", async () => {
+    let config: any;
+    jest.isolateModules(() => {
+      config = require("../../config/database");
+    });
+
+    const mockRelease = jest.fn();
+    const mockQuery = jest.fn().mockResolvedValue({ rows: [] });
+    
+    // Spy on the pool to intercept the connect method
+    jest.spyOn(config.pool, 'connect').mockResolvedValue({
+      query: mockQuery,
+      release: mockRelease
+    } as any);
+
+    await config.executeTransaction([{ text: 'UPDATE users SET name = $1', params: ['Test'] }]);
+
+    expect(mockQuery).toHaveBeenCalledWith('BEGIN');
+    expect(mockQuery).toHaveBeenCalledWith('UPDATE users SET name = $1', ['Test']);
+    expect(mockQuery).toHaveBeenCalledWith('COMMIT');
+    expect(mockRelease).toHaveBeenCalledTimes(1);
+  });
+
+  it("should rollback and release the connection when a query timeout error occurs", async () => {
+    let config: any;
+    jest.isolateModules(() => {
+      config = require("../../config/database");
+    });
+
+    const mockRelease = jest.fn();
+    const mockQuery = jest.fn()
+      .mockResolvedValueOnce(undefined) // Mock successful BEGIN
+      .mockRejectedValueOnce(new Error('Query read timeout')); // Mock failing query
+
+    jest.spyOn(config.pool, 'connect').mockResolvedValue({
+      query: mockQuery,
+      release: mockRelease
+    } as any);
+
+    await expect(
+      config.executeTransaction([{ text: 'SELECT pg_sleep(15)' }])
+    ).rejects.toThrow('Query read timeout');
+
+    expect(mockQuery).toHaveBeenCalledWith('BEGIN');
+    expect(mockQuery).toHaveBeenCalledWith('ROLLBACK');
+    expect(mockRelease).toHaveBeenCalledTimes(1);
+  });
+});
