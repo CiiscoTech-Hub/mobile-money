@@ -10,6 +10,20 @@
 //! Admin ownership moves in two steps: the current admin proposes a new
 //! admin, who can accept only after a 24-hour delay. The current admin can
 //! revoke the proposal at any time before it is accepted.
+//!
+//! The settlement fee — the parameter most directly exposed to a malicious
+//! or mistaken admin, since it is taken out of every off-ramp payout — goes
+//! through the same propose-then-execute shape as admin transfer: the admin
+//! proposes a new fee, and it only takes effect after [`FEE_TIMELOCK_DELAY`]
+//! (24 hours), giving depositors time to react before it lands. The
+//! blacklist / fee-tier registry addresses are lower-risk wiring (screening
+//! and discount lookups, not fund movement) set once at deploy time, so they
+//! stay immediate and admin-gated like before.
+//!
+//! An emergency circuit breaker lets the admin instantly `pause` deposits
+//! and settlements — with no delay, unlike the timelocked parameter path —
+//! in response to an upstream provider outage or a suspicious transaction
+//! spike, and `unpause` once the issue is resolved.
 
 #[cfg(test)]
 mod test;
@@ -23,6 +37,8 @@ use soroban_sdk::{
 
 /// Delay between proposing and accepting a new admin (24 hours).
 pub const ADMIN_TRANSFER_DELAY: u64 = 24 * 60 * 60;
+/// Delay between proposing and executing a new settlement fee (24 hours).
+pub const FEE_TIMELOCK_DELAY: u64 = 24 * 60 * 60;
 /// Basis-point denominator (100%).
 pub const BPS_DENOMINATOR: i128 = 10_000;
 /// Standard fee can never exceed 10%.
@@ -64,6 +80,12 @@ pub enum BridgeError {
     /// Proposed admin must differ from the current admin.
     InvalidAdmin = 8,
     InsufficientBalance = 9,
+    /// No fee update is pending.
+    NoPendingFeeUpdate = 10,
+    /// The 24-hour timelock has not elapsed yet.
+    FeeUpdateNotReady = 11,
+    /// Deposits and settlements are halted by the emergency circuit breaker.
+    ContractPaused = 12,
 }
 
 // ── Types & storage ──────────────────────────────────────────────────────────
@@ -88,6 +110,16 @@ pub struct Settlement {
     pub payout: i128,
 }
 
+/// A proposed settlement fee awaiting its timelock delay before it can execute.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingFeeUpdate {
+    pub fee_bps: u32,
+    pub proposed_at: u64,
+    /// Earliest ledger timestamp at which `execute_fee_update` succeeds.
+    pub execute_after: u64,
+}
+
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
@@ -98,6 +130,8 @@ pub enum DataKey {
     FeeBps,
     Blacklist,
     FeeTier,
+    PendingFeeUpdate,
+    Paused,
 }
 
 // ── Events ───────────────────────────────────────────────────────────────────
@@ -143,6 +177,44 @@ pub struct Settled {
     pub to: Address,
     pub amount: i128,
     pub fee: i128,
+}
+
+#[contractevent(topics = ["bridge", "fee_update_proposed"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeUpdateProposed {
+    #[topic]
+    pub admin: Address,
+    pub fee_bps: u32,
+    pub execute_after: u64,
+}
+
+#[contractevent(topics = ["bridge", "fee_update_revoked"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeUpdateRevoked {
+    #[topic]
+    pub admin: Address,
+}
+
+#[contractevent(topics = ["bridge", "fee_update_executed"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeUpdateExecuted {
+    #[topic]
+    pub admin: Address,
+    pub fee_bps: u32,
+}
+
+#[contractevent(topics = ["bridge", "paused"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EmergencyPaused {
+    #[topic]
+    pub admin: Address,
+}
+
+#[contractevent(topics = ["bridge", "unpaused"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EmergencyUnpaused {
+    #[topic]
+    pub admin: Address,
 }
 
 // ── Contract ─────────────────────────────────────────────────────────────────
@@ -275,13 +347,104 @@ impl BridgeContract {
         Ok(())
     }
 
-    pub fn set_fee_bps(env: Env, fee_bps: u32) -> Result<(), BridgeError> {
-        Self::require_admin(&env)?;
+    // ── Settlement fee (timelocked) ──────────────────────────────────────────
+    //
+    // The fee is the parameter most directly felt by depositors, so instead
+    // of an immediate setter it goes through the same propose-then-execute
+    // shape as admin transfer: `propose_fee_bps` queues the new rate, and it
+    // only takes effect [`FEE_TIMELOCK_DELAY`] seconds later via
+    // `execute_fee_update`. Only one change may be queued at a time.
+
+    /// Propose a new standard settlement fee (in basis points, max 10%).
+    pub fn propose_fee_bps(env: Env, fee_bps: u32) -> Result<PendingFeeUpdate, BridgeError> {
+        let admin = Self::require_admin(&env)?;
         if fee_bps > MAX_FEE_BPS {
             return Err(BridgeError::InvalidFee);
         }
-        env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
+
+        let now = env.ledger().timestamp();
+        let pending = PendingFeeUpdate {
+            fee_bps,
+            proposed_at: now,
+            execute_after: now + FEE_TIMELOCK_DELAY,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingFeeUpdate, &pending);
+
+        FeeUpdateProposed {
+            admin,
+            fee_bps,
+            execute_after: pending.execute_after,
+        }
+        .publish(&env);
+        Ok(pending)
+    }
+
+    /// Cancel the pending fee update.
+    pub fn revoke_fee_update(env: Env) -> Result<(), BridgeError> {
+        let admin = Self::require_admin(&env)?;
+        Self::pending_fee_update(&env)?;
+        env.storage().instance().remove(&DataKey::PendingFeeUpdate);
+
+        FeeUpdateRevoked { admin }.publish(&env);
         Ok(())
+    }
+
+    /// Apply the pending fee update. Must be at least [`FEE_TIMELOCK_DELAY`]
+    /// seconds after it was proposed.
+    pub fn execute_fee_update(env: Env) -> Result<(), BridgeError> {
+        let admin = Self::require_admin(&env)?;
+        let pending = Self::pending_fee_update(&env)?;
+
+        if env.ledger().timestamp() < pending.execute_after {
+            return Err(BridgeError::FeeUpdateNotReady);
+        }
+
+        env.storage().instance().remove(&DataKey::PendingFeeUpdate);
+        env.storage()
+            .instance()
+            .set(&DataKey::FeeBps, &pending.fee_bps);
+
+        FeeUpdateExecuted {
+            admin,
+            fee_bps: pending.fee_bps,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    pub fn get_pending_fee_update(env: Env) -> Option<PendingFeeUpdate> {
+        env.storage().instance().get(&DataKey::PendingFeeUpdate)
+    }
+
+    // ── Emergency circuit breaker ────────────────────────────────────────────
+    //
+    // Unlike the fee timelock above, pausing takes effect immediately — it
+    // exists precisely so the admin can react in real time to an upstream
+    // provider outage or a suspicious transaction spike, without waiting out
+    // a 24-hour delay. It halts `deposit` and `settle`; admin/governance
+    // calls (including finishing a pending fee update) remain available so
+    // the situation can still be resolved while paused.
+
+    /// Immediately halt deposits and settlements.
+    pub fn pause(env: Env) -> Result<(), BridgeError> {
+        let admin = Self::require_admin(&env)?;
+        env.storage().instance().set(&DataKey::Paused, &true);
+        EmergencyPaused { admin }.publish(&env);
+        Ok(())
+    }
+
+    /// Resume deposits and settlements.
+    pub fn unpause(env: Env) -> Result<(), BridgeError> {
+        let admin = Self::require_admin(&env)?;
+        env.storage().instance().set(&DataKey::Paused, &false);
+        EmergencyUnpaused { admin }.publish(&env);
+        Ok(())
+    }
+
+    pub fn is_paused(env: Env) -> bool {
+        env.storage().instance().get(&DataKey::Paused).unwrap_or(false)
     }
 
     pub fn get_blacklist(env: Env) -> Option<Address> {
@@ -303,6 +466,7 @@ impl BridgeContract {
 
     /// On-ramp: move `amount` tokens from `from` into the bridge.
     pub fn deposit(env: Env, from: Address, amount: i128) -> Result<(), BridgeError> {
+        Self::require_not_paused(&env)?;
         from.require_auth();
         if amount <= 0 {
             return Err(BridgeError::InvalidAmount);
@@ -345,6 +509,7 @@ impl BridgeContract {
     /// Off-ramp settlement: pay `amount` minus the (discounted) fee to `to`
     /// and the fee to the fee recipient. Admin only.
     pub fn settle(env: Env, to: Address, amount: i128) -> Result<Settlement, BridgeError> {
+        Self::require_not_paused(&env)?;
         Self::require_admin(&env)?;
         Self::ensure_not_blacklisted(&env, &to)?;
 
@@ -387,6 +552,17 @@ impl BridgeContract {
 
     fn pending_admin(env: &Env) -> Result<PendingAdmin, BridgeError> {
         Self::get_pending_admin(env.clone()).ok_or(BridgeError::NoPendingAdmin)
+    }
+
+    fn pending_fee_update(env: &Env) -> Result<PendingFeeUpdate, BridgeError> {
+        Self::get_pending_fee_update(env.clone()).ok_or(BridgeError::NoPendingFeeUpdate)
+    }
+
+    fn require_not_paused(env: &Env) -> Result<(), BridgeError> {
+        if Self::is_paused(env.clone()) {
+            return Err(BridgeError::ContractPaused);
+        }
+        Ok(())
     }
 
     fn token(env: &Env) -> Result<token::Client<'_>, BridgeError> {
