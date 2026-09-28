@@ -39,6 +39,7 @@ import { statsRoutes } from "./routes/stats";
 import { contactsRoutes } from "./routes/contacts";
 import { reportsRoutes } from "./routes/reports";
 import feesRoutes from "./routes/fees";
+import deepHealthRoutes from "./routes/health";
 import { docsRouter } from "./routes/docs";
 import { createKYCRoutes } from "./routes/kycRoutes";
 import { adminRoutes } from "./routes/admin";
@@ -275,6 +276,10 @@ app.get("/health", (_req: Request, res: Response) => {
   };
   res.json(body);
 });
+
+// GET /health/deep: full dependency health check (database, Redis, Horizon,
+// mobile money provider gateways) plus memory/uptime stats. See src/routes/health.ts.
+app.use(deepHealthRoutes);
 
 app.get("/api/live-rates", async (_req: Request, res: Response) => {
   try {
@@ -727,9 +732,8 @@ async function initializeRuntime(): Promise<void> {
     // STK push query polling fallback (#1969): poll `stkpushquery` when the
     // callback does not arrive within 30s. Safe to start unconditionally —
     // it only schedules work when `onStkPushInitiated` is called.
-    const { mpesaStkQueryWorker } = await import(
-      "./workers/mpesaStkQueryWorker.js"
-    );
+    const { mpesaStkQueryWorker } =
+      await import("./workers/mpesaStkQueryWorker.js");
     mpesaStkQueryWorker.start();
     console.log("M-Pesa STK query worker started");
   } catch (err) {
