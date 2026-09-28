@@ -102,6 +102,38 @@ export function getSep10Config(): Sep10Config {
 const clientDomainCache = new Map<string, { signingKey: string; fetchedAt: number }>();
 const CACHE_TTL_MS = 15 * 60 * 1000;
 
+/**
+ * Read raw signature bytes from a decorated signature.
+ * SDK 17's XDR `Signature` stringifies to hex; `.value` is the raw bytes.
+ */
+function readDecoratedSignature(
+  sig: StellarSdk.xdr.DecoratedSignature,
+): Buffer {
+  const signature = sig.signature as unknown;
+
+  if (typeof signature === "function") {
+    const raw = (signature as () => unknown).call(sig);
+    if (Buffer.isBuffer(raw) || raw instanceof Uint8Array) {
+      return Buffer.from(raw);
+    }
+  }
+
+  const rendered =
+    signature && typeof (signature as { toString?: () => string }).toString === "function"
+      ? String(signature)
+      : "";
+  if (/^[0-9a-f]+$/i.test(rendered) && rendered.length % 2 === 0) {
+    return Buffer.from(rendered, "hex");
+  }
+
+  const value = (signature as { value?: Uint8Array } | null)?.value;
+  if (value && (Buffer.isBuffer(value) || value instanceof Uint8Array)) {
+    return Buffer.from(value);
+  }
+
+  throw new Error("Unreadable signature");
+}
+
 export async function fetchClientDomainSigningKey(
   clientDomain: string,
   fetchFn?: typeof fetch,
@@ -204,37 +236,61 @@ export class Sep10Service {
     try {
       const server = this.getStellarServer();
       const account = await server.loadAccount(accountId);
+      const thresholdsRaw = (account as any).thresholds ?? {};
+      const rawSigners = Array.isArray((account as any).signers)
+        ? (account as any).signers
+        : [];
 
-      // Get master key weight
-      const masterWeight = (account as any).thresholds?.master_weight ?? 1;
-
-      // Extract all signers
+      // Horizon's signers array is the source of truth. It already includes the
+      // master key. `thresholds.master_weight` is not part of the Horizon
+      // response, so defaulting it to 1 counts a disabled master key.
       const signers: SignerInfo[] = [];
+      const seen = new Set<string>();
 
-      // Add master key as a signer
-      if (masterWeight > 0) {
+      for (const signer of rawSigners) {
+        const signerType = signer.type as string | undefined;
+        if (signerType && signerType !== "ed25519_public_key") {
+          continue;
+        }
+
+        const publicKey = String(signer.key || "");
+        const weight = Number(signer.weight ?? 0);
+        if (
+          !publicKey ||
+          !Sep10Service.isValidPublicKey(publicKey) ||
+          !Number.isFinite(weight) ||
+          weight <= 0 ||
+          seen.has(publicKey)
+        ) {
+          continue;
+        }
+
+        seen.add(publicKey);
+        signers.push({ publicKey, weight });
+      }
+
+      const explicitMasterWeight = Number(thresholdsRaw.master_weight);
+      if (
+        !seen.has(accountId) &&
+        Number.isFinite(explicitMasterWeight) &&
+        explicitMasterWeight > 0
+      ) {
         signers.push({
           publicKey: accountId,
-          weight: masterWeight,
+          weight: explicitMasterWeight,
         });
+        seen.add(accountId);
       }
 
-      // Add other signers
-      if ((account as any).signers) {
-        for (const signer of (account as any).signers) {
-          if (signer.type === "ed25519_public_key") {
-            signers.push({
-              publicKey: signer.key,
-              weight: signer.weight,
-            });
-          }
-        }
-      }
+      const masterWeight = seen.has(accountId)
+        ? (signers.find((signer) => signer.publicKey === accountId)?.weight ??
+          0)
+        : 0;
 
       const thresholds: AccountThresholds = {
-        lowThreshold: (account as any).thresholds?.low_threshold ?? 0,
-        mediumThreshold: (account as any).thresholds?.med_threshold ?? 0,
-        highThreshold: (account as any).thresholds?.high_threshold ?? 0,
+        lowThreshold: Number(thresholdsRaw.low_threshold ?? 0),
+        mediumThreshold: Number(thresholdsRaw.med_threshold ?? 0),
+        highThreshold: Number(thresholdsRaw.high_threshold ?? 0),
       };
 
       return { signers, thresholds, masterWeight };
@@ -271,7 +327,12 @@ export class Sep10Service {
 
     // Check each signature in the transaction
     for (const sig of transaction.signatures) {
-      const signatureBuffer = Buffer.from(sig.signature.toString(), "hex");
+      let signatureBuffer: Buffer;
+      try {
+        signatureBuffer = readDecoratedSignature(sig);
+      } catch {
+        continue;
+      }
 
       // Try to verify this signature against each signer
       for (const signer of signers) {
@@ -327,10 +388,14 @@ export class Sep10Service {
       this.serverKeypair.publicKey(),
     );
 
-    console.log(
-      `[SEP-10] Account: ${clientAccountId}, ` +
-        `Required weight: ${thresholds.mediumThreshold}, ` +
-        `Actual weight: ${clientSignatureWeight}`,
+    logger.info(
+      {
+        account: clientAccountId,
+        requiredWeight: thresholds.mediumThreshold,
+        actualWeight: clientSignatureWeight,
+        masterWeight,
+      },
+      "[SEP-10] Evaluated multisig signer weights",
     );
 
     return clientSignatureWeight >= thresholds.mediumThreshold;
@@ -512,7 +577,7 @@ export class Sep10Service {
       try {
         return this.serverKeypair.verify(
           Buffer.from(txHash),
-          Buffer.from(sig.signature.toString(), "hex"),
+          readDecoratedSignature(sig),
         );
       } catch {
         return false;
@@ -559,7 +624,7 @@ export class Sep10Service {
         try {
           return clientDomainKeypair.verify(
             Buffer.from(txHash),
-            Buffer.from(sig.signature.toString(), "hex"),
+            readDecoratedSignature(sig),
           );
         } catch {
           return false;
