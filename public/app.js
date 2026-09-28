@@ -14,12 +14,26 @@ function saveTheme(theme) {
 }
 
 function loadTheme() {
-  const saved = localStorage.getItem("theme") || "carbon";
-  setTheme(saved);
+  const saved = localStorage.getItem("theme");
+  if (saved) {
+    setTheme(saved);
+  } else {
+    const prefersDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+    setTheme(prefersDark ? "dark" : "light");
+  }
 }
 
 // Initialize theme before anything else
 loadTheme();
+
+// Listen to system theme changes
+if (window.matchMedia) {
+  window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", e => {
+    if (!localStorage.getItem("theme")) {
+      setTheme(e.matches ? "dark" : "light");
+    }
+  });
+}
 
 // Theme switcher event listeners
 document.querySelectorAll(".theme-switcher button").forEach(btn => {

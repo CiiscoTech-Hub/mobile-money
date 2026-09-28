@@ -167,8 +167,8 @@
               <div class="input-group">
                 <label for="calc-send-amount">You Send</label>
                 <div class="input-wrapper">
-                  <input type="number" id="calc-send-amount" value="5000" min="500" max="100000">
-                  <select id="calc-send-currency">
+                  <input type="number" id="calc-send-amount" value="5000" min="500" max="100000" aria-label="Send amount">
+                  <select id="calc-send-currency" aria-label="Send currency">
                     <option value="NGN">Nigeria (NGN)</option>
                     <option value="XAF">Cameroon (XAF)</option>
                     <option value="KES">Kenya (KES)</option>
@@ -183,8 +183,8 @@
               <div class="input-group">
                 <label for="calc-receive-asset">Recipient Gets</label>
                 <div class="input-wrapper">
-                  <input type="text" id="calc-receive-amount" readonly value="8.00">
-                  <select id="calc-receive-asset">
+                  <input type="text" id="calc-receive-amount" readonly value="8.00" aria-label="Receive amount">
+                  <select id="calc-receive-asset" aria-label="Receive asset">
                     <option value="USDC">Stellar USDC</option>
                     <option value="XLM">Stellar XLM</option>
                   </select>

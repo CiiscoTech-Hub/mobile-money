@@ -1,3 +1,4 @@
+import { ipReputationService } from "../services/ipReputation";
 import logger from "../utils/logger";
 import { Router, Request, Response } from "express";
 import { sep24RateLimiter } from "../middleware/rateLimit";
@@ -504,14 +505,28 @@ sep24Router.post(
   },
 );
 
+
 sep24Router.post(
   "/withdraw",
   sep24Limiter,
   async (req: Request, res: Response) => {
     try {
+      const ip = req.ip || req.connection.remoteAddress || "0.0.0.0";
+      const risk = await ipReputationService.checkIP(ip);
+      
+      if (risk.isTorExitNode) {
+        throw createError(ERROR_CODES.UNAUTHORIZED, "High risk IP detected: Tor Exit Node", {
+          error: "High risk IP detected",
+        });
+      }
+
+      req.body.metadata = req.body.metadata || {};
+      req.body.metadata.ipRisk = risk;
+
       const result = await initiateWithdrawal(req.body);
       res.json(result);
     } catch (error: any) {
+      if (error.statusCode) throw error;
       throw createError(ERROR_CODES.INVALID_INPUT, error.message, {
         error: error.message,
       });
