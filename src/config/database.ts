@@ -2,7 +2,11 @@ import logger from "../utils/logger";
 import { Pool, QueryConfig, QueryResult, QueryResultRow, PoolClient } from "pg";
 import { auditService } from "../services/auditlogService";
 import { isReadOnlyQuery } from "../utils/readOnlyDetector";
-import { dbReplicaLagSeconds, dbReplicaReadEnabled } from "../utils/metrics";
+import {
+  dbReplicaLagSeconds,
+  dbReplicaReadEnabled,
+  emitPoolMetrics,
+} from "../utils/metrics";
 import { startDeadlockDetector } from "./deadlockDetector";
 import { IS_SANDBOX, SANDBOX_DATABASE_URL, DATABASE_URL, DR_DATABASE_URL } from "./env";
 import { isTransientDatabaseConnectionError } from "./databaseErrors";
@@ -421,23 +425,184 @@ function schedulePrimaryPoolReconnect(error: unknown): void {
   });
 }
 
+/**
+ * Error listener for PostgreSQL connection pools.
+ * Gracefully handles client disconnects, server restarts (e.g. ECONNRESET, 57P01),
+ * drains the dead connection from the pool, and schedules reconnection without
+ * crashing the process.
+ */
+export function handlePoolError(
+  err: Error & { code?: string },
+  client?: PoolClient,
+): void {
+  const isTransient = isTransientDatabaseConnectionError(err);
+  const errorCode = err.code || "UNKNOWN";
+
+  logger.warn(
+    `[Database] Connection pool client error [code=${errorCode}]: ${err.message}`,
+    {
+      errorCode,
+      isTransient,
+      errorName: err.name,
+      message: err.message,
+    },
+  );
+
+  emitPoolMetrics(pool, "primary");
+
+  // If a specific client errored, drain it from the pool so pg discards it.
+  if (client && typeof client.release === "function") {
+    try {
+      client.release(err);
+    } catch (releaseErr) {
+      logger.debug(
+        "[Database] Error releasing failed client from pool:",
+        releaseErr,
+      );
+    }
+  }
+
+  if (isTransient) {
+    schedulePrimaryPoolReconnect(err);
+  }
+}
+
+const DB_HEALTH_CHECK_TIMEOUT_MS = parseInt(
+  process.env.DB_HEALTH_CHECK_TIMEOUT_MS || "2000",
+  10,
+);
+const DB_HEALTH_CHECK_INTERVAL_MS = parseInt(
+  process.env.DB_HEALTH_CHECK_INTERVAL_MS || "15000",
+  10,
+);
+
+let poolHealthCheckTimer: NodeJS.Timeout | null = null;
+
+/**
+ * Performs a lightweight health check ping (SELECT 1) against the database pool.
+ * Emits active, idle, and waiting connection metrics, and triggers automatic
+ * pool recovery if the ping encounters a disconnect or error.
+ *
+ * @param targetPool - Pool instance to ping (defaults to primary pool)
+ * @returns true if the ping succeeded, false if unhealthy/disconnected
+ */
+export async function pingDatabasePool(
+  targetPool: Pool = pool,
+): Promise<boolean> {
+  if (!targetPool) {
+    return false;
+  }
+
+  emitPoolMetrics(targetPool, "primary");
+
+  let client: PoolClient | null = null;
+  let connectPromise: Promise<PoolClient> | null = null;
+  try {
+    connectPromise = targetPool.connect();
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      setTimeout(
+        () => reject(new Error("Database pool ping connection timeout")),
+        DB_HEALTH_CHECK_TIMEOUT_MS,
+      );
+    });
+
+    client = await Promise.race([connectPromise, timeoutPromise]);
+
+    await client.query("SELECT 1");
+    emitPoolMetrics(targetPool, "primary");
+    return true;
+  } catch (error) {
+    logger.warn("[Database] Pool health check ping failed:", error);
+    if (!client && connectPromise) {
+      void connectPromise
+        .then((lateClient) => {
+          try {
+            lateClient.release(error as Error);
+          } catch {
+            // Ignore late-connect release errors
+          }
+        })
+        .catch(() => {
+          // Connection already failed; nothing to drain
+        });
+    }
+    if (isTransientDatabaseConnectionError(error)) {
+      schedulePrimaryPoolReconnect(error);
+    }
+    return false;
+  } finally {
+    if (client) {
+      try {
+        client.release();
+      } catch {
+        // Ignore release errors during ping teardown
+      }
+    }
+    emitPoolMetrics(targetPool, "primary");
+  }
+}
+
+/**
+ * Starts background pool health check ping loop.
+ */
+export function startPoolHealthCheck(
+  intervalMs = DB_HEALTH_CHECK_INTERVAL_MS,
+): void {
+  if (poolHealthCheckTimer) {
+    clearInterval(poolHealthCheckTimer);
+  }
+  poolHealthCheckTimer = setInterval(() => {
+    void pingDatabasePool();
+  }, intervalMs);
+  if (typeof poolHealthCheckTimer.unref === "function") {
+    poolHealthCheckTimer.unref();
+  }
+}
+
+/**
+ * Stops background pool health check ping loop.
+ */
+export function stopPoolHealthCheck(): void {
+  if (poolHealthCheckTimer) {
+    clearInterval(poolHealthCheckTimer);
+    poolHealthCheckTimer = null;
+  }
+}
+
 async function reconnectPrimaryPool(): Promise<void> {
   try {
     const previousPool = pool;
     const nextPool = new Pool(getPoolOptions());
 
-    nextPool.on("error", (err) => {
-      logger.error("[Database] Primary pool error", err);
-      schedulePrimaryPoolReconnect(err);
+    nextPool.on("error", (err, client) => {
+      handlePoolError(err, client);
     });
 
     attachPrimaryPoolRecovery(nextPool);
-    await verifyPrimaryPoolHealth();
+    const isHealthy = await pingDatabasePool(nextPool);
+    if (!isHealthy) {
+      nextPool.end().catch((drainErr) => {
+        logger.debug(
+          "[Database] Ignored error while ending failed replacement pool:",
+          drainErr,
+        );
+      });
+      throw new Error("New pool instance health check failed during reconnect");
+    }
 
     pool = nextPool;
-    await previousPool.end();
     primaryPoolReconnectAttempt = 0;
     logger.info("[Database] Primary pool reconnected successfully");
+
+    // Automatically drain dead connections from previous pool
+    if (previousPool && typeof previousPool.end === "function") {
+      previousPool.end().catch((drainErr) => {
+        logger.debug(
+          "[Database] Ignored error while draining previous pool:",
+          drainErr,
+        );
+      });
+    }
   } catch (error) {
     logger.error("[Database] Primary pool reconnect failed", error);
     setTimeout(() => {
@@ -481,9 +646,8 @@ function startPoolMonitor(monitoredPool?: Pool): void {
 function createPrimaryPool(): Pool {
   const newPool = new Pool(getPoolOptions());
 
-  newPool.on("error", (err) => {
-    logger.error("[Database] Primary pool error", err);
-    schedulePrimaryPoolReconnect(err);
+  newPool.on("error", (err, client) => {
+    handlePoolError(err, client);
   });
 
   currentPoolMax = POOL_DEFAULT_MAX;
@@ -630,6 +794,7 @@ function startReplicaLagMonitor(): void {
 if (process.env.NODE_ENV !== "test") {
   startReplicaLagMonitor();
   startDeadlockDetector(pool);
+  startPoolHealthCheck();
 }
 
 /**
