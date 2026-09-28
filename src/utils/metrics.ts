@@ -265,3 +265,46 @@ export const kycRequestsTotal = new Counter({
   labelNames: ["provider", "status"],
   registers: [register],
 });
+
+// Database Connection Pool Health Metrics
+export const dbPoolActiveConnections = new Gauge({
+  name: "db_pool_active_connections",
+  help: "Number of active connections checked out from the database pool",
+  labelNames: ["pool"],
+  registers: [register],
+});
+
+export const dbPoolIdleConnections = new Gauge({
+  name: "db_pool_idle_connections",
+  help: "Number of idle connections available in the database pool",
+  labelNames: ["pool"],
+  registers: [register],
+});
+
+export const dbPoolWaitingClients = new Gauge({
+  name: "db_pool_waiting_clients",
+  help: "Number of clients waiting for a database pool connection",
+  labelNames: ["pool"],
+  registers: [register],
+});
+
+export interface PoolMetricsSource {
+  totalCount?: number;
+  idleCount?: number;
+  waitingCount?: number;
+}
+
+export function emitPoolMetrics(
+  poolInstance?: PoolMetricsSource | null,
+  poolName = "primary",
+): void {
+  if (!poolInstance) return;
+  const total = poolInstance.totalCount ?? 0;
+  const idle = poolInstance.idleCount ?? 0;
+  const waiting = poolInstance.waitingCount ?? 0;
+  const active = Math.max(0, total - idle);
+
+  dbPoolActiveConnections.labels(poolName).set(active);
+  dbPoolIdleConnections.labels(poolName).set(idle);
+  dbPoolWaitingClients.labels(poolName).set(waiting);
+}
