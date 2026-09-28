@@ -1,3 +1,4 @@
+import { ipReputationService } from "../services/ipReputation";
 import logger from "../utils/logger";
 import { Router, Request, Response, NextFunction } from "express";
 import { sep24RateLimiter } from "../middleware/rateLimit";

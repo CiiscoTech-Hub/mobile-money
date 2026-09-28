@@ -1,3 +1,4 @@
+import { ipReputationService } from "../services/ipReputation";
 import logger from "../utils/logger";
 import { Router, Request, Response } from "express";
 import { sep31RateLimiter } from "../middleware/rateLimit";
@@ -260,6 +261,14 @@ router.post(
   sep31WriteLimiter,
   strictIdempotency,
   async (req: Request, res: Response) => {
+    const ip = req.ip || req.connection.remoteAddress || "0.0.0.0";
+    const risk = await ipReputationService.checkIP(ip);
+    if (risk.isTorExitNode) {
+      throw createError(ERROR_CODES.UNAUTHORIZED, "High risk IP detected: Tor Exit Node", {
+        error: "High risk IP detected",
+      });
+    }
+
     const {
       amount,
       asset_code,
@@ -529,6 +538,7 @@ router.post(
               }
             : {}),
         },
+        ipRisk: risk,
       };
 
       const newTransaction = await transactionModel.create({

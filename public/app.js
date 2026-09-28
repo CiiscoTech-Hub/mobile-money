@@ -145,6 +145,13 @@ function applyDynamicStyles(overrides, targetElement) {
 }
 
 function loadTheme() {
+  const saved = localStorage.getItem("theme");
+  if (saved) {
+    setTheme(saved);
+  } else {
+    const prefersDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+    setTheme(prefersDark ? "dark" : "light");
+  }
   const urlOverrides = parseThemeParams();
   if (urlOverrides.theme) {
     setTheme(urlOverrides.theme);
