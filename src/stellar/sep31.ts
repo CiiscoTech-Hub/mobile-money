@@ -8,6 +8,7 @@ import { ERROR_CODES } from "../constants/errorCodes";
 import { createError } from "../middleware/errorHandler";
 import { validateRequest } from "../middleware/validation";
 import { createSep31TransactionSchema } from "../schemas/sep31";
+import { z } from "zod";
 
 const router = Router();
 const transactionModel = new TransactionModel();
@@ -183,7 +184,7 @@ router.get("/info", sep31ReadLimiter, async (req: Request, res: Response) => {
  * Validates amount, asset, sender/receiver fields, and returns
  * the Stellar account + memo for the sender to make payment.
  */
-router.post("/transactions", sep31WriteLimiter, validateRequest(createSep31TransactionSchema), async (req: Request, res: Response) => {
+router.post("/transactions", sep31WriteLimiter, async (req: Request, res: Response) => {
   const {
     amount,
     asset_code,
@@ -195,11 +196,19 @@ router.post("/transactions", sep31WriteLimiter, validateRequest(createSep31Trans
   } = req.body;
 
   // --- Input Validation ---
-  if (!amount || !asset_code) {
-    throw createError(ERROR_CODES.INVALID_INPUT, "Missing required fields: amount, asset_code", {
-      error: "invalid_request",
-      message: "Missing required fields: amount, asset_code",
-    });
+  try {
+    createSep31TransactionSchema.parse(req.body);
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      return res.status(400).json({
+        error: "Validation error",
+        details: error.issues.map((issue) => ({
+          path: issue.path.join("."),
+          message: issue.message,
+        })),
+      });
+    }
+    throw error;
   }
 
   const parsedAmount = parseFloat(amount);
