@@ -1,3 +1,4 @@
+import logger from "../utils/logger";
 import { Request, Response } from "express";
 import crypto from "crypto";
 import { PaymentLinkModel } from "../models/paymentLink";
@@ -40,12 +41,9 @@ export async function createPaymentLinkHandler(
     }
 
     if (!stellarAddress || !/^G[A-Z2-7]{55}$/.test(stellarAddress)) {
-      return res
-        .status(400)
-        .json({
-          error:
-            "A valid target Stellar public key (stellarAddress) is required",
-        });
+      return res.status(400).json({
+        error: "A valid target Stellar public key (stellarAddress) is required",
+      });
     }
 
     // Get active merchant ID from the authenticated session
@@ -84,7 +82,7 @@ export async function createPaymentLinkHandler(
       paymentUrl,
     });
   } catch (error) {
-    console.error("Failed to create payment link:", error);
+    logger.error("Failed to create payment link:", error);
     return res.status(500).json({ error: "Failed to create payment link" });
   }
 }
@@ -132,7 +130,7 @@ export async function renderPaymentLinkLandingHandler(
       }),
     );
   } catch (error) {
-    console.error("Failed to render payment link landing:", error);
+    logger.error("Failed to render payment link landing:", error);
     res.status(500).send("Internal server error");
   }
 }
@@ -223,12 +221,10 @@ export async function processPaymentHandler(
       redirectUrl,
     });
   } catch (error: any) {
-    console.error("Failed to process payment link transaction:", error);
-    return res
-      .status(500)
-      .json({
-        error: error.message || "Failed to process payment link transaction",
-      });
+    logger.error("Failed to process payment link transaction:", error);
+    return res.status(500).json({
+      error: error.message || "Failed to process payment link transaction",
+    });
   }
 }
 

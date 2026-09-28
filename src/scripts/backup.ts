@@ -1,7 +1,8 @@
 #!/usr/bin/env node
+import { printError } from "./momo-cli";
 /**
- * Database Backup Script (Issue #553)
- * 
+ * Database Backup Script (Issue #1867)
+ *
  * Usage:
  *   npx tsx src/scripts/backup.ts
  *
@@ -23,7 +24,9 @@ async function main() {
   console.log("================================================");
   console.log(`Started: ${new Date().toISOString()}`);
   console.log(`Database: ${process.env.DB_NAME || "mobilemoney_stellar"}`);
-  console.log(`Backup Bucket: ${process.env.BACKUP_BUCKET || "mobile-money-backups"}`);
+  console.log(
+    `Backup Bucket: ${process.env.BACKUP_BUCKET || "mobile-money-backups"}`,
+  );
   console.log("");
 
   try {
@@ -35,13 +38,17 @@ async function main() {
       console.log("✅ Backup Successful!");
       console.log(`   Backup ID: ${result.backupId}`);
       console.log(`   S3 URL: ${result.s3Url}`);
-      console.log(`   Size: ${((result.metadata?.size || 0) / 1024 / 1024).toFixed(2)} MB`);
+      console.log(
+        `   Size: ${((result.metadata?.size || 0) / 1024 / 1024).toFixed(2)} MB`,
+      );
       console.log(`   Duration: ${result.duration_ms}ms`);
-      console.log(`   Checksum: ${result.metadata?.checksum.substring(0, 16)}...`);
+      console.log(
+        `   Checksum: ${result.metadata?.checksum?.substring(0, 16) || "unavailable"}...`,
+      );
     } else {
-      console.error("");
-      console.error("❌ Backup Failed!");
-      console.error(`   Error: ${result.error}`);
+      printError("");
+      printError("❌ Backup Failed!");
+      printError(`   Error: ${result.error}`);
       process.exit(1);
     }
 
@@ -50,8 +57,12 @@ async function main() {
     console.log("🔐 Verifying Data Safety...");
     const safety = await verifyDataSafety();
 
-    console.log(`   Bucket Accessible: ${safety.details.bucket_accessible ? "✓" : "✗"}`);
-    console.log(`   Encryption Enabled: ${safety.details.encryption_enabled ? "✓" : "✗"}`);
+    console.log(
+      `   Bucket Accessible: ${safety.details.bucket_accessible ? "✓" : "✗"}`,
+    );
+    console.log(
+      `   Encryption Enabled: ${safety.details.encryption_enabled ? "✓" : "✗"}`,
+    );
     console.log(`   Data Safe: ${safety.safe ? "✓" : "✗"}`);
 
     if (!safety.safe) {
@@ -62,7 +73,7 @@ async function main() {
     console.log(`Completed: ${new Date().toISOString()}`);
     console.log("================================================");
   } catch (error) {
-    console.error("Fatal error:", error);
+    printError("Fatal error:", error);
     process.exit(1);
   }
 }

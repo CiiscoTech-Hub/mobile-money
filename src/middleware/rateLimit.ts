@@ -1,3 +1,4 @@
+import logger from "../utils/logger";
 import { Request, Response, NextFunction } from "express";
 import { redisClient } from "../config/redis";
 
@@ -31,6 +32,16 @@ export const RATE_LIMIT_CONFIG = {
 
   // Suspicious queries: more than 50 items without pagination
   SUSPICIOUS_QUERY_THRESHOLD: 50,
+
+  // Generic API endpoints, keyed by API key: 100 requests per minute
+  API_KEY_LIMIT: 100,
+  API_KEY_WINDOW_MS: 60 * 1000, // 1 minute
+
+  // Generic API endpoints, keyed by client IP: 300 requests per minute
+  // (looser than the API key limit — this exists to catch unauthenticated
+  // abuse/scraping, not to double-limit a single well-behaved API key holder)
+  IP_LIMIT: 300,
+  IP_WINDOW_MS: 60 * 1000, // 1 minute
 };
 
 /**
@@ -53,7 +64,7 @@ const rateLimitStore = new Map<string, RateLimitEntry>();
 async function checkRateLimit(
   key: string,
   limit: number,
-  windowMs: number
+  windowMs: number,
 ): Promise<{ allowed: boolean; remaining: number; resetTime: number }> {
   try {
     const now = Date.now();
@@ -62,7 +73,7 @@ async function checkRateLimit(
 
     // Use Redis to atomically increment and check
     const count = await redisClient.incr(key);
-    const countNum = typeof count === 'string' ? parseInt(count, 10) : count;
+    const countNum = typeof count === "string" ? parseInt(count, 10) : count;
 
     // Set expiry on first request in this window
     if (countNum === 1) {
@@ -74,7 +85,7 @@ async function checkRateLimit(
 
     return { allowed, remaining, resetTime };
   } catch (error) {
-    console.error("Rate limit Redis error:", error);
+    logger.error("Rate limit Redis error:", error);
     // Fallback to in-memory if Redis fails
     return checkRateLimitInMemory(key, limit, windowMs);
   }
@@ -86,7 +97,7 @@ async function checkRateLimit(
 function checkRateLimitInMemory(
   key: string,
   limit: number,
-  windowMs: number
+  windowMs: number,
 ): { allowed: boolean; remaining: number; resetTime: number } {
   const now = Date.now();
   const entry = rateLimitStore.get(key);
@@ -105,14 +116,18 @@ function checkRateLimitInMemory(
   }
 
   entry.count++;
-  return { allowed: true, remaining: limit - entry.count, resetTime: entry.resetTime };
+  return {
+    allowed: true,
+    remaining: limit - entry.count,
+    resetTime: entry.resetTime,
+  };
 }
 
 /**
  * Log high-severity events
  */
 const logHighSeverity = (message: string, context: Record<string, unknown>) => {
-  console.error(`[RATE_LIMIT_BREACH] HIGH SEVERITY: ${message}`, {
+  logger.error(`[RATE_LIMIT_BREACH] HIGH SEVERITY: ${message}`, {
     timestamp: new Date().toISOString(),
     ...context,
   });
@@ -129,7 +144,11 @@ const generateRateLimitKey = (userId: string, endpoint: string): string => {
  * Middleware: for sep24Routes (Deposit/Withdrawal)
  * Limit: 10 requests per minute per user
  */
-export const sep24RateLimiter = async (req: Request, res: Response, next: NextFunction) => {
+export const sep24RateLimiter = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) => {
   const userId = (req as any).user?.id;
 
   if (!userId) {
@@ -254,7 +273,7 @@ async function checkSlidingWindowRateLimit(
       resetTime,
     };
   } catch (error) {
-    console.error("Cancellation rate limit Redis error:", error);
+    logger.error("Cancellation rate limit Redis error:", error);
     return {
       allowed: true,
       remaining: limit,
@@ -279,18 +298,17 @@ export const cancelTransactionRateLimiter = async (
   }
 
   const key = `cancellation:events:${userId}`;
-  const {
-    allowed,
-    remaining,
-    retryAfterSeconds,
-    resetTime,
-  } = await checkSlidingWindowRateLimit(
-    key,
-    RATE_LIMIT_CONFIG.CANCELLATION_LIMIT,
-    RATE_LIMIT_CONFIG.CANCELLATION_WINDOW_MS,
-  );
+  const { allowed, remaining, retryAfterSeconds, resetTime } =
+    await checkSlidingWindowRateLimit(
+      key,
+      RATE_LIMIT_CONFIG.CANCELLATION_LIMIT,
+      RATE_LIMIT_CONFIG.CANCELLATION_WINDOW_MS,
+    );
 
-  res.setHeader("X-RateLimit-Limit", String(RATE_LIMIT_CONFIG.CANCELLATION_LIMIT));
+  res.setHeader(
+    "X-RateLimit-Limit",
+    String(RATE_LIMIT_CONFIG.CANCELLATION_LIMIT),
+  );
   res.setHeader("X-RateLimit-Remaining", String(remaining));
   res.setHeader("X-RateLimit-Reset", new Date(resetTime).toISOString());
 
@@ -309,7 +327,11 @@ export const cancelTransactionRateLimiter = async (
  * Middleware: for sep31RateLimiter (Send Payment)
  * Limit: 5 requests per minute per user
  */
-export const sep31RateLimiter = async (req: Request, res: Response, next: NextFunction) => {
+export const sep31RateLimiter = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) => {
   const userId = (req as any).user?.id;
 
   if (!userId) {
@@ -353,8 +375,17 @@ export const sep31RateLimiter = async (req: Request, res: Response, next: NextFu
  * Middleware: for sep12RateLimiter (KYC)
  * Limit: 20 requests per hour per user
  */
-export const sep12RateLimiter = async (req: Request, res: Response, next: NextFunction) => {
-  const userId = (req as any).user?.id;
+export const sep12RateLimiter = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) => {
+  const userId =
+    (req as any).user?.id ||
+    (req as any).query?.account ||
+    (req as any).body?.account ||
+    req.ip ||
+    "anonymous";
 
   if (!userId) {
     return res.status(401).json({ message: "Unauthorized" });
@@ -392,7 +423,6 @@ export const sep12RateLimiter = async (req: Request, res: Response, next: NextFu
 
   next();
 };
-
 
 /**
  * Middleware: Rate limit for export endpoints
@@ -532,3 +562,86 @@ export const cleanupRateLimitStore = () => {
 
 // Cleanup expired entries every 30 minutes
 setInterval(cleanupRateLimitStore, 30 * 60 * 1000);
+
+/**
+ * Middleware: rate limit generic API endpoints by API key (when present)
+ * and always by client IP, applying both limits independently.
+ *
+ * Unlike the SEP-specific limiters above (keyed by authenticated userId),
+ * this targets endpoints that authenticate via `X-API-Key` and may also
+ * be reachable without one — so IP is always checked, and the API key
+ * check layers on top when a key is present.
+ */
+export const apiKeyAndIpRateLimiter = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) => {
+  const apiKey = req.header("X-API-Key");
+  const clientIp = req.ip || req.socket?.remoteAddress || "unknown";
+
+  const ipKey = generateRateLimitKey(clientIp, "API_IP");
+  const ipResult = await checkRateLimit(
+    ipKey,
+    RATE_LIMIT_CONFIG.IP_LIMIT,
+    RATE_LIMIT_CONFIG.IP_WINDOW_MS,
+  );
+
+  if (!ipResult.allowed) {
+    const retryAfterSeconds = Math.ceil(
+      (ipResult.resetTime - Date.now()) / 1000,
+    );
+    res.setHeader("Retry-After", String(retryAfterSeconds));
+
+    logHighSeverity("IP rate limit exceeded", {
+      clientIp,
+      limit: RATE_LIMIT_CONFIG.IP_LIMIT,
+      window: "1 minute",
+      path: req.path,
+      method: req.method,
+    });
+
+    return res.status(429).json({
+      error: "Rate limit exceeded for this IP address",
+      retryAfter: retryAfterSeconds,
+    });
+  }
+
+  if (apiKey) {
+    const apiKeyKey = generateRateLimitKey(apiKey, "API_KEY");
+    const apiKeyResult = await checkRateLimit(
+      apiKeyKey,
+      RATE_LIMIT_CONFIG.API_KEY_LIMIT,
+      RATE_LIMIT_CONFIG.API_KEY_WINDOW_MS,
+    );
+
+    res.setHeader("X-RateLimit-Limit", RATE_LIMIT_CONFIG.API_KEY_LIMIT);
+    res.setHeader("X-RateLimit-Remaining", apiKeyResult.remaining);
+    res.setHeader(
+      "X-RateLimit-Reset",
+      new Date(apiKeyResult.resetTime).toISOString(),
+    );
+
+    if (!apiKeyResult.allowed) {
+      const retryAfterSeconds = Math.ceil(
+        (apiKeyResult.resetTime - Date.now()) / 1000,
+      );
+      res.setHeader("Retry-After", String(retryAfterSeconds));
+
+      logHighSeverity("API key rate limit exceeded", {
+        apiKey: `${apiKey.slice(0, 8)}...`,
+        limit: RATE_LIMIT_CONFIG.API_KEY_LIMIT,
+        window: "1 minute",
+        path: req.path,
+        method: req.method,
+      });
+
+      return res.status(429).json({
+        error: "Rate limit exceeded for this API key",
+        retryAfter: retryAfterSeconds,
+      });
+    }
+  }
+
+  next();
+};

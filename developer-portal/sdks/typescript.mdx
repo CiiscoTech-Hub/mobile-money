@@ -1,0 +1,27 @@
+---
+title: 'TypeScript SDK'
+description: 'Client library for Node.js and Browser environments'
+---
+
+## Installation
+
+```bash
+npm install @momo-bridge/sdk
+```
+
+## Usage
+
+```typescript
+import { BridgeClient } from '@momo-bridge/sdk';
+
+const client = new BridgeClient({
+  apiKey: 'YOUR_API_KEY',
+  environment: 'testnet'
+});
+
+const quote = await client.quotes.getQuote({
+  sourceAsset: 'iso4217:UGX',
+  destinationAsset: 'stellar:USDC',
+  amount: 50000
+});
+```

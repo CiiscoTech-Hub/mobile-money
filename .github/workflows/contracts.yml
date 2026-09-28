@@ -175,6 +175,11 @@ jobs:
             --test-threads 4 \
             2>&1 | tee /tmp/nextest-output.txt || true
 
+      - name: Verify test snapshots
+        run: |
+          git add "*/test_snapshots/*" || true
+          git diff --cached --exit-code || (echo "Test snapshots are not up to date. Run tests locally and commit the changes." && exit 1)
+
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v4
@@ -237,16 +242,6 @@ jobs:
           name: coverage-report-${{ github.sha }}
           path: contracts/coverage/
           retention-days: 30
-
-      - name: Upload to Codecov
-        uses: codecov/codecov-action@v4
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: contracts/coverage/lcov.info
-          flags: soroban-escrow
-          name: escrow-coverage
-          fail_ci_if_error: false
-          verbose: true
 
   # ──────────────────────────────────────────────────────────────────────────
   # 5. Summary gate – all previous jobs must pass

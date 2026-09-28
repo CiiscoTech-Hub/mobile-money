@@ -1,3 +1,4 @@
+import logger from "../utils/logger";
 import subscriptionModel from "../models/subscription";
 import { TransactionModel } from "../models/transaction";
 import { addTransactionJob } from "../queue/transactionQueue";
@@ -27,13 +28,17 @@ export async function runSubscriptionJob(): Promise<void> {
     try {
       // Create a transaction record linked to this subscription
       const phoneEncrypted = s.phone_number ? s.phone_number : null;
-      const phoneNumber = phoneEncrypted ? decrypt(String(phoneEncrypted)) : null;
+      const phoneNumber = phoneEncrypted
+        ? decrypt(String(phoneEncrypted))
+        : null;
+      const metadataProvider =
+        typeof s.metadata?.provider === "string" ? s.metadata.provider : "";
       const tx = await transactionModel.create({
         type: "deposit",
         amount: s.amount,
         currency: s.currency,
         phoneNumber: phoneNumber,
-        provider: (s.metadata && s.metadata.provider) || "",
+        provider: metadataProvider,
         status: "pending",
         userId: s.user_id ?? null,
         metadata: { subscription_id: s.id },
@@ -49,15 +54,23 @@ export async function runSubscriptionJob(): Promise<void> {
         type: "deposit",
         amount: String(s.amount),
         phoneNumber: tx.phoneNumber || "",
-        provider: tx.provider || (s.metadata && s.metadata.provider) || "",
+        provider: tx.provider || metadataProvider,
         stellarAddress: tx.stellarAddress || "",
       });
 
       // Advance next_run_at according to interval
-      await queryWrite(`UPDATE subscriptions SET last_run_at = NOW(), next_run_at = ${computeNextRun(s.interval)}, updated_at = NOW() WHERE id = $1`, [s.id]);
-      console.log(`[subscriptions] Scheduled transaction ${tx.id} for subscription ${s.id}`);
+      await queryWrite(
+        `UPDATE subscriptions SET last_run_at = NOW(), next_run_at = ${computeNextRun(s.interval)}, updated_at = NOW() WHERE id = $1`,
+        [s.id],
+      );
+      console.log(
+        `[subscriptions] Scheduled transaction ${tx.id} for subscription ${s.id}`,
+      );
     } catch (err) {
-      console.error(`[subscriptions] Error processing subscription ${s.id}:`, err);
+      logger.error(
+        `[subscriptions] Error processing subscription ${s.id}:`,
+        err,
+      );
     }
   }
 }

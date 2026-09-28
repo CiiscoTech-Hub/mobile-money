@@ -1,5 +1,7 @@
 import { Command } from "commander";
 import { runSetupWizard } from "../setupWizard";
+import { printError, printWarn } from "../dashboard";
+import { formatSuccess } from "../utils/cliFormatting";
 
 export function registerSetupCommand(program: Command): void {
   program
@@ -8,15 +10,19 @@ export function registerSetupCommand(program: Command): void {
     .action(async () => {
       try {
         const config = await runSetupWizard();
-        console.log(`✓ Saved cli/.momorc for ${config.apiUrl}`);
+        console.log(formatSuccess(`Saved cli/.momorc for ${config.apiUrl}`));
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         if (msg === "Setup cancelled") {
-          console.log("Setup cancelled.");
+          printWarn("Setup cancelled.");
           return;
         }
 
-        console.error(`✗ Setup failed: ${msg}`);
+        printError(
+          `Setup failed: ${msg}`,
+          err instanceof Error ? err : undefined,
+          "ERR_SETUP",
+        );
         process.exit(1);
       }
     });

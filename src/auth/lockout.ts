@@ -1,3 +1,4 @@
+import logger from "../utils/logger";
 import { EventEmitter } from "events";
 import { redisClient } from "../config/redis";
 
@@ -6,16 +7,12 @@ import { redisClient } from "../config/redis";
 const MAX_LOGIN_ATTEMPTS = parseInt(process.env.MAX_LOGIN_ATTEMPTS ?? "5", 10);
 
 // Sliding window during which failed attempts are counted (seconds).
-const LOCKOUT_WINDOW_SECONDS = parseInt(
-  process.env.LOCKOUT_WINDOW_MINUTES ?? "10",
-  10,
-) * 60;
+const LOCKOUT_WINDOW_SECONDS =
+  parseInt(process.env.LOCKOUT_WINDOW_MINUTES ?? "10", 10) * 60;
 
 // How long an account stays locked after crossing the threshold (seconds).
-const LOCKOUT_DURATION_SECONDS = parseInt(
-  process.env.LOCKOUT_DURATION_MINUTES ?? "30",
-  10,
-) * 60;
+const LOCKOUT_DURATION_SECONDS =
+  parseInt(process.env.LOCKOUT_DURATION_MINUTES ?? "30", 10) * 60;
 
 // ─── Redis key helpers ────────────────────────────────────────────────────────
 
@@ -115,7 +112,7 @@ export async function getLockoutStatus(
       minutesRemaining: null,
     };
   } catch (err) {
-    console.error("[Lockout] getLockoutStatus Redis error:", err);
+    logger.error("[Lockout] getLockoutStatus Redis error:", err);
     return {
       isLocked: false,
       attemptsRemaining: MAX_LOGIN_ATTEMPTS,
@@ -244,7 +241,7 @@ export async function recordFailedAttempt(
       justLocked: false,
     };
   } catch (err) {
-    console.error("[Lockout] recordFailedAttempt Redis error:", err);
+    logger.error("[Lockout] recordFailedAttempt Redis error:", err);
     const fallbackStatus: LockoutStatus = {
       isLocked: false,
       attemptsRemaining: MAX_LOGIN_ATTEMPTS - 1,
@@ -274,7 +271,7 @@ export async function recordSuccessfulLogin(identifier: string): Promise<void> {
       lockoutEvents.emit("reset", { identifier, reason: "successful_login" });
     }
   } catch (err) {
-    console.error("[Lockout] recordSuccessfulLogin Redis error:", err);
+    logger.error("[Lockout] recordSuccessfulLogin Redis error:", err);
   }
 }
 
@@ -304,7 +301,7 @@ export async function adminUnlock(
     }
     return wasLocked;
   } catch (err) {
-    console.error("[Lockout] adminUnlock Redis error:", err);
+    logger.error("[Lockout] adminUnlock Redis error:", err);
     return false;
   }
 }

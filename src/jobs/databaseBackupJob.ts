@@ -1,3 +1,4 @@
+import logger from "../utils/logger";
 import { createBackup } from "../services/backupService";
 
 /**
@@ -11,13 +12,15 @@ export async function runDatabaseBackupJob(): Promise<void> {
     const result = await createBackup();
     const duration = ((Date.now() - startTime) / 1000).toFixed(2);
     if (result.success) {
-      console.log(`[backup-job] Database backup successful in ${duration}s. Backup ID: ${result.backupId}`);
+      console.log(
+        `[backup-job] Database backup successful in ${duration}s. Backup ID: ${result.backupId}`,
+      );
     } else {
-      console.error(`[backup-job] Database backup failed: ${result.error}`);
+      logger.error(`[backup-job] Database backup failed: ${result.error}`);
       throw new Error(result.error);
     }
   } catch (error) {
-    console.error("[backup-job] Unhandled error during database backup:", error);
+    logger.error("[backup-job] Unhandled error during database backup:", error);
     throw error;
   }
 }

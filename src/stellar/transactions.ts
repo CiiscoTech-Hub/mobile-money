@@ -7,12 +7,13 @@ import {
   StrKey,
   Transaction,
   TransactionBuilder,
-} from "stellar-sdk";
+} from "@stellar/stellar-sdk";
 import {
   getFeeBumpConfig,
   getNetworkPassphrase,
   getStellarServer,
 } from "../config/stellar";
+import { hasTrustline } from "./trustlines";
 
 type StellarOperation = Parameters<TransactionBuilder["addOperation"]>[0];
 type StellarTimebounds = { minTime: string; maxTime: string };
@@ -58,11 +59,17 @@ function getConfiguredBaseFee(networkBaseFee: number): number {
   return Math.max(config.baseFeeStroops, networkBaseFee);
 }
 
-function getInnerTransactionFee(operationCount: number, baseFee: number): number {
+function getInnerTransactionFee(
+  operationCount: number,
+  baseFee: number,
+): number {
   return operationCount * baseFee;
 }
 
-function getRequiredFeeBumpFee(operationCount: number, baseFee: number): number {
+function getRequiredFeeBumpFee(
+  operationCount: number,
+  baseFee: number,
+): number {
   return getChargedOperationCount(operationCount) * baseFee;
 }
 
@@ -95,8 +102,16 @@ function getFeePayerKeypair(): Keypair {
 
 async function getTransactionBaseFee(): Promise<number> {
   const server = getStellarServer();
-  const fetchedBaseFee = await server.fetchBaseFee();
-  return getConfiguredBaseFee(Number(fetchedBaseFee));
+  try {
+    const feeStats = await server.feeStats();
+    const dynamicBaseFee = Number(
+      feeStats.fee_charged?.p90 || feeStats.last_ledger_base_fee || 100
+    );
+    return getConfiguredBaseFee(dynamicBaseFee);
+  } catch (error) {
+    const fetchedBaseFee = await server.fetchBaseFee();
+    return getConfiguredBaseFee(Number(fetchedBaseFee));
+  }
 }
 
 async function buildInnerTransaction(
@@ -106,7 +121,8 @@ async function buildInnerTransaction(
   const server = getStellarServer();
   const networkPassphrase = getNetworkPassphrase();
   const sourceAccountRecord = await server.loadAccount(options.sourceAccount);
-  const txTimebounds = options.timebounds ?? (await server.fetchTimebounds(300));
+  const txTimebounds =
+    options.timebounds ?? (await server.fetchTimebounds(300));
 
   let builder = new TransactionBuilder(sourceAccountRecord, {
     fee: String(getInnerTransactionFee(options.operations.length, baseFee)),
@@ -162,7 +178,7 @@ export const buildTransactionWithFeeBump = async (
   if (!enableFeeBump) {
     return {
       envelope: innerTransaction.toEnvelope().toXDR("base64"),
-      innerTransactionHash: innerTransaction.hash().toString("hex"),
+      innerTransactionHash: Buffer.from(innerTransaction.hash()).toString("hex"),
       feeBumpTransactionHash: "",
       fee: Number(innerTransaction.fee),
       usedFeeBump: false,
@@ -183,8 +199,8 @@ export const buildTransactionWithFeeBump = async (
 
   return {
     envelope: feeBumpTransaction.toEnvelope().toXDR("base64"),
-    innerTransactionHash: innerTransaction.hash().toString("hex"),
-    feeBumpTransactionHash: feeBumpTransaction.hash().toString("hex"),
+    innerTransactionHash: Buffer.from(innerTransaction.hash()).toString("hex"),
+    feeBumpTransactionHash: Buffer.from(feeBumpTransaction.hash()).toString("hex"),
     fee: Number(feeBumpTransaction.fee),
     usedFeeBump: true,
   };
@@ -328,15 +344,33 @@ export const createSimplePaymentWithFeeBump = async (
   const stellarAsset =
     asset === "native" ? Asset.native() : new Asset(asset.code, asset.issuer);
 
+  const operations: StellarOperation[] = [];
+
+  // Auto-inject changeTrust operation if trustline is missing for non-native assets
+  if (!stellarAsset.isNative()) {
+    const trustlineExists = await hasTrustline(destination, stellarAsset);
+    if (!trustlineExists) {
+      operations.push(
+        Operation.changeTrust({
+          asset: stellarAsset,
+          limit: amount,
+          source: destination,
+        }) as StellarOperation,
+      );
+    }
+  }
+
+  operations.push(
+    Operation.payment({
+      destination,
+      asset: stellarAsset,
+      amount,
+    }) as StellarOperation,
+  );
+
   return buildTransactionWithFeeBump({
     sourceAccount,
-    operations: [
-      Operation.payment({
-        destination,
-        asset: stellarAsset,
-        amount,
-      }) as StellarOperation,
-    ],
+    operations,
     memo: memo ? Memo.text(memo) : undefined,
   });
 };

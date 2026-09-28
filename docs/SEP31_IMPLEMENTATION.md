@@ -7,18 +7,21 @@ This implementation provides full SEP-31 (Cross-Border Payments) protocol suppor
 ## Features Implemented
 
 ### ✅ Core SEP-31 Endpoints
+
 - **GET /info**: Returns supported assets, fees, and required fields
 - **POST /transactions**: Creates new cross-border payment transactions
 - **GET /transactions/:id**: Retrieves transaction status and details
 - **PATCH /transactions/:id**: Updates transaction fields (e.g., additional info requests)
 
 ### ✅ Transaction Lifecycle Management
+
 - **Status State Machine**: Proper SEP-31 status transitions (pending_sender → pending_stellar → pending_receiver → completed)
 - **Metadata Persistence**: All SEP-31 data correctly stored in transaction metadata
 - **Payment Monitoring**: Automated job monitors for incoming Stellar payments
 - **Status Updates**: Automatic status progression based on payment receipt
 
 ### ✅ Compliance & Validation
+
 - **SEP-12 Integration**: Sender/receiver identification via SEP-12
 - **Fee Calculation**: Configurable fixed and percentage fees
 - **Amount Limits**: Configurable min/max transaction amounts
@@ -35,6 +38,8 @@ SEP31_MIN_AMOUNT=0.1
 SEP31_MAX_AMOUNT=1000000
 SEP31_FEE_FIXED=1.00
 SEP31_FEE_PERCENT=0.5
+# Base network fee in the transaction asset (rounded to 7 decimal places)
+SEP31_BASE_NETWORK_FEE=0.00001
 SEP31_STATUS_ETA=600
 STELLAR_RECEIVING_ACCOUNT=G...
 
@@ -45,6 +50,7 @@ SEP31_MONITOR_CRON="* * * * *"  # Every minute
 ## API Usage
 
 ### Create Transaction
+
 ```bash
 POST /sep31/transactions
 Content-Type: application/json
@@ -65,8 +71,24 @@ Content-Type: application/json
 ```
 
 ### Get Transaction Status
+
 ```bash
 GET /sep31/transactions/:id
+```
+
+SEP-31 transaction responses include an itemized `fee_details` array. The
+amounts are rounded to seven decimal places and sum exactly to `amount_fee`:
+
+```json
+{
+  "amount_fee": "1.50001",
+  "amount_fee_asset": "stellar:native",
+  "fee_details": [
+    { "description": "Base network fee", "amount": "0.00001" },
+    { "description": "Provider processing fee", "amount": "1" },
+    { "description": "FX conversion margin", "amount": "0.5" }
+  ]
+}
 ```
 
 ## Monitoring & Jobs
@@ -84,6 +106,7 @@ GET /sep31/transactions/:id
 ## Testing
 
 The implementation includes comprehensive tests for:
+
 - SEP-31 endpoint validation
 - Transaction creation and status updates
 - Fee calculation
@@ -91,6 +114,7 @@ The implementation includes comprehensive tests for:
 - State machine transitions
 
 Run tests with:
+
 ```bash
 npm test -- --testPathPattern=sep31
 ```

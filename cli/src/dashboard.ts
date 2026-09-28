@@ -1,6 +1,13 @@
 import chalk from "chalk";
 import Table from "cli-table3";
 import figlet from "figlet";
+import {
+  formatError as formatErrorMessage,
+  formatInfo as formatInfoMessage,
+  formatSuccess as formatSuccessMessage,
+  formatWarn as formatWarnMessage,
+  normalizeErrorCode,
+} from "./utils/cliFormatting";
 
 export interface SystemHealth {
   database: "healthy" | "degraded" | "unhealthy";
@@ -89,9 +96,21 @@ export function printHealthStatus(health: SystemHealth): void {
   });
 
   healthTable.push(
-    ["Database", getHealthIcon(health.database), `${health.responseTime || "N/A"}ms`],
-    ["Redis Cache", getHealthIcon(health.redis), `${health.responseTime || "N/A"}ms`],
-    ["Stellar Network", getHealthIcon(health.stellar), `${health.responseTime || "N/A"}ms`],
+    [
+      "Database",
+      getHealthIcon(health.database),
+      `${health.responseTime || "N/A"}ms`,
+    ],
+    [
+      "Redis Cache",
+      getHealthIcon(health.redis),
+      `${health.responseTime || "N/A"}ms`,
+    ],
+    [
+      "Stellar Network",
+      getHealthIcon(health.stellar),
+      `${health.responseTime || "N/A"}ms`,
+    ],
   );
 
   console.log(healthTable.toString());
@@ -113,9 +132,12 @@ export function printQueueStats(queue: QueueStats): void {
   });
 
   const total = queue.totalJobs;
-  const pendingPercent = total > 0 ? ((queue.pendingJobs / total) * 100).toFixed(1) : "0";
-  const activePercent = total > 0 ? ((queue.activeJobs / total) * 100).toFixed(1) : "0";
-  const failedPercent = total > 0 ? ((queue.failedJobs / total) * 100).toFixed(1) : "0";
+  const pendingPercent =
+    total > 0 ? ((queue.pendingJobs / total) * 100).toFixed(1) : "0";
+  const activePercent =
+    total > 0 ? ((queue.activeJobs / total) * 100).toFixed(1) : "0";
+  const failedPercent =
+    total > 0 ? ((queue.failedJobs / total) * 100).toFixed(1) : "0";
 
   queueTable.push(
     ["Total Jobs", chalk.bold.white(total.toString())],
@@ -127,17 +149,13 @@ export function printQueueStats(queue: QueueStats): void {
       "Active",
       `${chalk.blue(queue.activeJobs.toString())} (${activePercent}%)`,
     ],
-    [
-      "Completed",
-      chalk.green(queue.completedJobs.toString()),
-    ],
-    [
-      "Failed",
-      `${chalk.red(queue.failedJobs.toString())} (${failedPercent}%)`,
-    ],
+    ["Completed", chalk.green(queue.completedJobs.toString())],
+    ["Failed", `${chalk.red(queue.failedJobs.toString())} (${failedPercent}%)`],
     [
       "Dead Letter Queue",
-      queue.dlqSize > 0 ? chalk.red.bold(queue.dlqSize.toString()) : chalk.gray("Empty"),
+      queue.dlqSize > 0
+        ? chalk.red.bold(queue.dlqSize.toString())
+        : chalk.gray("Empty"),
     ],
   );
 
@@ -163,12 +181,23 @@ export function printTransactionStats(
     },
   });
 
-  const successColor = transactions.successRate >= 95 ? chalk.green : transactions.successRate >= 80 ? chalk.yellow : chalk.red;
+  const successColor =
+    transactions.successRate >= 95
+      ? chalk.green
+      : transactions.successRate >= 80
+        ? chalk.yellow
+        : chalk.red;
 
   txTable.push(
-    ["Total Transactions", chalk.bold.white(transactions.totalCount.toString())],
+    [
+      "Total Transactions",
+      chalk.bold.white(transactions.totalCount.toString()),
+    ],
     ["Success Rate", `${successColor(transactions.successRate.toFixed(2))}%`],
-    ["Total Volume", chalk.cyan(`${transactions.totalVolume.toLocaleString()} XAF`)],
+    [
+      "Total Volume",
+      chalk.cyan(`${transactions.totalVolume.toLocaleString()} XAF`),
+    ],
     ["Active Users", chalk.magenta(transactions.activeUsers.toString())],
   );
 
@@ -213,7 +242,12 @@ export function printProviderStatus(
         break;
     }
 
-    const failureColor = info.failureRate > 10 ? chalk.red : info.failureRate > 5 ? chalk.yellow : chalk.green;
+    const failureColor =
+      info.failureRate > 10
+        ? chalk.red
+        : info.failureRate > 5
+          ? chalk.yellow
+          : chalk.green;
 
     providerTable.push([
       chalk.bold(provider),
@@ -254,9 +288,7 @@ export function printStatusLine(data: DashboardData): void {
     : chalk.yellow("⚠ Some Systems Degraded");
 
   const queueStr =
-    data.queue.dlqSize > 0
-      ? chalk.red(`DLQ: ${data.queue.dlqSize} | `)
-      : "";
+    data.queue.dlqSize > 0 ? chalk.red(`DLQ: ${data.queue.dlqSize} | `) : "";
 
   console.log(
     `${healthStr} | Queue: ${chalk.cyan(
@@ -268,14 +300,15 @@ export function printStatusLine(data: DashboardData): void {
 /**
  * Print loading spinner frame
  */
-export function printLoading(message: string = "Loading"): void {
+/**
+ * Print loading spinner — returns a stop function to clear the spinner.
+ */
+export function printLoading(message: string = "Loading"): () => void {
   const frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
   let frameIndex = 0;
 
   const interval = setInterval(() => {
-    process.stdout.write(
-      `\r${chalk.cyan(frames[frameIndex])} ${message}...`,
-    );
+    process.stdout.write(`\r${chalk.cyan(frames[frameIndex])} ${message}...`);
     frameIndex = (frameIndex + 1) % frames.length;
   }, 80);
 
@@ -286,26 +319,44 @@ export function printLoading(message: string = "Loading"): void {
 }
 
 /**
- * Print error message with formatting
+ * Print a standardized CLI error to stderr.
+ *
+ * @param message  Short human-readable description of the failure.
+ * @param error    Optional underlying Error for detail output.
+ * @param code     Optional short error-code label (e.g. "ERR_AUTH", "ERR_API").
  */
-export function printError(message: string, error?: Error): void {
-  console.log(chalk.red(`\n✗ Error: ${message}`));
-  if (error) {
-    console.log(chalk.gray(`Details: ${error.message}`));
+export function printError(
+  message: string,
+  error?: Error,
+  code?: string,
+): void {
+  const normalizedCode = normalizeErrorCode(code);
+  process.stderr.write(`\n${formatErrorMessage(message, normalizedCode)}\n`);
+  if (error?.message && error.message !== message) {
+    process.stderr.write(
+      `  ${chalk.gray("Details:")} ${chalk.gray(error.message)}\n`,
+    );
   }
-  console.log();
+  process.stderr.write("\n");
 }
 
 /**
  * Print success message
  */
 export function printSuccess(message: string): void {
-  console.log(chalk.green(`\n✓ ${message}\n`));
+  console.log(`\n${formatSuccessMessage(message)}\n`);
 }
 
 /**
  * Print info message
  */
 export function printInfo(message: string): void {
-  console.log(chalk.cyan(`ℹ ${message}\n`));
+  console.log(`${formatInfoMessage(message)}\n`);
+}
+
+/**
+ * Print a warning message to stderr.
+ */
+export function printWarn(message: string): void {
+  process.stderr.write(`${formatWarnMessage(message)}\n`);
 }

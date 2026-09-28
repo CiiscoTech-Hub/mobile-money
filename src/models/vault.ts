@@ -1,3 +1,4 @@
+import { Pool, PoolClient } from "pg";
 import { pool, queryRead, queryWrite } from "../config/database";
 
 export interface Vault {
@@ -37,6 +38,29 @@ export interface VaultTransferInput {
   amount: string;
   description?: string;
   referenceId?: string;
+}
+
+export interface VaultRow {
+  id: string;
+  userId: string;
+  name: string;
+  description?: string | null;
+  balance: string;
+  targetAmount?: string | null;
+  isActive: boolean;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface VaultTransactionRow {
+  id: string;
+  vaultId: string;
+  userId: string;
+  type: "deposit" | "withdraw";
+  amount: string;
+  description?: string | null;
+  referenceId?: string | null;
+  createdAt: Date;
 }
 
 export interface UserBalanceSummary {
@@ -85,7 +109,7 @@ export class VaultModel {
       throw new Error("Vault description cannot exceed 1000 characters");
     }
 
-    const result = await queryWrite(
+    const result = await queryWrite<VaultRow>(
       `INSERT INTO vaults (user_id, name, description, target_amount)
        VALUES ($1, $2, $3, $4)
        RETURNING ${VAULT_SELECT_COLUMNS}`,
@@ -101,7 +125,7 @@ export class VaultModel {
   }
 
   async findById(id: string): Promise<Vault | null> {
-    const result = await queryRead(
+    const result = await queryRead<VaultRow>(
       `SELECT ${VAULT_SELECT_COLUMNS}
        FROM vaults
        WHERE id = $1`,
@@ -113,7 +137,7 @@ export class VaultModel {
 
   async findByUserId(userId: string, activeOnly = true): Promise<Vault[]> {
     let query = `SELECT ${VAULT_SELECT_COLUMNS} FROM vaults WHERE user_id = $1`;
-    const params = [userId];
+    const params: string[] = [userId];
 
     if (activeOnly) {
       query += " AND is_active = true";
@@ -121,12 +145,12 @@ export class VaultModel {
 
     query += " ORDER BY created_at ASC";
 
-    const result = await queryRead(query, params);
+    const result = await queryRead<VaultRow>(query, params);
     return result.rows;
   }
 
   async findByUserAndName(userId: string, name: string): Promise<Vault | null> {
-    const result = await queryRead(
+    const result = await queryRead<VaultRow>(
       `SELECT ${VAULT_SELECT_COLUMNS}
        FROM vaults
        WHERE user_id = $1 AND name = $2`,
@@ -139,7 +163,7 @@ export class VaultModel {
   async updateBalance(
     vaultId: string,
     newBalance: string,
-    client: any = pool,
+    client: Pool | PoolClient = pool,
   ): Promise<void> {
     await client.query(
       `UPDATE vaults 
@@ -151,10 +175,12 @@ export class VaultModel {
 
   async updateVault(
     id: string,
-    updates: Partial<Pick<Vault, "name" | "description" | "targetAmount" | "isActive">>,
+    updates: Partial<
+      Pick<Vault, "name" | "description" | "targetAmount" | "isActive">
+    >,
   ): Promise<Vault | null> {
     const fields: string[] = [];
-    const values: any[] = [];
+    const values: unknown[] = [];
     let paramIndex = 1;
 
     if (updates.name !== undefined) {
@@ -193,7 +219,7 @@ export class VaultModel {
     fields.push(`updated_at = CURRENT_TIMESTAMP`);
     values.push(id);
 
-    const result = await queryWrite(
+    const result = await queryWrite<VaultRow>(
       `UPDATE vaults 
        SET ${fields.join(", ")}
        WHERE id = $${paramIndex}
@@ -219,9 +245,9 @@ export class VaultModel {
 
   async createVaultTransaction(
     data: VaultTransferInput,
-    client: any = pool,
+    client: Pool | PoolClient = pool,
   ): Promise<VaultTransaction> {
-    const result = await client.query(
+    const result = await client.query<VaultTransactionRow>(
       `INSERT INTO vault_transactions (vault_id, user_id, type, amount, description, reference_id)
        VALUES ($1, $2, $3, $4, $5, $6)
        RETURNING ${VAULT_TRANSACTION_SELECT_COLUMNS}`,
@@ -246,7 +272,7 @@ export class VaultModel {
     const capped = Math.min(Math.max(limit, 1), 100);
     const off = Math.max(offset, 0);
 
-    const result = await queryRead(
+    const result = await queryRead<VaultTransactionRow>(
       `SELECT ${VAULT_TRANSACTION_SELECT_COLUMNS}
        FROM vault_transactions
        WHERE vault_id = $1
@@ -316,12 +342,12 @@ export class VaultModel {
     description?: string,
   ): Promise<{ vault: Vault; vaultTransaction: VaultTransaction }> {
     const client = await pool.connect();
-    
+
     try {
       await client.query("BEGIN");
 
       // Get current vault
-      const vaultResult = await client.query(
+      const vaultResult = await client.query<VaultRow>(
         `SELECT ${VAULT_SELECT_COLUMNS} FROM vaults WHERE id = $1 AND user_id = $2 FOR UPDATE`,
         [vaultId, userId],
       );
@@ -360,16 +386,19 @@ export class VaultModel {
           [userId],
         );
 
-        const mainBalance = parseFloat(mainBalanceResult.rows[0]?.balance || "0");
+        const mainBalance = parseFloat(
+          mainBalanceResult.rows[0]?.balance || "0",
+        );
         if (mainBalance < amountNum) {
           throw new Error("Insufficient main balance");
         }
       }
 
       // Calculate new vault balance
-      const newBalance = type === "deposit" 
-        ? (currentBalance + amountNum).toString()
-        : (currentBalance - amountNum).toString();
+      const newBalance =
+        type === "deposit"
+          ? (currentBalance + amountNum).toString()
+          : (currentBalance - amountNum).toString();
 
       // Update vault balance
       await this.updateBalance(vaultId, newBalance, client);
@@ -389,7 +418,7 @@ export class VaultModel {
       // Create corresponding main transaction
       const { TransactionModel } = await import("./transaction.js");
       const transactionModel = new TransactionModel();
-      
+
       // Note: This creates a record of the vault transfer in the main transactions table
       // The actual balance calculation will account for this when vault_id is set
       await client.query(

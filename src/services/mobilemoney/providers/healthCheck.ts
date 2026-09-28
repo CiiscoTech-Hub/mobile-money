@@ -1,9 +1,18 @@
+import logger from "../../../utils/logger";
 import { createClient, RedisClientType } from "redis";
 import { healthCheckResponseTimeSeconds } from "../../../utils/metrics";
+import { getConfigValue } from "../../../config/appConfig";
 
 // ─── Public types ─────────────────────────────────────────────────────────────
 
-export type ProviderName = "mtn" | "airtel" | "orange";
+export type ProviderName =
+  | "mtn"
+  | "airtel"
+  | "orange"
+  | "orange_madagascar"
+  | "orange_guinea"
+  | "wave_senegal"
+  | "sms_portal";
 export type ProviderStatus = "up" | "down";
 
 export interface ProviderHealth {
@@ -57,6 +66,27 @@ export const DEFAULT_PROVIDERS: ProviderConfig[] = [
       "https://api.orange.com/orange-money-webpay/dev/v1/webpayment",
     timeoutMs: DEFAULT_TIMEOUT_MS,
   },
+  {
+    name: "orange_madagascar",
+    pingUrl:
+      process.env.ORANGE_MADAGASCAR_HEALTH_URL ??
+      "https://api.orange.com/orange-money-webpay/mg/v1/webpayment",
+    timeoutMs: DEFAULT_TIMEOUT_MS,
+  },
+  {
+    name: "orange_guinea",
+    pingUrl:
+      process.env.ORANGE_GUINEA_HEALTH_URL ??
+      "https://api.orange.com/orange-money-webpay/gn/v1/webpayment",
+    timeoutMs: DEFAULT_TIMEOUT_MS,
+  },
+  {
+    name: "wave_senegal",
+    pingUrl:
+      process.env.WAVE_SENEGAL_HEALTH_URL ??
+      `${process.env.WAVE_BASE_URL ?? "https://api.wave.com/v1"}/balance`,
+    timeoutMs: DEFAULT_TIMEOUT_MS,
+  },
 ];
 
 // ─── Structured logger ────────────────────────────────────────────────────────
@@ -76,7 +106,7 @@ function log(
     ...meta,
   });
   if (level === "error") {
-    console.error(line);
+    logger.error(line);
   } else if (level === "warn") {
     console.warn(line);
   } else {
@@ -153,10 +183,27 @@ async function setCached(result: MobileMoneyHealthResult): Promise<void> {
 
 // ─── Circuit breaker ──────────────────────────────────────────────────────────
 
-/** Open circuit after this many consecutive failures. */
-const FAILURE_THRESHOLD = 3;
-/** Keep circuit open for this many ms before allowing a retry. */
-const OPEN_DURATION_MS = 60_000;
+function getFailureThreshold(): number {
+  const raw = process.env.PROVIDER_HEALTH_FAILURE_THRESHOLD;
+  if (raw !== undefined && raw !== "") {
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+  return getConfigValue("healthCheck.failureThreshold");
+}
+
+function getOpenDurationMs(): number {
+  const raw = process.env.PROVIDER_HEALTH_OPEN_DURATION_MS;
+  if (raw !== undefined && raw !== "") {
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+  return getConfigValue("healthCheck.openDurationMs");
+}
 
 interface CircuitState {
   failures: number;
@@ -196,8 +243,8 @@ function recordSuccess(provider: string): void {
 function recordFailure(provider: string): void {
   const state = getCircuit(provider);
   state.failures += 1;
-  if (state.failures >= FAILURE_THRESHOLD) {
-    state.openUntil = Date.now() + OPEN_DURATION_MS;
+  if (state.failures >= getFailureThreshold()) {
+    state.openUntil = Date.now() + getOpenDurationMs();
     log("warn", "Circuit opened for provider", {
       provider,
       openUntil: new Date(state.openUntil).toISOString(),

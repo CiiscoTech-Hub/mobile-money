@@ -202,29 +202,38 @@ export class AccountingService {
         );
       }
 
-      const activeTenant = this.resolveActiveXeroTenant(
-        tenants,
-        selectedTenantId,
-      );
+      // If the caller didn't select a specific tenant, create a connection
+      // record for each authorized tenant so the user can sync per-organization.
+      // All created connections share the same OAuth tokens and must be kept
+      // in sync when a refresh occurs.
+      const createdConnections: AccountingConnection[] = [];
 
-      const connection: AccountingConnection = {
-        id: uuidv4(),
-        userId,
-        provider: AccountingProvider.XERO,
-        tenantId: activeTenant.tenantId,
-        tenantName: activeTenant.tenantName,
-        accessToken: tokenResponse.access_token,
-        refreshToken: tokenResponse.refresh_token,
-        expiresAt: new Date(Date.now() + tokenResponse.expires_in * 1000),
-        isActive: true,
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      };
+      const tenantsToCreate = selectedTenantId
+        ? [this.resolveActiveXeroTenant(tenants, selectedTenantId)]
+        : tenants;
 
-      await this.saveConnection(connection);
-      await this.scheduleTokenRefresh(connection);
+      for (const t of tenantsToCreate) {
+        const conn: AccountingConnection = {
+          id: uuidv4(),
+          userId,
+          provider: AccountingProvider.XERO,
+          tenantId: t.tenantId,
+          tenantName: t.tenantName,
+          accessToken: tokenResponse.access_token,
+          refreshToken: tokenResponse.refresh_token,
+          expiresAt: new Date(Date.now() + tokenResponse.expires_in * 1000),
+          isActive: true,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
 
-      return connection;
+        await this.saveConnection(conn);
+        await this.scheduleTokenRefresh(conn);
+        createdConnections.push(conn);
+      }
+
+      // Return the first created connection for compatibility with callers
+      return createdConnections[0];
     } catch (error) {
       logger.error(`Xero OAuth callback failed: ${error}`);
       throw new Error(`Xero OAuth failed: ${error}`);
@@ -428,24 +437,51 @@ export class AccountingService {
           },
         },
       );
+      // When refreshing a Xero token, update all Xero connections for the
+      // same user so that multi-tenant connections remain in sync.
+      const newAccessToken: string = response.data.access_token;
+      const newRefreshToken: string = response.data.refresh_token;
+      const newExpiresAt = new Date(
+        Date.now() + response.data.expires_in * 1000,
+      );
 
-      const updatedConnection: AccountingConnection = {
-        ...connection,
-        accessToken: response.data.access_token,
-        refreshToken: response.data.refresh_token,
-        expiresAt: new Date(Date.now() + response.data.expires_in * 1000),
-        updatedAt: new Date(),
-      };
+      // Encrypt tokens for storage
+      const encAccess = encryptField(newAccessToken);
+      const encRefresh = encryptField(newRefreshToken);
 
-      await this.updateConnectionTokens(connectionId, {
-        accessToken: updatedConnection.accessToken,
-        refreshToken: updatedConnection.refreshToken,
-        expiresAt: updatedConnection.expiresAt,
-      });
+      // Update all accounting_connections rows for this user and provider
+      await pool.query(
+        `UPDATE accounting_connections SET access_token = $1, refresh_token = $2, expires_at = $3, updated_at = $4 WHERE user_id = $5 AND provider = $6`,
+        [
+          encAccess,
+          encRefresh,
+          newExpiresAt,
+          new Date(),
+          connection.userId,
+          AccountingProvider.XERO,
+        ],
+      );
 
-      await this.scheduleTokenRefresh(updatedConnection);
+      // Reschedule refresh jobs for all active Xero connections for this user
+      const updatedConns = await this.getUserConnections(connection.userId);
+      const xeroConns = updatedConns.filter(
+        (c) => c.provider === AccountingProvider.XERO,
+      );
+
+      for (const c of xeroConns) {
+        const updatedConn: AccountingConnection = {
+          ...c,
+          accessToken: newAccessToken,
+          refreshToken: newRefreshToken,
+          expiresAt: newExpiresAt,
+          updatedAt: new Date(),
+        };
+
+        await this.scheduleTokenRefresh(updatedConn);
+      }
+
       logger.info(
-        `Successfully refreshed Xero token for connection ${connectionId}`,
+        `Successfully refreshed Xero tokens for user ${connection.userId} (${xeroConns.length} connections)`,
       );
     } catch (error) {
       logger.error(`Xero token refresh failed for ${connectionId}: ${error}`);
@@ -838,15 +874,23 @@ export class AccountingService {
   async syncContactForUser(userId: string): Promise<void> {
     try {
       // Load user data
-      const userRes = await pool.query("SELECT id, first_name, last_name, email FROM users WHERE id = $1", [userId]);
+      const userRes = await pool.query(
+        "SELECT id, first_name, last_name, email FROM users WHERE id = $1",
+        [userId],
+      );
       if (userRes.rows.length === 0) return;
       const row = userRes.rows[0];
       const email = decrypt(row.email) as string | null | undefined;
-      const firstName = decryptField(row.first_name) as string | null | undefined;
+      const firstName = decryptField(row.first_name) as
+        | string
+        | null
+        | undefined;
       const lastName = decryptField(row.last_name) as string | null | undefined;
 
       if (!email) {
-        logger.info(`[AccountingService] Skipping contact sync for user ${userId}: no email`);
+        logger.info(
+          `[AccountingService] Skipping contact sync for user ${userId}: no email`,
+        );
         return;
       }
 
@@ -855,16 +899,32 @@ export class AccountingService {
       for (const connection of connections) {
         try {
           if (connection.provider === AccountingProvider.XERO) {
-            await this.syncXeroContactForUser(userId, connection, email, firstName, lastName);
+            await this.syncXeroContactForUser(
+              userId,
+              connection,
+              email,
+              firstName,
+              lastName,
+            );
           } else if (connection.provider === AccountingProvider.QUICKBOOKS) {
-            await this.syncQuickBooksCustomerForUser(userId, connection, email, firstName, lastName);
+            await this.syncQuickBooksCustomerForUser(
+              userId,
+              connection,
+              email,
+              firstName,
+              lastName,
+            );
           }
         } catch (err) {
-          logger.error(`[AccountingService] Failed to sync contact for user ${userId} on connection ${connection.id}: ${err instanceof Error ? err.message : String(err)}`);
+          logger.error(
+            `[AccountingService] Failed to sync contact for user ${userId} on connection ${connection.id}: ${err instanceof Error ? err.message : String(err)}`,
+          );
         }
       }
     } catch (err) {
-      logger.error(`[AccountingService] syncContactForUser error for ${userId}: ${err instanceof Error ? err.message : String(err)}`);
+      logger.error(
+        `[AccountingService] syncContactForUser error for ${userId}: ${err instanceof Error ? err.message : String(err)}`,
+      );
     }
   }
 
@@ -906,7 +966,8 @@ export class AccountingService {
       if (c.EmailAddress) emails.push(c.EmailAddress);
       if (c.EmailAddresses && Array.isArray(c.EmailAddresses)) {
         for (const e of c.EmailAddresses) {
-          if (e && (e.EmailAddress || e.email)) emails.push(e.EmailAddress || e.email);
+          if (e && (e.EmailAddress || e.email))
+            emails.push(e.EmailAddress || e.email);
         }
       }
       if (emails.find((e) => e && e.toLowerCase() === email.toLowerCase())) {
@@ -918,10 +979,16 @@ export class AccountingService {
     let externalId: string | undefined;
 
     if (foundContact) {
-      externalId = foundContact.ContactID || foundContact.ContactId || foundContact.contactID;
+      externalId =
+        foundContact.ContactID ||
+        foundContact.ContactId ||
+        foundContact.contactID;
     } else {
       // Create new contact in Xero
-      const name = (firstName || lastName) ? `${firstName || ''} ${lastName || ''}`.trim() : email;
+      const name =
+        firstName || lastName
+          ? `${firstName || ""} ${lastName || ""}`.trim()
+          : email;
       const createBody = {
         Contacts: [
           {
@@ -933,14 +1000,18 @@ export class AccountingService {
         ],
       };
 
-      const createResp = await axios.post("https://api.xero.com/api.xro/2.0/Contacts", createBody, {
-        headers: {
-          Authorization: `Bearer ${connection.accessToken}`,
-          "Xero-tenant-id": connection.tenantId || "",
-          "Content-Type": "application/json",
+      const createResp = await axios.post(
+        "https://api.xero.com/api.xro/2.0/Contacts",
+        createBody,
+        {
+          headers: {
+            Authorization: `Bearer ${connection.accessToken}`,
+            "Xero-tenant-id": connection.tenantId || "",
+            "Content-Type": "application/json",
+          },
+          timeout: 20000,
         },
-        timeout: 20000,
-      });
+      );
 
       const created = createResp.data?.Contacts && createResp.data.Contacts[0];
       externalId = created?.ContactID || created?.ContactId;
@@ -952,7 +1023,9 @@ export class AccountingService {
          VALUES (gen_random_uuid(), $1, 'xero', $2, $3, $4)`,
         [userId, connection.tenantId, externalId, email],
       );
-      logger.info(`[AccountingService] Mapped user ${userId} -> xero contact ${externalId} (tenant ${connection.tenantId})`);
+      logger.info(
+        `[AccountingService] Mapped user ${userId} -> xero contact ${externalId} (tenant ${connection.tenantId})`,
+      );
     }
   }
 
@@ -977,7 +1050,8 @@ export class AccountingService {
 
     // Query QuickBooks for customers with matching email
     // Use a QBO query to find customers by email
-    const query = `SELECT * FROM Customer WHERE BillAddr.Email = '${email}' MAXRESULTS 10`;
+    const sanitizedEmail = email.replace(/'/g, "\\'");
+    const query = `SELECT * FROM Customer WHERE BillAddr.Email = '${sanitizedEmail}' MAXRESULTS 10`;
     const encodedQuery = encodeURIComponent(query);
 
     try {
@@ -999,7 +1073,10 @@ export class AccountingService {
       if (customers.length > 0) {
         for (const c of customers) {
           const customerEmail = c.BillAddr?.Email || c.ShipAddr?.Email;
-          if (customerEmail && customerEmail.toLowerCase() === email.toLowerCase()) {
+          if (
+            customerEmail &&
+            customerEmail.toLowerCase() === email.toLowerCase()
+          ) {
             foundCustomer = c;
             break;
           }
@@ -1012,7 +1089,10 @@ export class AccountingService {
         customerId = foundCustomer.Id;
       } else {
         // Create new customer in QuickBooks
-        const displayName = (firstName || lastName) ? `${firstName || ''} ${lastName || ''}`.trim() : email.split("@")[0];
+        const displayName =
+          firstName || lastName
+            ? `${firstName || ""} ${lastName || ""}`.trim()
+            : email.split("@")[0];
 
         const createBody = {
           DisplayName: displayName,
@@ -1052,15 +1132,25 @@ export class AccountingService {
            VALUES (gen_random_uuid(), $1, 'quickbooks', $2, $3, $4)`,
           [userId, connection.realmId, customerId, email],
         );
-        logger.info(`[AccountingService] Mapped user ${userId} -> quickbooks customer ${customerId} (realm ${connection.realmId})`);
+        logger.info(
+          `[AccountingService] Mapped user ${userId} -> quickbooks customer ${customerId} (realm ${connection.realmId})`,
+        );
       }
     } catch (err) {
       // If query fails (e.g., no customer with that email), proceed to create
-      if ((err as any).response?.status === 400 || (err as any).response?.status === 401) {
-        logger.warn(`[AccountingService] QB customer query failed for user ${userId}: ${(err as Error).message}. Attempting create.`);
+      if (
+        (err as any).response?.status === 400 ||
+        (err as any).response?.status === 401
+      ) {
+        logger.warn(
+          `[AccountingService] QB customer query failed for user ${userId}: ${(err as Error).message}. Attempting create.`,
+        );
 
         // Attempt to create customer
-        const displayName = (firstName || lastName) ? `${firstName || ''} ${lastName || ''}`.trim() : email.split("@")[0];
+        const displayName =
+          firstName || lastName
+            ? `${firstName || ""} ${lastName || ""}`.trim()
+            : email.split("@")[0];
 
         const createBody = {
           DisplayName: displayName,
@@ -1099,7 +1189,9 @@ export class AccountingService {
              VALUES (gen_random_uuid(), $1, 'quickbooks', $2, $3, $4)`,
             [userId, connection.realmId, customerId, email],
           );
-          logger.info(`[AccountingService] Created and mapped user ${userId} -> quickbooks customer ${customerId} (realm ${connection.realmId})`);
+          logger.info(
+            `[AccountingService] Created and mapped user ${userId} -> quickbooks customer ${customerId} (realm ${connection.realmId})`,
+          );
         }
       } else {
         throw err;
@@ -1615,6 +1707,24 @@ export class AccountingService {
             err instanceof Error ? err.message : String(err),
           ],
         );
+
+        const providerType =
+          connection.provider === AccountingProvider.QUICKBOOKS
+            ? "quickbooks"
+            : connection.provider === AccountingProvider.XERO
+              ? "xero"
+              : null;
+
+        if (providerType) {
+          const errorMessage = err instanceof Error ? err.message : String(err);
+          await pool.query(
+            `INSERT INTO accounting_sync_errors
+               (transaction_id, provider_type, error_message, status)
+             VALUES ($1, $2, $3, 'pending')
+             ON CONFLICT DO NOTHING`,
+            [transaction.id, providerType, errorMessage.slice(0, 500)],
+          );
+        }
       }
     }
   }
@@ -1648,7 +1758,9 @@ export class AccountingService {
           },
         },
       ],
-      CurrencyRef: transaction.currency ? { value: transaction.currency } : undefined,
+      CurrencyRef: transaction.currency
+        ? { value: transaction.currency }
+        : undefined,
     };
 
     await axios.post(

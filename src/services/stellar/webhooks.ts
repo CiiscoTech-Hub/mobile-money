@@ -1,6 +1,8 @@
+import logger from "../../utils/logger";
 import { Queue, Worker, Job } from "bullmq";
 import { createHmac } from "crypto";
 import { queueOptions } from "../../queue/config";
+import { signWebhookPayload } from "../../crypto/webhookSigning";
 
 export const SEP_WEBHOOK_QUEUE_NAME = "sep-webhooks";
 
@@ -13,7 +15,7 @@ export interface SepWebhookJobData {
 
 export const sepWebhookQueue = new Queue<SepWebhookJobData>(
   SEP_WEBHOOK_QUEUE_NAME,
-  queueOptions
+  queueOptions,
 );
 
 /**
@@ -23,10 +25,12 @@ export async function enqueueSepWebhook(
   transactionId: string,
   status: string,
   callbackUrl: string,
-  payload: any
+  payload: any,
 ): Promise<void> {
   if (!callbackUrl) {
-    console.warn(`[sep-webhook] Skipped enqueuing webhook for transaction ${transactionId}: No callback URL provided`);
+    console.warn(
+      `[sep-webhook] Skipped enqueuing webhook for transaction ${transactionId}: No callback URL provided`,
+    );
     return;
   }
 
@@ -46,9 +50,11 @@ export async function enqueueSepWebhook(
         type: "exponential",
         delay: 1000,
       },
-    }
+    },
   );
-  console.log(`[sep-webhook] Enqueued webhook job ${jobId} for transaction ${transactionId} (status: ${status}) to ${callbackUrl}`);
+  console.log(
+    `[sep-webhook] Enqueued webhook job ${jobId} for transaction ${transactionId} (status: ${status}) to ${callbackUrl}`,
+  );
 }
 
 /**
@@ -61,9 +67,15 @@ export const sepWebhookWorker = new Worker<SepWebhookJobData>(
     const secret = process.env.STELLAR_WEBHOOK_SECRET || "default_secret";
 
     const bodyStr = JSON.stringify(payload);
-    const signature = "sha256=" + createHmac("sha256", secret).update(bodyStr).digest("hex");
+    const signature = signWebhookPayload(
+      bodyStr,
+      (p) => "sha256=" + createHmac("sha256", secret).update(p).digest("hex"),
+      process.env.STELLAR_WEBHOOK_ED25519_SIGNING_KEY,
+    ).signature;
 
-    console.log(`[sep-webhook] Delivering webhook job=${job.id} for transaction=${transactionId} status=${status} to callbackUrl=${callbackUrl}`);
+    console.log(
+      `[sep-webhook] Delivering webhook job=${job.id} for transaction=${transactionId} status=${status} to callbackUrl=${callbackUrl}`,
+    );
     console.log(`[sep-webhook] Request Body: ${bodyStr}`);
 
     try {
@@ -77,17 +89,22 @@ export const sepWebhookWorker = new Worker<SepWebhookJobData>(
       });
 
       const responseText = await response.text();
-      console.log(`[sep-webhook] Response status=${response.status} body=${responseText}`);
+      console.log(
+        `[sep-webhook] Response status=${response.status} body=${responseText}`,
+      );
 
       if (!response.ok) {
         throw new Error(`HTTP error ${response.status}: ${responseText}`);
       }
     } catch (error: any) {
-      console.error(`[sep-webhook] Delivery failed for transaction=${transactionId} callbackUrl=${callbackUrl}:`, error.message);
+      logger.error(
+        `[sep-webhook] Delivery failed for transaction=${transactionId} callbackUrl=${callbackUrl}:`,
+        error.message,
+      );
       throw error; // Propagate error so BullMQ retries the job
     }
   },
-  queueOptions
+  queueOptions,
 );
 
 // Graceful shutdown helper

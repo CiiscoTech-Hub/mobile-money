@@ -3,6 +3,12 @@ import crypto from "crypto";
 import { VodacomProvider } from "../../src/services/mobilemoney/providers/vodacom";
 import { MobileMoneyService } from "../../src/services/mobilemoney/mobileMoneyService";
 
+jest.mock("../../src/services/providerSettingsService", () => ({
+  providerSettingsService: {
+    resolveMaintenanceRouting: jest.fn().mockResolvedValue({ action: "proceed" }),
+  },
+}));
+
 // Mock axios
 jest.mock("axios");
 const mockedAxios = axios as jest.Mocked<typeof axios>;
@@ -12,9 +18,11 @@ jest.mock("crypto", () => {
   const originalCrypto = jest.requireActual("crypto");
   return {
     ...originalCrypto,
-    publicEncrypt: jest.fn().mockImplementation((options: any, buffer: Buffer) => {
-      return Buffer.from(`mock-encrypted:${buffer.toString()}`);
-    })
+    publicEncrypt: jest
+      .fn()
+      .mockImplementation((options: any, buffer: Buffer) => {
+        return Buffer.from(`mock-encrypted:${buffer.toString()}`);
+      }),
   };
 });
 
@@ -42,10 +50,10 @@ describe("VodacomProvider", () => {
           data: {
             output_ResponseCode: "INS-0",
             output_ResponseDesc: "Request processed successfully",
-            output_SessionID: "mock-session-id"
-          }
+            output_SessionID: "mock-session-id",
+          },
         }),
-        post: jest.fn()
+        post: jest.fn(),
       };
       mockedAxios.create.mockReturnValue(mockClient as any);
 
@@ -56,7 +64,7 @@ describe("VodacomProvider", () => {
       expect(token).toBe("mock-session-id");
       expect(mockClient.get).toHaveBeenCalledWith(
         "/vodacomTZN/getSession/",
-        expect.any(Object)
+        expect.any(Object),
       );
 
       const authHeader = mockClient.get.mock.calls[0][1].headers.Authorization;
@@ -74,16 +82,16 @@ describe("VodacomProvider", () => {
         get: jest.fn().mockResolvedValue({
           data: {
             output_ResponseCode: "INS-0",
-            output_SessionID: "mock-session-id"
-          }
+            output_SessionID: "mock-session-id",
+          },
         }),
         post: jest.fn().mockResolvedValue({
           data: {
             output_ResponseCode: "INS-0",
             output_ResponseDesc: "Success",
-            output_TransactionID: "TXN12345"
-          }
-        })
+            output_TransactionID: "TXN12345",
+          },
+        }),
       };
       mockedAxios.create.mockReturnValue(mockClient as any);
       provider = new VodacomProvider();
@@ -97,9 +105,9 @@ describe("VodacomProvider", () => {
         expect.objectContaining({
           input_Amount: "1000",
           input_CustomerMSISDN: "255700000000",
-          input_ServiceProviderCode: "123456"
+          input_ServiceProviderCode: "123456",
         }),
-        expect.any(Object)
+        expect.any(Object),
       );
 
       const authHeader = mockClient.post.mock.calls[0][2].headers.Authorization;
@@ -113,15 +121,15 @@ describe("VodacomProvider", () => {
         get: jest.fn().mockResolvedValue({
           data: {
             output_ResponseCode: "INS-0",
-            output_SessionID: "mock-session-id"
-          }
+            output_SessionID: "mock-session-id",
+          },
         }),
         post: jest.fn().mockResolvedValue({
           data: {
             output_ResponseCode: "INS-1",
-            output_ResponseDesc: "Insufficient Balance"
-          }
-        })
+            output_ResponseDesc: "Insufficient Balance",
+          },
+        }),
       };
       mockedAxios.create.mockReturnValue(mockClient as any);
       provider = new VodacomProvider();
@@ -138,16 +146,16 @@ describe("VodacomProvider", () => {
         get: jest.fn().mockResolvedValue({
           data: {
             output_ResponseCode: "INS-0",
-            output_SessionID: "mock-session-id"
-          }
+            output_SessionID: "mock-session-id",
+          },
         }),
         post: jest.fn().mockResolvedValue({
           data: {
             output_ResponseCode: "INS-0",
             output_ResponseDesc: "Success",
-            output_TransactionID: "TXN54321"
-          }
-        })
+            output_TransactionID: "TXN54321",
+          },
+        }),
       };
       mockedAxios.create.mockReturnValue(mockClient as any);
       provider = new VodacomProvider();
@@ -160,9 +168,9 @@ describe("VodacomProvider", () => {
         expect.objectContaining({
           input_Amount: "500",
           input_CustomerMSISDN: "255700000000",
-          input_ServiceProviderCode: "123456"
+          input_ServiceProviderCode: "123456",
         }),
-        expect.any(Object)
+        expect.any(Object),
       );
     });
   });
@@ -170,19 +178,20 @@ describe("VodacomProvider", () => {
   describe("getTransactionStatus", () => {
     it("should query status and map properly", async () => {
       const mockClient = {
-        get: jest.fn()
+        get: jest
+          .fn()
           .mockResolvedValueOnce({
             data: {
               output_ResponseCode: "INS-0",
-              output_SessionID: "mock-session-id"
-            }
+              output_SessionID: "mock-session-id",
+            },
           })
           .mockResolvedValueOnce({
             data: {
               output_ResponseCode: "INS-0",
-              output_TransactionStatus: "SUCCESSFUL"
-            }
-          })
+              output_TransactionStatus: "SUCCESSFUL",
+            },
+          }),
       };
       mockedAxios.create.mockReturnValue(mockClient as any);
       provider = new VodacomProvider();
@@ -198,25 +207,29 @@ describe("VodacomProvider", () => {
         get: jest.fn().mockResolvedValue({
           data: {
             output_ResponseCode: "INS-0",
-            output_SessionID: "mock-session-id"
-          }
+            output_SessionID: "mock-session-id",
+          },
         }),
         post: jest.fn().mockResolvedValue({
           data: {
             output_ResponseCode: "INS-0",
             output_ResponseDesc: "Success",
-            output_TransactionID: "TXN-LAZY"
-          }
-        })
+            output_TransactionID: "TXN-LAZY",
+          },
+        }),
       };
-      
+
       // Use active axios instance from the reloaded module registry after resetModules()
       const activeAxios = require("axios") as jest.Mocked<typeof axios>;
       activeAxios.create.mockReturnValue(mockClient as any);
 
       const service = new MobileMoneyService();
 
-      const result = await service.initiatePayment("vodacom", "255700000000", "1000");
+      const result = await service.initiatePayment(
+        "vodacom",
+        "255700000000",
+        "1000",
+      );
 
       expect(result.success).toBe(true);
       expect(result.data.output_TransactionID).toBe("TXN-LAZY");

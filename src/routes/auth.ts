@@ -1,3 +1,4 @@
+import logger from "../utils/logger";
 import { Router, Request, Response } from "express";
 import { z } from "zod";
 import {
@@ -17,8 +18,11 @@ import {
   createUser,
   getUserPermissions,
   getUserByPhoneNumber,
+  getUserById,
   User,
 } from "../services/userService";
+import { smsService } from "../services/sms";
+import { translate } from "../utils/i18n";
 import { getLockoutStatus, recordFailedAttempt } from "../auth/lockout";
 import { verifyTOTPToken, verifyBackupCode, is2FAEnabled } from "../auth/2fa";
 import { evaluateAdminLoginAnomaly } from "../services/loginAnomaly";
@@ -31,8 +35,24 @@ import {
   loginRateLimiter,
   registerRateLimiter,
 } from "../middleware/authRateLimit";
+import {
+  verifyDeviceRateLimiter,
+  resendVerificationRateLimiter,
+} from "../middleware/rateLimiter";
 import { ERROR_CODES } from "../constants/errorCodes";
 import { createError } from "../middleware/errorHandler";
+import {
+  checkDeviceVerification,
+  generateVerificationOTP,
+  verifyOTP,
+  setVerificationPending,
+  clearVerificationPending,
+  getPendingVerificationId,
+} from "../services/deviceVerification";
+import { extractFingerprint } from "../middleware/fingerprint";
+import { getCurrentRequestIp } from "../services/loginAnomaly";
+import { trackLoginSession } from "../services/userSessionTracking";
+import { userSessionModel } from "../models/userSession";
 
 const emailService = new EmailService();
 
@@ -54,6 +74,10 @@ export const registerSchema = z.object({
 
 /**
  * POST /api/auth/register
+ *
+ * Registers a new user with phone number and password.
+ * Returns 409 Conflict if phone number already registered (active user).
+ * Allows re-registration if prior account was soft-deleted.
  */
 authRoutes.post(
   "/register",
@@ -73,6 +97,18 @@ authRoutes.post(
         .status(201)
         .json({ message: "User registered successfully", userId: user.id });
     } catch (error) {
+      // Handle unique constraint violation for phone_number
+      // PostgreSQL error code 23505 = unique constraint violation
+      const pgError = error as any;
+      if (pgError?.code === "23505" && pgError?.detail?.includes("phone_number")) {
+        res.status(409).json({
+          error: "Phone number already registered",
+          message: "This phone number is already associated with an active account. If you believe this is an error, please contact support.",
+          code: "PHONE_NUMBER_EXISTS",
+        });
+        return;
+      }
+
       throw createError(ERROR_CODES.INTERNAL_ERROR, "Registration failed", {
         error: "Registration failed",
         message: error instanceof Error ? error.message : "Unknown error",
@@ -147,7 +183,7 @@ authRoutes.post(
               });
             }
           } catch (emailErr) {
-            console.error(
+            logger.error(
               "[Login] Failed to send lockout notification:",
               emailErr,
             );
@@ -218,6 +254,62 @@ authRoutes.post(
         }
       }
 
+      // Device verification check for all users
+      const ipAddress = getCurrentRequestIp(req);
+      const fingerprint = extractFingerprint(req);
+
+      if (ipAddress && fingerprint) {
+        const deviceCheck = await checkDeviceVerification(
+          user.id,
+          ipAddress,
+          fingerprint,
+        );
+
+        if (deviceCheck.requiresVerification && deviceCheck.verificationId) {
+          // Generate OTP
+          const otp = await generateVerificationOTP(deviceCheck.verificationId);
+
+          if (otp) {
+            // Mark verification as pending for this user
+            await setVerificationPending(user.id, deviceCheck.verificationId);
+
+            // Send OTP via SMS
+            try {
+              const locale = "en";
+              const message = translate("sms.otp", locale, { otp });
+              await smsService.sendToPhone(user.phone_number, message);
+              logger.info({ userId: user.id, verificationId: deviceCheck.verificationId }, "Device verification OTP sent via SMS");
+            } catch (smsErr) {
+              logger.error({ smsErr, userId: user.id }, "Failed to send device verification OTP SMS");
+            }
+
+            logger.info(
+              {
+                userId: user.id,
+                verificationId: deviceCheck.verificationId,
+                reason: deviceCheck.reason,
+              },
+              "Device verification required - OTP generated",
+            );
+
+            throw createError(
+              ERROR_CODES.FORBIDDEN,
+              "New device or IP detected. Please verify your identity using the code sent to your registered contact.",
+              {
+                error: "Device verification required",
+                requiresDeviceVerification: true,
+                verificationId: deviceCheck.verificationId,
+                reason: deviceCheck.reason,
+                isNewDevice: deviceCheck.isNewDevice,
+                isNewIp: deviceCheck.isNewIp,
+                // In production, remove this and send via email/SMS
+                otp: process.env.NODE_ENV === "development" ? otp : undefined,
+              },
+            );
+          }
+        }
+      }
+
       const payload = {
         userId: user.id,
         email: user.phone_number,
@@ -227,6 +319,17 @@ authRoutes.post(
       const token = generateToken(payload);
       const refreshToken = await generateRefreshToken(user.id);
       const permissions = await getUserPermissions(user.id);
+
+      // Record the session (device + geo-location) — best-effort, must not
+      // delay or block the login response.
+      void trackLoginSession({
+        userId: user.id,
+        fingerprint,
+        ipAddress,
+        userAgent: Array.isArray(req.headers["user-agent"])
+          ? (req.headers["user-agent"][0] ?? null)
+          : (req.headers["user-agent"] ?? null),
+      });
 
       res.json({
         message: "Login successful",
@@ -321,6 +424,61 @@ authRoutes.delete(
 );
 
 /**
+ * GET /api/auth/sessions
+ *
+ * List the authenticated user's active sessions, with device fingerprint
+ * and resolved geo-location metadata.
+ */
+authRoutes.get(
+  "/sessions",
+  authenticateToken,
+  async (req: Request, res: Response) => {
+    const userId = req.jwtUser?.userId;
+    if (!userId) {
+      throw createError(ERROR_CODES.UNAUTHORIZED, "Unauthorized", {
+        error: "Unauthorized",
+      });
+    }
+
+    const sessions = await userSessionModel.getActiveSessionsForUser(userId);
+    res.json({ sessions });
+  },
+);
+
+/**
+ * DELETE /api/auth/sessions/:session_id
+ *
+ * Revoke a specific active session belonging to the authenticated user.
+ */
+authRoutes.delete(
+  "/sessions/:session_id",
+  authenticateToken,
+  async (req: Request, res: Response) => {
+    const userId = req.jwtUser?.userId;
+    if (!userId) {
+      throw createError(ERROR_CODES.UNAUTHORIZED, "Unauthorized", {
+        error: "Unauthorized",
+      });
+    }
+
+    const revoked = await userSessionModel.revokeSession(
+      req.params.session_id,
+      userId,
+    );
+
+    if (!revoked) {
+      throw createError(
+        ERROR_CODES.NOT_FOUND,
+        "Session not found or already revoked",
+        { error: "Not found" },
+      );
+    }
+
+    res.json({ revoked: true });
+  },
+);
+
+/**
  * POST /api/auth/verify
  *
  * Verify a JWT token and return the decoded payload
@@ -391,7 +549,7 @@ authRoutes.get(
           try {
             balanceStats = JSON.parse(cachedStats.toString());
           } catch (e) {
-            console.error("Error parsing cached balance stats", e);
+            logger.error("Error parsing cached balance stats", e);
           }
         } else {
           const transactionModel = new TransactionModel();
@@ -451,6 +609,188 @@ authRoutes.get(
         {
           error: "Unable to fetch user info",
           message: error instanceof Error ? error.message : "Unknown error",
+        },
+      );
+    }
+  },
+);
+
+/**
+ * POST /api/auth/verify-device
+ *
+ * Verify device OTP code and release session
+ * This endpoint allows users to complete device verification after login
+ */
+authRoutes.post(
+  "/verify-device",
+  verifyDeviceRateLimiter,
+  authenticateToken,
+  async (req: Request, res: Response) => {
+    const payload = req.jwtUser as JWTPayload;
+
+    if (!payload) {
+      throw createError(ERROR_CODES.UNAUTHORIZED, "Authentication required", {
+        error: "Authentication required",
+      });
+    }
+
+    const { verificationId, otp } = req.body;
+
+    if (!verificationId || !otp) {
+      throw createError(
+        ERROR_CODES.MISSING_FIELD,
+        "Verification ID and OTP are required",
+        {
+          error: "Missing required fields",
+        },
+      );
+    }
+
+    try {
+      // Verify the OTP
+      const result = await verifyOTP(verificationId, otp);
+
+      if (result.success) {
+        // Clear pending verification for this user
+        await clearVerificationPending(payload.userId);
+
+        // Generate new tokens for the verified session
+        const token = generateToken({
+          userId: payload.userId,
+          email: payload.email,
+          role: payload.role,
+        });
+        const refreshToken = await generateRefreshToken(payload.userId);
+        const permissions = await getUserPermissions(payload.userId);
+
+        logger.info(
+          {
+            userId: payload.userId,
+            verificationId,
+          },
+          "Device verification successful",
+        );
+
+        res.json({
+          message: "Device verification successful",
+          token,
+          refreshToken,
+          user: {
+            userId: payload.userId,
+            email: payload.email,
+            role: payload.role,
+            permissions,
+          },
+        });
+      } else {
+        throw createError(
+          ERROR_CODES.UNAUTHORIZED,
+          result.message || "Verification failed",
+          {
+            error: "Verification failed",
+          },
+        );
+      }
+    } catch (error) {
+      if (error && typeof error === "object" && "statusCode" in error) {
+        throw error;
+      }
+
+      throw createError(
+        ERROR_CODES.INTERNAL_ERROR,
+        error instanceof Error ? error.message : "Unknown error",
+        {
+          error: "Verification failed",
+        },
+      );
+    }
+  },
+);
+
+/**
+ * POST /api/auth/resend-verification
+ *
+ * Resend verification OTP code
+ */
+authRoutes.post(
+  "/resend-verification",
+  resendVerificationRateLimiter,
+  authenticateToken,
+  async (req: Request, res: Response) => {
+    const payload = req.jwtUser as JWTPayload;
+
+    if (!payload) {
+      throw createError(ERROR_CODES.UNAUTHORIZED, "Authentication required", {
+        error: "Authentication required",
+      });
+    }
+
+    try {
+      // Get pending verification ID for this user
+      const verificationId = await getPendingVerificationId(payload.userId);
+
+      if (!verificationId) {
+        throw createError(
+          ERROR_CODES.NOT_FOUND,
+          "No pending verification found",
+          {
+            error: "No pending verification",
+          },
+        );
+      }
+
+      // Generate new OTP
+      const otp = await generateVerificationOTP(verificationId);
+
+      if (!otp) {
+        throw createError(
+          ERROR_CODES.INTERNAL_ERROR,
+          "Failed to generate verification code",
+          {
+            error: "Code generation failed",
+          },
+        );
+      }
+
+      // Fetch user to get their phone number
+      const user = await getUserById(payload.userId);
+      if (user) {
+        // Send OTP via SMS
+        try {
+          const locale = "en";
+          const message = translate("sms.otp", locale, { otp });
+          await smsService.sendToPhone(user.phone_number, message);
+          logger.info({ userId: payload.userId, verificationId }, "Verification OTP resent via SMS");
+        } catch (smsErr) {
+          logger.error({ smsErr, userId: payload.userId }, "Failed to resend verification OTP SMS");
+        }
+      }
+
+      logger.info(
+        {
+          userId: payload.userId,
+          verificationId,
+        },
+        "Verification code resent",
+      );
+
+      // In production, send OTP via email/SMS
+      res.json({
+        message: "Verification code resent",
+        verificationId,
+        // In production, remove this and send via email/SMS
+        otp: process.env.NODE_ENV === "development" ? otp : undefined,
+      });
+    } catch (error) {
+      if (error && typeof error === "object" && "statusCode" in error) {
+        throw error;
+      }
+
+      throw createError(
+        ERROR_CODES.INTERNAL_ERROR,
+        error instanceof Error ? error.message : "Unknown error",
+        {
+          error: "Failed to resend verification code",
         },
       );
     }

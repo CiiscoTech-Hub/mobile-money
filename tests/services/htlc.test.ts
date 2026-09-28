@@ -1,5 +1,5 @@
 import { HtlcService } from "../../src/services/stellar/htlcService";
-import * as StellarSdk from "stellar-sdk";
+import * as StellarSdk from "@stellar/stellar-sdk";
 
 jest.mock("../../src/config/stellar", () => ({
   getStellarServer: jest.fn().mockReturnValue({
@@ -9,7 +9,9 @@ jest.mock("../../src/config/stellar", () => ({
       sequence: "1",
     }),
   }),
-  getNetworkPassphrase: jest.fn().mockReturnValue("Test SDF Network ; September 2015"),
+  getNetworkPassphrase: jest
+    .fn()
+    .mockReturnValue("Test SDF Network ; September 2015"),
 }));
 
 describe("HtlcService", () => {
@@ -22,12 +24,13 @@ describe("HtlcService", () => {
   it("should build a lock transaction", async () => {
     const params = {
       senderAddress: "GBAF7YV6T7YV6T7YV6T7YV6T7YV6T7YV6T7YV6T7YV6T7YV6T7YV6T7", // Placeholder
-      receiverAddress: "GBAF7YV6T7YV6T7YV6T7YV6T7YV6T7YV6T7YV6T7YV6T7YV6T7YV6T7",
-      tokenAddress: "CDW7YV6T7YV6T7YV6T7YV6T7YV6T7YV6T7YV6T7YV6T7YV6T7YV6T7",
+      receiverAddress:
+        "GBAF7YV6T7YV6T7YV6T7YV6T7YV6T7YV6T7YV6T7YV6T7YV6T7YV6T7",
+      tokenAddress: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB2XJ",
       amount: "100",
       hashlock: "0".repeat(64),
       timelock: 2000,
-      contractId: "CDW7YV6T7YV6T7YV6T7YV6T7YV6T7YV6T7YV6T7YV6T7YV6T7YV6T7",
+      contractId: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB2XJ",
     };
 
     const tx = await htlcService.buildLockTx(params);
@@ -40,7 +43,7 @@ describe("HtlcService", () => {
     const params = {
       claimerAddress: "GBAF7YV6T7YV6T7YV6T7YV6T7YV6T7YV6T7YV6T7YV6T7YV6T7YV6T7",
       preimage: "0".repeat(64),
-      contractId: "CDW7YV6T7YV6T7YV6T7YV6T7YV6T7YV6T7YV6T7YV6T7YV6T7YV6T7",
+      contractId: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB2XJ",
     };
 
     const tx = await htlcService.buildClaimTx(params);

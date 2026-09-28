@@ -3,8 +3,6 @@
 -- Description: Persistent storage for channel accounts that distribute transaction load
 --              across multiple Stellar accounts to avoid sequence number collisions.
 
-BEGIN;
-
 -- Table: channel_accounts
 CREATE TABLE IF NOT EXISTS channel_accounts (
   id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -44,5 +42,3 @@ CREATE TRIGGER trg_channel_accounts_updated_at
   BEFORE UPDATE ON channel_accounts
   FOR EACH ROW
   EXECUTE FUNCTION update_channel_accounts_updated_at();
-
-COMMIT;

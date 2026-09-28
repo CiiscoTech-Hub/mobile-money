@@ -6,9 +6,9 @@ jest.mock("axios");
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const axiosMock = axios as any;
 
+const env = { ...process.env };
+
 describe("MTNProvider.sendBatchPayout", () => {
-
-
   beforeEach(() => {
     jest.resetAllMocks();
     process.env = { ...env };
@@ -215,4 +215,3 @@ describe("MTNProvider.sendBatchPayout", () => {
     ]);
   });
 });
-

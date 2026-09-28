@@ -1,3 +1,4 @@
+import logger from "../utils/logger";
 import { Router, Request, Response, NextFunction } from "express";
 import { authenticateToken } from "../middleware/auth";
 import multer, { MulterError } from "multer";
@@ -222,7 +223,7 @@ async function processJob(jobId: string, rows: CsvRow[]): Promise<void> {
       }
     }
   } catch (error) {
-    console.error("[BulkImport] Fatal error in processJob:", error);
+    logger.error("[BulkImport] Fatal error in processJob:", error);
   } finally {
     job.status = "completed";
     job.completedAt = new Date();
@@ -358,3 +359,22 @@ bulkRoutes.get("/:jobId", (req: Request, res: Response) => {
     ...(job.completedAt && { completedAt: job.completedAt }),
   });
 });
+
+bulkRoutes.post(
+  "/batch-payout/trigger",
+  authenticateToken,
+  async (req: Request, res: Response) => {
+    const { executeProviderBatchPayout } = await import(
+      "../queue/payoutBatchWorker.js"
+    );
+    const provider = (req.body?.provider || "mtn").toLowerCase();
+    const result = await executeProviderBatchPayout(provider);
+
+    return res.status(200).json({
+      success: result.success,
+      provider,
+      totalProcessed: result.totalProcessed,
+      triggeredAt: new Date().toISOString(),
+    });
+  },
+);

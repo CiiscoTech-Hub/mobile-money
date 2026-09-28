@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="carbon">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Mobile Money to Stellar Bridge & KYC Portal</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="app-header">
+    <div class="logo-area">
+      <h1>Mobile Money ↔ Stellar</h1>
+      <span id="status-text" class="status-text">System: Connecting...</span>
+      <span id="status-dot" class="status-dot"></span>
+    </div>
+    <div class="theme-switcher">
+      <button data-theme="carbon" aria-pressed="true">Carbon</button>
+      <button data-theme="light" aria-pressed="false">Light</button>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="card">
+      <h2>Exchange Rate Calculator</h2>
+      <div class="calculator-grid">
+        <div class="input-group">
+          <label for="calc-send-amount">You Send</label>
+          <input type="number" id="calc-send-amount" value="1000">
+          <select id="calc-send-currency">
+            <option value="XAF">XAF</option>
+            <option value="NGN">NGN</option>
+            <option value="KES">KES</option>
+            <option value="GHS">GHS</option>
+            <option value="TZS">TZS</option>
+            <option value="ZMW">ZMW</option>
+            <option value="RWF">RWF</option>
+          </select>
+        </div>
+        <div class="input-group">
+          <label for="calc-receive-amount">Recipient Gets</label>
+          <input type="text" id="calc-receive-amount" readonly>
+          <select id="calc-receive-asset">
+            <option value="USDC">USDC</option>
+            <option value="XLM">XLM</option>
+          </select>
+        </div>
+      </div>
+      <div class="calc-details">
+        <p>Exchange Rate: <span id="rate-display">-</span></p>
+        <p>Operator Fee (1.5%): <span id="fee-display">-</span></p>
+        <p>Final Settlement: <strong id="final-display">-</strong></p>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Hosted KYC Document Upload Flow</h2>
+      <div id="kyc-upload-container" data-applicant-id="app_sample_123" data-doc-type="passport" data-file-input-id="kyc-file-input">
+        <div class="upload-input-group">
+          <label for="kyc-file-input">Upload Passport / ID Document</label>
+          <input type="file" id="kyc-file-input">
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>

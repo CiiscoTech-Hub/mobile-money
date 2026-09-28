@@ -1,3 +1,4 @@
+import logger from "../utils/logger";
 /**
  * Token-bucket rate limiter for ingest streams (webhooks / callbacks).
  *
@@ -158,7 +159,10 @@ export function deriveIngestKey(req: Request): string {
 
   const forwarded = req.headers["x-forwarded-for"];
   const ip =
-    (typeof forwarded === "string" ? forwarded.split(",")[0] : undefined)?.trim() ??
+    (typeof forwarded === "string"
+      ? forwarded.split(",")[0]
+      : undefined
+    )?.trim() ??
     req.ip ??
     "unknown";
 
@@ -189,7 +193,7 @@ async function consumeToken(
     const tokensRemaining = parseFloat(String(result[1]));
     return { allowed, tokensRemaining };
   } catch (err) {
-    console.error("[ingest-rate-limit] Redis eval failed, using fallback", err);
+    logger.error("[ingest-rate-limit] Redis eval failed, using fallback", err);
     const allowed = fallbackConsume(key, cfg);
     return { allowed, tokensRemaining: allowed ? cfg.capacity - 1 : 0 };
   }
@@ -211,7 +215,9 @@ async function consumeToken(
  * // Apply with explicit config
  * router.use(createIngestRateLimiter({ capacity: 200, refillRate: 100, keyTtlSeconds: 60 }));
  */
-export function createIngestRateLimiter(overrides: Partial<TokenBucketConfig> = {}) {
+export function createIngestRateLimiter(
+  overrides: Partial<TokenBucketConfig> = {},
+) {
   const cfg: TokenBucketConfig = { ...loadConfig(), ...overrides };
 
   return async function ingestRateLimiter(

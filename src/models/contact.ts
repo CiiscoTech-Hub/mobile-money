@@ -25,21 +25,31 @@ export interface UpdateUserContactInput {
   nickname?: string;
 }
 
-function mapRow(row: any): UserContact {
+interface UserContactRow {
+  id: string;
+  user_id: string;
+  destination_type: DestinationType;
+  destination_value: string;
+  nickname: string;
+  created_at: Date | string;
+  updated_at: Date | string;
+}
+
+function mapRow(row: UserContactRow): UserContact {
   return {
     id: row.id,
     userId: row.user_id,
     destinationType: row.destination_type,
     destinationValue: row.destination_value,
     nickname: row.nickname,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
+    createdAt: new Date(row.created_at),
+    updatedAt: new Date(row.updated_at),
   };
 }
 
 export class ContactModel {
   async create(input: CreateUserContactInput): Promise<UserContact> {
-    const result = await queryWrite(
+    const result = await queryWrite<UserContactRow>(
       `INSERT INTO user_contacts (user_id, destination_type, destination_value, nickname)
        VALUES ($1, $2, $3, $4)
        RETURNING id, user_id, destination_type, destination_value, nickname, created_at, updated_at`,
@@ -55,7 +65,7 @@ export class ContactModel {
   }
 
   async listByUser(userId: string): Promise<UserContact[]> {
-    const result = await queryRead(
+    const result = await queryRead<UserContactRow>(
       `SELECT id, user_id, destination_type, destination_value, nickname, created_at, updated_at
        FROM user_contacts
        WHERE user_id = $1
@@ -70,7 +80,7 @@ export class ContactModel {
     id: string,
     userId: string,
   ): Promise<UserContact | null> {
-    const result = await queryRead(
+    const result = await queryRead<UserContactRow>(
       `SELECT id, user_id, destination_type, destination_value, nickname, created_at, updated_at
        FROM user_contacts
        WHERE id = $1 AND user_id = $2
@@ -112,7 +122,7 @@ export class ContactModel {
       return this.findByIdForUser(id, userId);
     }
 
-    const result = await queryWrite(
+    const result = await queryWrite<UserContactRow>(
       `UPDATE user_contacts
        SET ${updates.join(", ")}
        WHERE id = $1 AND user_id = $2

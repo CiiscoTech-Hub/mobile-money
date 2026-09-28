@@ -1,0 +1,39 @@
+{
+  "$schema": "./node_modules/@stryker-mutator/core/schema/stryker-schema.json",
+  "testRunner": "jest",
+  "jest": {
+    "projectType": "custom",
+    "configFile": "jest.stryker.queue.config.js",
+    "enableFindRelatedTests": false
+  },
+  "checkers": [],
+  "disableTypeChecks": true,
+  "mutate": ["src/queue/syncWorker.ts", "src/queue/syncQueue.ts"],
+  "ignorePatterns": [
+    "dist",
+    "coverage",
+    "reports",
+    "contracts/target",
+    ".kiro",
+    "stryker-tmp"
+  ],
+  "reporters": ["clear-text", "progress", "html", "json"],
+  "htmlReporter": {
+    "fileName": "reports/mutation/queue-html/index.html"
+  },
+  "jsonReporter": {
+    "fileName": "reports/mutation/queue-mutation.json"
+  },
+  "coverageAnalysis": "off",
+  "concurrency": 2,
+  "dryRunTimeoutMinutes": 15,
+  "timeoutMS": 15000,
+  "timeoutFactor": 2,
+  "tempDirName": "stryker-tmp",
+  "cleanTempDir": "always",
+  "thresholds": {
+    "high": 80,
+    "low": 70,
+    "break": 70
+  }
+}

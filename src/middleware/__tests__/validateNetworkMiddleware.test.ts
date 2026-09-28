@@ -52,6 +52,54 @@ describe("validateNetworkMiddleware", () => {
     expect((req.body as any).resolvedNetwork).toBe("ORANGE");
   });
 
+  it("should resolve VODACOM for a Tanzanian Vodacom number", () => {
+    req.body = {
+      phoneNumber: "+255762000000",
+    };
+
+    validateNetworkMiddleware(req as Request, res as Response, next);
+
+    expect(next).toHaveBeenCalled();
+    expect((req.body as any).resolvedNetwork).toBe("VODACOM");
+    expect(statusCode).toBe(200);
+  });
+
+  it("should resolve VODACOM for a local-format Tanzanian Vodacom number", () => {
+    req.body = {
+      destinationPhone: "0762000000",
+    };
+
+    validateNetworkMiddleware(req as Request, res as Response, next);
+
+    expect(next).toHaveBeenCalled();
+    expect((req.body as any).resolvedNetwork).toBe("VODACOM");
+    expect(statusCode).toBe(200);
+  });
+
+  it("should resolve TIGO for a Tanzanian Tigo number", () => {
+    req.body = {
+      phoneNumber: "+255713000000",
+    };
+
+    validateNetworkMiddleware(req as Request, res as Response, next);
+
+    expect(next).toHaveBeenCalled();
+    expect((req.body as any).resolvedNetwork).toBe("TIGO");
+    expect(statusCode).toBe(200);
+  });
+
+  it("should resolve TIGO for a Tanzanian Tigo number with 075 prefix", () => {
+    req.body = {
+      phoneNumber: "+255752000000",
+    };
+
+    validateNetworkMiddleware(req as Request, res as Response, next);
+
+    expect(next).toHaveBeenCalled();
+    expect((req.body as any).resolvedNetwork).toBe("TIGO");
+    expect(statusCode).toBe(200);
+  });
+
   it("should reject unsupported network prefixes", () => {
     req.body = {
       phoneNumber: "+1234567890",

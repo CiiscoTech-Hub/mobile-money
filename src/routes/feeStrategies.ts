@@ -1,3 +1,4 @@
+import logger from "../utils/logger";
 /**
  * Fee Strategy Engine — REST API
  *
@@ -46,7 +47,13 @@ const createStrategySchema = z
   .object({
     name: z.string().min(1).max(100),
     description: z.string().optional(),
-    strategyType: z.enum(["flat", "percentage", "time_based", "volume_based"]),
+    strategyType: z.enum([
+      "flat",
+      "percentage",
+      "time_based",
+      "volume_based",
+      "volatility_based",
+    ]),
     scope: z.enum(["user", "provider", "global"]),
     userId: z.string().uuid().optional(),
     provider: z.string().min(1).max(100).optional(),
@@ -75,6 +82,17 @@ const createStrategySchema = z
 
     // Volume-based
     volumeTiers: z.array(volumeTierSchema).min(1).optional(),
+
+    // Volatility-based
+    volatilityBaseCurrency: z.string().min(1).max(10).optional(),
+    volatilityQuoteCurrency: z.string().min(1).max(10).optional(),
+    volatilityMultiplier: z.number().min(0).optional(),
+    volatilityWindowHours: z
+      .number()
+      .int()
+      .min(1)
+      .max(24 * 30)
+      .optional(),
   })
   .superRefine((data, ctx) => {
     if (data.scope === "user" && !data.userId) {
@@ -129,6 +147,17 @@ const createStrategySchema = z
       });
     }
     if (
+      data.strategyType === "volatility_based" &&
+      (!data.volatilityBaseCurrency || !data.volatilityQuoteCurrency)
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "volatilityBaseCurrency and volatilityQuoteCurrency are required for volatility_based strategies",
+        path: ["volatilityBaseCurrency"],
+      });
+    }
+    if (
       data.feeMaximum !== undefined &&
       data.feeMinimum !== undefined &&
       data.feeMaximum < data.feeMinimum
@@ -163,6 +192,15 @@ const updateStrategySchema = z
     overridePercentage: z.number().min(0).max(100).optional(),
     overrideFlatAmount: z.number().min(0).optional(),
     volumeTiers: z.array(volumeTierSchema).min(1).optional(),
+    volatilityBaseCurrency: z.string().min(1).max(10).optional(),
+    volatilityQuoteCurrency: z.string().min(1).max(10).optional(),
+    volatilityMultiplier: z.number().min(0).optional(),
+    volatilityWindowHours: z
+      .number()
+      .int()
+      .min(1)
+      .max(24 * 30)
+      .optional(),
   })
   .refine(
     (d) =>
@@ -232,7 +270,7 @@ router.post("/calculate", async (req: Request, res: Response) => {
         details: error.errors,
       });
     }
-    console.error("[FeeStrategies] calculate error:", error);
+    logger.error("[FeeStrategies] calculate error:", error);
     throw createError(ERROR_CODES.INTERNAL_ERROR, "Failed to calculate fee");
   }
 });
@@ -255,7 +293,7 @@ router.get(
       const strategies = await feeStrategyEngine.getAllStrategies();
       res.json({ success: true, data: strategies });
     } catch (error: any) {
-      console.error("[FeeStrategies] list error:", error);
+      logger.error("[FeeStrategies] list error:", error);
       throw createError(
         ERROR_CODES.INTERNAL_ERROR,
         "Failed to fetch fee strategies",
@@ -313,7 +351,7 @@ router.post(
           },
         );
       }
-      console.error("[FeeStrategies] create error:", error);
+      logger.error("[FeeStrategies] create error:", error);
       throw createError(
         ERROR_CODES.INTERNAL_ERROR,
         "Failed to create fee strategy",
@@ -341,7 +379,7 @@ router.get(
       }
       res.json({ success: true, data: strategy });
     } catch (error: any) {
-      console.error("[FeeStrategies] get error:", error);
+      logger.error("[FeeStrategies] get error:", error);
       throw createError(
         ERROR_CODES.INTERNAL_ERROR,
         "Failed to fetch fee strategy",
@@ -386,7 +424,7 @@ router.put(
           details: error.errors,
         });
       }
-      console.error("[FeeStrategies] update error:", error);
+      logger.error("[FeeStrategies] update error:", error);
       throw createError(
         ERROR_CODES.INTERNAL_ERROR,
         "Failed to update fee strategy",
@@ -421,7 +459,7 @@ router.delete(
 
       res.json({ success: true, message: "Fee strategy deleted successfully" });
     } catch (error: any) {
-      console.error("[FeeStrategies] delete error:", error);
+      logger.error("[FeeStrategies] delete error:", error);
       throw createError(
         ERROR_CODES.INTERNAL_ERROR,
         "Failed to delete fee strategy",
@@ -460,7 +498,7 @@ router.post(
         message: "Fee strategy activated",
       });
     } catch (error: any) {
-      console.error("[FeeStrategies] activate error:", error);
+      logger.error("[FeeStrategies] activate error:", error);
       throw createError(
         ERROR_CODES.INTERNAL_ERROR,
         "Failed to activate fee strategy",
@@ -499,7 +537,7 @@ router.post(
         message: "Fee strategy deactivated",
       });
     } catch (error: any) {
-      console.error("[FeeStrategies] deactivate error:", error);
+      logger.error("[FeeStrategies] deactivate error:", error);
       throw createError(
         ERROR_CODES.INTERNAL_ERROR,
         "Failed to deactivate fee strategy",
@@ -522,7 +560,7 @@ router.get(
       const history = await feeStrategyEngine.getAuditHistory(req.params.id);
       res.json({ success: true, data: history });
     } catch (error: any) {
-      console.error("[FeeStrategies] audit error:", error);
+      logger.error("[FeeStrategies] audit error:", error);
       throw createError(
         ERROR_CODES.INTERNAL_ERROR,
         "Failed to fetch audit history",

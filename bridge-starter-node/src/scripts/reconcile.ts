@@ -11,6 +11,7 @@
  */
 
 import { reconcile } from "../services/reconciler";
+import logger from "../logger";
 import type { ReconciliationReport } from "../types/reconciliation";
 
 // ─── Configuration ───────────────────────────────────────────────────────────
@@ -41,10 +42,10 @@ function printReport(report: ReconciliationReport): void {
       const icon = entry.match ? "✅" : "⚠️";
       console.log(`  ${icon} [${entry.payoutId}]`);
       console.log(
-        `     local  → status: ${entry.localStatus ?? "—"}, amount: ${entry.localAmount ?? "—"}`
+        `     local  → status: ${entry.localStatus ?? "—"}, amount: ${entry.localAmount ?? "—"}`,
       );
       console.log(
-        `     remote → status: ${entry.remoteStatus ?? "—"}, amount: ${entry.remoteAmount ?? "—"}`
+        `     remote → status: ${entry.remoteStatus ?? "—"}, amount: ${entry.remoteAmount ?? "—"}`,
       );
       if (entry.discrepancy) {
         console.log(`     ⤷ ${entry.discrepancy}`);
@@ -52,11 +53,9 @@ function printReport(report: ReconciliationReport): void {
     }
   } else {
     console.log("\n  No payout records found on either side.");
+    console.log("  → Implement fetchLocalPayouts() and fetchRemotePayouts()");
     console.log(
-      "  → Implement fetchLocalPayouts() and fetchRemotePayouts()"
-    );
-    console.log(
-      "    in src/services/reconciler.ts to connect your data sources.\n"
+      "    in src/services/reconciler.ts to connect your data sources.\n",
     );
   }
 
@@ -68,16 +67,30 @@ function printReport(report: ReconciliationReport): void {
 async function runOnce(): Promise<void> {
   try {
     const report = await reconcile();
+
+    logger.info(
+      {
+        totalLocal: report.totalLocal,
+        totalRemote: report.totalRemote,
+        matched: report.matched,
+        mismatched: report.mismatched,
+        missingLocal: report.missingLocal,
+        missingRemote: report.missingRemote,
+      },
+      "Reconciliation completed",
+    );
+
     printReport(report);
   } catch (err) {
-    console.error("[reconciler] Reconciliation failed:", err);
+    logger.error({ err }, "Reconciliation failed");
     process.exitCode = 1;
   }
 }
 
 async function runLoop(): Promise<void> {
-  console.log(
-    `[reconciler] Starting reconciliation loop (interval: ${LOOP_INTERVAL_MS / 1000}s) …`
+  logger.info(
+    { interval: `${LOOP_INTERVAL_MS / 1000}s` },
+    "Starting reconciliation loop",
   );
   console.log("[reconciler] Press Ctrl+C to stop.\n");
 
