@@ -26,6 +26,7 @@ import { createExportRoutes } from "../export";
 import { TransactionModel, TransactionStatus } from "../../models/transaction";
 import { generateTransactionPdfBuffer } from "../../services/pdfReceipt";
 import { validate2FAForWithdrawal } from "../../services/twoFactorWithdrawalService";
+import { strictIdempotency } from "../../middleware/idempotency";
 
 export const transactionRoutesV1 = Router();
 transactionRoutesV1.use(createExportRoutes());
@@ -36,6 +37,7 @@ const transactionModel = new TransactionModel();
 transactionRoutesV1.post(
   "/deposit",
   requireAuth,
+  strictIdempotency,
   checkAccountStatusStrict,
   geoFencingMiddleware,
   validateNetworkMiddleware,
@@ -50,6 +52,7 @@ transactionRoutesV1.post(
 transactionRoutesV1.post(
   "/withdraw",
   requireAuth,
+  strictIdempotency,
   checkAccountStatusStrict,
   geoFencingMiddleware,
   validateNetworkMiddleware,

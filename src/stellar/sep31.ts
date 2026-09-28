@@ -10,7 +10,13 @@ import { createError } from "../middleware/errorHandler";
 
 import { pool } from "../config/database";
 import { sanctionService } from "../services/sanctionService";
-import { calculateFee } from "../services/feeCalculator";
+import {
+  AmlScreeningResult,
+  PENDING_COMPLIANCE_REVIEW,
+  amlScreeningService,
+} from "../services/amlScreening";
+import { notifyReceivingAnchorStatus } from "../services/webhookService";
+import { strictIdempotency } from "../middleware/idempotency";
 
 const router = Router();
 const transactionModel = new TransactionModel();
@@ -214,6 +220,7 @@ router.get("/info", sep31ReadLimiter, async (req: Request, res: Response) => {
 router.post(
   "/transactions",
   sep31WriteLimiter,
+  strictIdempotency,
   async (req: Request, res: Response) => {
     const {
       amount,
@@ -223,6 +230,8 @@ router.post(
       receiver_id,
       fields,
       lang,
+      callback_url,
+      callback_secret,
     } = req.body;
 
     // --- Input Validation ---
@@ -316,6 +325,29 @@ router.post(
       );
     }
 
+    // Strict KYC schema validation per country specifications (#1945)
+    const { validateSep31KycFields } = await import("../validators/sep31");
+    const kycValidation = validateSep31KycFields(
+      fields,
+      finalSenderId,
+      finalReceiverId,
+      req.body.country_code || req.body.destination_country,
+    );
+    if (!kycValidation.valid) {
+      throw createError(
+        ERROR_CODES.INVALID_INPUT,
+        kycValidation.error || "Missing mandatory KYC compliance fields",
+        {
+          error: "invalid_request",
+          message: kycValidation.error || "Missing mandatory KYC compliance fields",
+          details: {
+            missingSenderFields: kycValidation.missingSenderFields,
+            missingReceiverFields: kycValidation.missingReceiverFields,
+          },
+        },
+      );
+    }
+
     if (!SEP31_CONFIG.receivingAccount) {
       logger.error("SEP-31: STELLAR_RECEIVING_ACCOUNT not configured");
       throw createError(
@@ -362,9 +394,47 @@ router.post(
         );
       }
 
-      const initialStatus = isComplianceFlagged
+      // --- High-volume sender/receiver AML screening (#1970) ---
+      // SEP-31 senders whose rolling 24h USD volume crosses the configured
+      // threshold are screened against the OFAC/UN/EU sanctions lists and the
+      // PEP database. Matches flag the payment as pending_compliance_review.
+      const senderScreeningIdentifier =
+        txFields.sender_name ||
+        (txFields.sender_first_name
+          ? `${txFields.sender_first_name} ${txFields.sender_last_name || ""}`.trim()
+          : finalSenderId);
+
+      let amlScreening: AmlScreeningResult | null = null;
+      try {
+        const dailyVolumeUsd =
+          await amlScreeningService.getDailyVolumeUsd(finalSenderId);
+        amlScreening = await amlScreeningService.screenParties(
+          {
+            transactionId: memo,
+            userId: finalSenderId,
+            senderName: senderScreeningIdentifier,
+            receiverName: receiverScreeningIdentifier,
+            dailyVolumeUsd:
+              dailyVolumeUsd + (Number.isFinite(parsedAmount) ? parsedAmount : 0),
+          },
+          { persistAudit: false },
+        );
+      } catch (amlErr) {
+        logger.warn({ error: amlErr }, "[SEP-31] AML screening error");
+      }
+
+      const isAmlFlagged = Boolean(amlScreening?.flagged);
+      const flaggedForReview = isComplianceFlagged || isAmlFlagged;
+
+      const initialStatus = flaggedForReview
         ? Sep31Status.PendingReceiver
         : Sep31Status.PendingSender;
+
+      const complianceStatus = isComplianceFlagged
+        ? "PENDING_COMPLIANCE"
+        : isAmlFlagged
+          ? PENDING_COMPLIANCE_REVIEW
+          : "PASSED";
 
       // Build sender/receiver payload mapping
       const metadata = {
@@ -388,7 +458,11 @@ router.post(
             ? null
             : configuredAsset.getIssuer(),
           lang: lang || "en",
-          compliance_status: isComplianceFlagged ? "PENDING_COMPLIANCE" : "PASSED",
+          // Receiving anchors register their callback and shared secret with
+          // the transfer. They are used only for outbound status webhooks.
+          callback_url: callback_url || txFields.callback_url || null,
+          callback_secret: callback_secret || txFields.callback_secret || null,
+          compliance_status: complianceStatus,
           ...(isComplianceFlagged && topMatch
             ? {
                 compliance_match: {
@@ -397,6 +471,22 @@ router.post(
                   source: topMatch.entity.source,
                   category: topMatch.entity.category,
                   reason: `Receiver matched sanction entry ${topMatch.entity.name}`,
+                },
+              }
+            : {}),
+          ...(isAmlFlagged && amlScreening
+            ? {
+                aml_screening: {
+                  status: PENDING_COMPLIANCE_REVIEW,
+                  threshold_usd: amlScreening.thresholdUsd,
+                  daily_volume_usd: amlScreening.dailyVolumeUsd,
+                  matches: amlScreening.matches.map((match) => ({
+                    party: match.party,
+                    list_type: match.listType,
+                    matched_name: match.matchedName,
+                    score: match.score,
+                    source: match.source,
+                  })),
                 },
               }
             : {}),
@@ -409,14 +499,50 @@ router.post(
         phoneNumber: "SEP-31",
         provider: "stellar-sep31",
         stellarAddress: SEP31_CONFIG.receivingAccount,
-        status: isComplianceFlagged
+        status: flaggedForReview
           ? TransactionStatus.Review
           : TransactionStatus.Pending,
         metadata,
         notes: isComplianceFlagged
           ? `SEP-31 cross-border payment from ${finalSenderId} to ${finalReceiverId} flagged for compliance review: matched ${topMatch?.entity?.name}`
-          : `SEP-31 cross-border payment from ${finalSenderId} to ${finalReceiverId}`,
+          : isAmlFlagged
+            ? `SEP-31 cross-border payment from ${finalSenderId} to ${finalReceiverId} flagged pending_compliance_review by high-volume AML screening`
+            : `SEP-31 cross-border payment from ${finalSenderId} to ${finalReceiverId}`,
       });
+
+      if (initialStatus === Sep31Status.PendingReceiver) {
+        await notifyReceivingAnchorStatus(
+          newTransaction,
+          Sep31Status.PendingReceiver,
+          metadata,
+        );
+      }
+
+      // Persist the immutable, hash-chained AML audit records for any matches
+      // now that the transaction (and its real id) exists.
+      if (isAmlFlagged && amlScreening && newTransaction) {
+        for (const match of amlScreening.matches) {
+          try {
+            await amlScreeningService.recordScreeningAudit({
+              transactionId: newTransaction.id,
+              userId: finalSenderId,
+              party: match.party,
+              listType: match.listType,
+              screenedName: match.screenedName,
+              matchedName: match.matchedName,
+              score: match.score,
+              source: match.source,
+              dailyVolumeUsd: amlScreening.dailyVolumeUsd,
+              status: PENDING_COMPLIANCE_REVIEW,
+            });
+          } catch (auditErr) {
+            logger.error(
+              { error: auditErr, transactionId: newTransaction.id },
+              "[SEP-31] Failed to record AML screening audit record",
+            );
+          }
+        }
+      }
 
       // Write incident entry into audit logs if flagged
       if (isComplianceFlagged && topMatch) {
@@ -460,7 +586,7 @@ router.post(
       return res.status(201).json({
         id: newTransaction.id,
         status: initialStatus,
-        status_eta: isComplianceFlagged ? null : SEP31_CONFIG.statusEta,
+        status_eta: flaggedForReview ? null : SEP31_CONFIG.statusEta,
         stellar_account_id: SEP31_CONFIG.receivingAccount,
         stellar_memo_type: "text",
         stellar_memo: memo,
@@ -470,10 +596,9 @@ router.post(
         amount_out_asset: getAssetString(),
         amount_fee: fee.toString(),
         amount_fee_asset: getAssetString(),
-        fee_details: feeDetails,
-        ...(isComplianceFlagged && {
+        ...(flaggedForReview && {
           required_info_message:
-            "Recipient profile requires AML compliance verification before proceeding.",
+            "This transfer requires AML compliance verification before proceeding.",
         }),
       });
     } catch (error: any) {
