@@ -40,6 +40,7 @@ import { statsRoutes } from "./routes/stats";
 import { contactsRoutes } from "./routes/contacts";
 import { reportsRoutes } from "./routes/reports";
 import feesRoutes from "./routes/fees";
+import { docsRouter } from "./routes/docs";
 import { createKYCRoutes } from "./routes/kycRoutes";
 import { adminRoutes } from "./routes/admin";
 import kycTierUpgradeRoutes from "./routes/kycTierUpgradeRoutes";
@@ -78,8 +79,11 @@ import { privacyRoutes } from "./routes/privacy";
 import { developerDashboardRoutes } from "./routes/developerDashboard";
 import { travelRuleRoutes } from "./routes/travelRule";
 import mtnCallbacksRouter from "./routes/mtnCallbacks";
+import mpesaCallbacksRouter from "./routes/mpesaCallbacks";
+import { createMpesaC2BRouter } from "./providers/mpesa/c2b";
 import orangeMadagascarCallbacksRouter from "./routes/orangeMadagascarCallbacks";
 import orangeGuineaCallbacksRouter from "./routes/orangeGuineaCallbacks";
+import { createOrangeQrRouter } from "./providers/orange/qrCode";
 import multisigCallbacksRouter from "./routes/multisigCallbacks";
 import adminWithdrawalsRouter from "./routes/adminWithdrawals";
 import { createMetricsRouter } from "./routes/metrics";
@@ -410,6 +414,7 @@ app.use(haltOnTimedout);
 app.use(apiVersionMiddleware);
 app.use(validateVersionMiddleware);
 app.use("/oauth", createOAuthRouter());
+app.use("/api/docs", docsRouter);
 app.use("/api/auth", authRoutes);
 
 app.use("/api/v1/transactions", transactionRoutesV1);
@@ -444,8 +449,11 @@ app.use("/api/disputes", disputeRoutes);
 app.use("/api/stats", statsRoutes);
 app.use("/api/contacts", contactsRoutes);
 app.use("/api/mtn", mtnCallbacksRouter);
+app.use("/api/mpesa", mpesaCallbacksRouter);
+app.use("/api/mpesa/c2b", createMpesaC2BRouter());
 app.use("/api/orange-madagascar", orangeMadagascarCallbacksRouter);
 app.use("/api/orange-guinea", orangeGuineaCallbacksRouter);
+app.use("/api/orange/qr", createOrangeQrRouter());
 app.use("/api/multisig", multisigCallbacksRouter);
 
 // Apply custom configurable CORS allowlist for admin routes
@@ -526,6 +534,11 @@ async function initializeRuntime(): Promise<void> {
   const { startJobs } = await import("./jobs/scheduler.js");
   startJobs();
 
+  // Start JWT key rotation worker (issue #1971): rotates the signing key
+  // on schedule and deprecates old secrets after the grace window.
+  const { startKeyRotationWorker } = await import("./workers/keyRotation.js");
+  startKeyRotationWorker();
+
   // Initialize Prometheus Horizon Scraper
   startStellarExporter();
 
@@ -604,13 +617,24 @@ async function initializeRuntime(): Promise<void> {
       startAccountingTokenRefreshWorker,
       startWebhookRetryWorker,
       startRefundWorker,
+      startReceivingAnchorWebhookWorker,
     } = await import("./queue/index.js");
     startProviderBalanceAlertWorker();
     startAccountingTokenRefreshWorker();
     startWebhookRetryWorker();
     startRefundWorker();
+    startReceivingAnchorWebhookWorker();
     await scheduleProviderBalanceAlertJob();
     console.log("Provider balance alert queue initialized");
+
+    // STK push query polling fallback (#1969): poll `stkpushquery` when the
+    // callback does not arrive within 30s. Safe to start unconditionally —
+    // it only schedules work when `onStkPushInitiated` is called.
+    const { mpesaStkQueryWorker } = await import(
+      "./workers/mpesaStkQueryWorker.js"
+    );
+    mpesaStkQueryWorker.start();
+    console.log("M-Pesa STK query worker started");
   } catch (err) {
     logger.error("Redis failed", err);
     console.warn("Distributed locks not available");

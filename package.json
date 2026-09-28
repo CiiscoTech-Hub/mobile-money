@@ -21,6 +21,7 @@
     "build": "tsc",
     "portal:dev": "cd developer-portal && npx mintlify dev",
     "check-cert": "tsx scripts/cert_check.ts",
+    "contracts:deploy": "tsx scripts/deployContracts.ts",
     "start": "node dist/src/index.js",
     "lint": "eslint src",
     "test": "NODE_OPTIONS=--experimental-vm-modules jest --coverage --forceExit --testPathIgnorePatterns=tests/pact",

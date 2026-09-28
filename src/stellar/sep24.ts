@@ -9,6 +9,7 @@ import {
   STELLAR_NETWORKS,
 } from "../config/stellar";
 import { ERROR_CODES } from "../constants/errorCodes";
+import { TransactionModel } from "../models/transaction";
 import { createError } from "../middleware/errorHandler";
 import { enqueueSepWebhook } from "../services/stellar/webhooks";
 import {
@@ -25,6 +26,11 @@ import {
   PostgresSep24TransactionStore,
   Sep24TransactionStore,
 } from "./sep24Store";
+import { renderSep24InteractivePage } from "../services/sep24InteractivePage";
+import {
+  OrangeQrCodeGenerator,
+  renderOrangeMoneyQrSection,
+} from "../providers/orange/qrCode";
 
 function isValidStellarPublicKey(key: string): boolean {
   try {
@@ -302,6 +308,9 @@ export const generateInteractiveUrl = async (
     account: request.account,
     lang: request.lang || "en",
   });
+
+  if ((request as any).token) params.append("token", (request as any).token);
+  if ((request as any).session_token) params.append("session_token", (request as any).session_token);
 
   if (request.memo) params.append("memo", request.memo);
   if (transaction.memo_type) params.append("memo_type", transaction.memo_type);
@@ -699,6 +708,62 @@ const withdrawHandler = async (
 sep24Router.post("/deposit", sep24Limiter, depositHandler);
 sep24Router.post("/withdraw", sep24Limiter, withdrawHandler);
 
+/**
+ * GET /sep24/interactive/deposit
+ *
+ * Renders the SEP-24 interactive deposit page and, when Orange Money
+ * scan-to-pay parameters are supplied, embeds a base64 QR code image in the
+ * page (#1968).
+ *
+ * Query params: transaction_id, merchant_id, amount, currency, reference,
+ * merchant_name, merchant_city.
+ */
+sep24Router.get("/interactive/deposit", async (req: Request, res: Response) => {
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+
+  const merchantId = req.query.merchant_id
+    ? String(req.query.merchant_id)
+    : undefined;
+  const amount = req.query.amount ? String(req.query.amount) : undefined;
+
+  if (!merchantId || !amount) {
+    return res.send(renderSep24InteractivePage());
+  }
+
+  try {
+    const generator = new OrangeQrCodeGenerator();
+    const qr = await generator.generate({
+      merchantId,
+      amount,
+      currency: req.query.currency ? String(req.query.currency) : undefined,
+      reference: req.query.reference
+        ? String(req.query.reference)
+        : req.query.transaction_id
+          ? String(req.query.transaction_id)
+          : undefined,
+      merchantName: req.query.merchant_name
+        ? String(req.query.merchant_name)
+        : undefined,
+      merchantCity: req.query.merchant_city
+        ? String(req.query.merchant_city)
+        : undefined,
+    });
+
+    return res.send(
+      renderSep24InteractivePage({
+        qrSectionHtml: renderOrangeMoneyQrSection(qr),
+      }),
+    );
+  } catch (error: any) {
+    logger.warn(
+      { error: error.message },
+      "[SEP-24] Failed to render Orange Money QR section",
+    );
+    // Never fail the interactive page because of a provider-specific embed.
+    return res.send(renderSep24InteractivePage());
+  }
+});
+
 // Canonical SEP-24 paths.
 sep24Router.post(
   "/transactions/deposit/interactive",
@@ -711,14 +776,83 @@ sep24Router.post(
   withdrawHandler,
 );
 
-sep24Router.get("/transaction/:id", async (req: Request, res: Response) => {
-  const transaction = getTransaction(req.params.id);
+const transactionModel = new TransactionModel();
+
+sep24Router.get("/transaction", async (req: Request, res: Response) => {
+  const { id, stellar_transaction_id, external_transaction_id } = req.query;
+  const txId = (id || stellar_transaction_id || external_transaction_id) as string;
+
+  if (!txId) {
+    throw createError(ERROR_CODES.INVALID_INPUT, "Missing id", {
+      error: "Missing id",
+    });
+  }
+
+  let transaction = getTransaction(txId);
+
+  if (!transaction) {
+    try {
+      const dbTx = await transactionModel.findById(txId);
+      if (dbTx) {
+        let status: string = "pending_external";
+        if (dbTx.status === "completed") status = "completed";
+        if (["failed", "cancelled", "reversed", "clawed_back"].includes(dbTx.status)) status = "failed";
+        
+        transaction = {
+          id: dbTx.id,
+          kind: dbTx.type === "withdraw" ? "withdrawal" : "deposit",
+          status: status as any,
+          amount_in: dbTx.amount,
+          amount_out: dbTx.amount,
+          created_at: dbTx.createdAt.toISOString(),
+          completed_at: dbTx.status === "completed" && dbTx.updatedAt ? dbTx.updatedAt.toISOString() : undefined,
+          message: dbTx.notes || "Detailed status message",
+          more_info_url: `${getSep24Config().webAuthDomain}/tx/${dbTx.id}`,
+        };
+      }
+    } catch (err) {
+      // ignore invalid uuid
+    }
+  }
+
   if (!transaction) {
     throw createError(ERROR_CODES.NOT_FOUND, "Not found", {
       error: "Not found",
     });
   }
-  res.json(transaction);
+
+  const formatRFC3339 = (dateStr?: string) => {
+    if (!dateStr) return undefined;
+    const d = new Date(dateStr);
+    return Number.isNaN(d.getTime()) ? undefined : d.toISOString();
+  };
+
+  const response = {
+    transaction: {
+      id: transaction.id,
+      kind: transaction.kind,
+      status: transaction.status,
+      amount_in: transaction.amount_in,
+      amount_out: transaction.amount_out,
+      amount_fee: transaction.amount_fee,
+      started_at: formatRFC3339(transaction.created_at),
+      completed_at: formatRFC3339(transaction.completed_at),
+      more_info_url: transaction.more_info_url || `${getSep24Config().webAuthDomain}/tx/${transaction.id}`,
+      message: transaction.message || "Detailed status message",
+    }
+  };
+
+  res.json(response);
+});
+
+sep24Router.get("/interactive/callback", async (req: Request, res: Response, next: NextFunction) => {
+  const { sep24RouteHandler } = await import("../routes/sep24");
+  return sep24RouteHandler(req, res, next);
+});
+
+sep24Router.get("/callback/popup", async (req: Request, res: Response, next: NextFunction) => {
+  const { sep24RouteHandler } = await import("../routes/sep24");
+  return sep24RouteHandler(req, res, next);
 });
 
 sep24Router.put("/transaction/:id", async (req: Request, res: Response) => {

@@ -28,6 +28,7 @@ import { createExportRoutes } from "./export";
 import { ERROR_CODES } from "../constants/errorCodes";
 import { createError } from "../middleware/errorHandler";
 import { complianceMiddlewares } from "../middleware/compliance";
+import { strictIdempotency } from "../middleware/idempotency";
 
 export const transactionRoutes = Router();
 transactionRoutes.use(createExportRoutes());
@@ -237,6 +238,7 @@ transactionRoutes.patch(
 transactionRoutes.post(
   "/deposit",
   authenticateToken,
+  strictIdempotency,
   TimeoutPresets.long,
   haltOnTimedout,
   normalizeProvider,
@@ -248,6 +250,7 @@ transactionRoutes.post(
 transactionRoutes.post(
   "/withdraw",
   authenticateToken,
+  strictIdempotency,
   TimeoutPresets.long,
   haltOnTimedout,
   normalizeProvider,
