@@ -200,7 +200,8 @@ describe("SEP-31 Cross-Border Payments API", () => {
         .send({ asset_code: "XLM", sender_id: "s", receiver_id: "r" });
 
       expect(res.status).toBe(400);
-      expect(res.body.error).toBe("invalid_request");
+      expect(res.body.error).toBe("Validation error");
+      expect(res.body.details[0].message).toContain("Amount is required");
     });
 
     it("should return 400 for missing asset_code", async () => {
@@ -209,6 +210,8 @@ describe("SEP-31 Cross-Border Payments API", () => {
         .send({ amount: "100", sender_id: "s", receiver_id: "r" });
 
       expect(res.status).toBe(400);
+      expect(res.body.error).toBe("Validation error");
+      expect(res.body.details[0].message).toContain("Asset code is required");
     });
 
     it("should return 400 for missing sender_id and receiver_id", async () => {
@@ -217,7 +220,7 @@ describe("SEP-31 Cross-Border Payments API", () => {
         .send({ amount: "100", asset_code: "XLM" });
 
       expect(res.status).toBe(400);
-      expect(res.body.message).toContain("sender_id");
+      expect(res.body.error).toBe("Validation error");
     });
 
     it("should return 400 for negative amount", async () => {
@@ -254,6 +257,24 @@ describe("SEP-31 Cross-Border Payments API", () => {
 
       expect(res.status).toBe(400);
       expect(res.body.message).toContain("not supported");
+    });
+
+    it("should return 400 for invalid MSISDN format", async () => {
+      const res = await request(app)
+        .post("/sep31/transactions")
+        .send({
+          ...validPayload,
+          fields: {
+            ...validPayload.fields,
+            sender: {
+              mobile_number: "08012345678", // Missing country code
+            },
+          },
+        });
+
+      expect(res.status).toBe(400);
+      expect(res.body.error).toBe("Validation error");
+      expect(res.body.details[0].message).toContain("Invalid MSISDN");
     });
 
     it("should return 500 on database error", async () => {

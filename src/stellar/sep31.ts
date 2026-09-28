@@ -6,9 +6,12 @@ import { getConfiguredPaymentAsset } from "../services/stellar/assetService";
 import  rateLimit from "express-rate-limit";
 import { ERROR_CODES } from "../constants/errorCodes";
 import { createError } from "../middleware/errorHandler";
+import { validateRequest } from "../middleware/validation";
+import { createSep31TransactionSchema } from "../schemas/sep31";
 
 const router = Router();
 const transactionModel = new TransactionModel();
+
 
 // --- SEP-31 Status State Machine ---
 // Valid statuses per SEP-31 spec
@@ -180,7 +183,7 @@ router.get("/info", sep31ReadLimiter, async (req: Request, res: Response) => {
  * Validates amount, asset, sender/receiver fields, and returns
  * the Stellar account + memo for the sender to make payment.
  */
-router.post("/transactions", sep31WriteLimiter, async (req: Request, res: Response) => {
+router.post("/transactions", sep31WriteLimiter, validateRequest(createSep31TransactionSchema), async (req: Request, res: Response) => {
   const {
     amount,
     asset_code,
