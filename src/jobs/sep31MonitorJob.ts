@@ -8,6 +8,7 @@ import {
 } from "../stellar/sep31";
 import { getStellarServer } from "../config/stellar";
 import * as StellarSdk from "@stellar/stellar-sdk";
+import { notifyReceivingAnchorStatus } from "../services/webhookService";
 
 /**
  * SEP-31 Transaction Monitor Job
@@ -21,7 +22,7 @@ export async function runSep31MonitorJob(): Promise<void> {
   try {
     // Find all pending SEP-31 transactions
     const result = await pool.query(`
-      SELECT id, metadata, stellar_address, amount, status
+      SELECT id, metadata, stellar_address, amount, status, created_at
       FROM transactions
       WHERE status IN ('pending', 'processing')
         AND provider = 'stellar-sep31'
@@ -75,6 +76,7 @@ export async function runSep31MonitorJob(): Promise<void> {
           const newStatus = Sep31Status.Completed;
           if (isValidTransition(currentStatus, newStatus)) {
             await updateSep31Status(row.id, newStatus, metadata);
+            await notifyReceivingAnchorStatus(row, newStatus, metadata);
             console.log(
               `[sep31-monitor] Transaction ${row.id} completed, status: ${newStatus}`,
             );

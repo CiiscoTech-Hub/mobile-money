@@ -214,3 +214,30 @@ export const SEP24_INTERACTIVE_HTML = `<!DOCTYPE html>
     </script>
 </body>
 </html>`;
+
+export interface Sep24InteractivePageOptions {
+  /**
+   * Pre-rendered HTML injected before `</body>`. Used to embed the Orange
+   * Money scan-to-pay QR card on the deposit interactive page (#1968).
+   */
+  qrSectionHtml?: string;
+  /** Any additional pre-rendered sections to inject. */
+  extraSectionsHtml?: string;
+}
+
+/**
+ * Render the SEP-24 interactive page, optionally injecting extra sections
+ * (for example a provider QR card). Falls back to the exact
+ * {@link SEP24_INTERACTIVE_HTML} when nothing is injected so existing
+ * consumers are unaffected.
+ */
+export function renderSep24InteractivePage(
+  options: Sep24InteractivePageOptions = {},
+): string {
+  const injection = [options.extraSectionsHtml, options.qrSectionHtml]
+    .filter(Boolean)
+    .join("\n");
+
+  if (!injection) return SEP24_INTERACTIVE_HTML;
+  return SEP24_INTERACTIVE_HTML.replace("</body>", `${injection}\n</body>`);
+}

@@ -67,6 +67,18 @@ export interface MpesaStkCallbackBody {
   };
 }
 
+/** Normalized response from Safaricom's `stkpushquery` (Lipa Na M-Pesa Query) endpoint. */
+export interface MpesaStkQueryResult {
+  success: boolean;
+  resultCode?: number;
+  resultDesc?: string;
+  merchantRequestId?: string;
+  checkoutRequestId?: string;
+  responseCode?: string;
+  responseDescription?: string;
+  error?: unknown;
+}
+
 export interface MpesaCallbackResult {
   success: boolean;
   merchantRequestId: string;
@@ -315,10 +327,16 @@ export class MpesaProvider extends BaseProvider {
     }
   }
 
-  /** Query the status of a transaction by its checkout request ID. */
-  async getTransactionStatus(
-    checkoutRequestId: string,
-  ): Promise<{ status: MpesaTransactionStatus }> {
+  /**
+   * Query the Lipa Na M-Pesa Online (`stkpushquery`) endpoint for a checkout
+   * request that has not yet received a callback.
+   *
+   * Safaricom returns the raw `ResultCode` / `ResultDesc` pair (for example
+   * `1032` = cancelled by user, `1037` = handset/DS timeout). Unlike
+   * {@link getTransactionStatus} this preserves the code so the caller can map
+   * it to a precise transaction state — see `mpesaStkQuery.ts` (#1969).
+   */
+  async queryStkPush(checkoutRequestId: string): Promise<MpesaStkQueryResult> {
     try {
       const token = await this.getAccessToken();
       const timestamp = buildTimestamp();
@@ -344,13 +362,36 @@ export class MpesaProvider extends BaseProvider {
         },
       );
 
-      const resultCode = Number(response.data?.ResultCode);
-      if (resultCode === 0) return { status: "completed" };
-      if (Number.isNaN(resultCode)) return { status: "pending" };
-      return { status: "failed" };
-    } catch {
-      return { status: "unknown" };
+      const rawCode = response.data?.ResultCode;
+      const resultCode = Number(rawCode);
+      const resolvedCode = rawCode === undefined || rawCode === null || Number.isNaN(resultCode)
+        ? undefined
+        : resultCode;
+
+      return {
+        success: true,
+        resultCode: resolvedCode,
+        resultDesc: response.data?.ResultDesc,
+        merchantRequestId: response.data?.MerchantRequestID,
+        checkoutRequestId: response.data?.CheckoutRequestID,
+        responseCode: response.data?.ResponseCode,
+        responseDescription: response.data?.ResponseDescription,
+      };
+    } catch (error) {
+      return { success: false, error };
     }
+  }
+
+  /** Query the status of a transaction by its checkout request ID. */
+  async getTransactionStatus(
+    checkoutRequestId: string,
+  ): Promise<{ status: MpesaTransactionStatus }> {
+    const query = await this.queryStkPush(checkoutRequestId);
+    if (!query.success) return { status: "unknown" };
+    if (query.resultCode === undefined) return { status: "pending" };
+    return {
+      status: query.resultCode === 0 ? "completed" : "failed",
+    };
   }
 
   /**

@@ -22,6 +22,11 @@ import {
   closeWebhookRetryWorker,
 } from "./webhookRetryWorker";
 import { closeRefundWorker, refundQueue, refundWorker } from "./refundWorker";
+import {
+  closeReceivingAnchorWebhookWorker,
+  startReceivingAnchorWebhookWorker,
+} from "./receivingAnchorWebhookWorker";
+import { closeReceivingAnchorWebhookQueue } from "../services/webhookService";
 
 export async function shutdownQueue(): Promise<void> {
   await Promise.all([
@@ -32,6 +37,8 @@ export async function shutdownQueue(): Promise<void> {
     syncQueue.close().catch(() => undefined),
     closeWebhookRetryWorker().catch(() => undefined),
     closeRefundWorker().catch(() => undefined),
+    closeReceivingAnchorWebhookWorker().catch(() => undefined),
+    closeReceivingAnchorWebhookQueue().catch(() => undefined),
   ]);
 }
 
@@ -116,6 +123,10 @@ export {
 } from "./accountMergeWorker";
 
 export { startAccountingTokenRefreshWorker, closeAccountingTokenRefreshWorker };
+export {
+  startReceivingAnchorWebhookWorker,
+  closeReceivingAnchorWebhookWorker,
+} from "./receivingAnchorWebhookWorker";
 
 export {
   startWebhookRetryWorker,
