@@ -790,6 +790,35 @@ export class TransactionModel {
   }
 
   /**
+   * Looks up a transaction by the provider's own reference (e.g. an M-Pesa
+   * B2C `ConversationID`/`OriginatorConversationID`, stored on initiation as
+   * `providerReference`). Used by provider result-webhook routes that only
+   * receive the provider's identifiers, not our internal transaction id.
+   */
+  async findByProviderReference(
+    providerReference: string,
+  ): Promise<Transaction | null> {
+    if (
+      !providerReference ||
+      typeof providerReference !== "string" ||
+      !providerReference.trim()
+    ) {
+      return null;
+    }
+
+    const trimmed = providerReference.trim();
+    const result = await queryRead<TransactionRow>(
+      `SELECT ${TRANSACTION_SELECT_COLUMNS}
+       FROM transactions
+       WHERE provider_reference = $1
+       LIMIT 1`,
+      [trimmed],
+    );
+
+    return mapTransactionRow(result.rows[0]);
+  }
+
+  /**
    * Fast index check for transaction reference existence
    */
   async checkReferenceExists(referenceNumber: string): Promise<boolean> {
