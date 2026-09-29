@@ -25,7 +25,7 @@ router.post("/checkout/sessions", (req: Request, res: Response) => {
     const delay = typeof trigger_delay_ms === "number" ? trigger_delay_ms : 100;
 
     // Dispatch webhook asynchronously
-    simulator.dispatchWebhook(clientReference, status, String(amount), currency, delay).catch((err) => {
+    simulator.dispatchWebhook(client_reference, status, String(amount), currency, delay).catch((err) => {
       logger.error({ error: err }, "[MockWaveRoute] Failed to dispatch webhook in background");
     });
 
