@@ -116,6 +116,15 @@ const JOBS: JobConfig[] = [
     handler: runProviderHealthCheckJob,
   },
   {
+    name: "airtel-balance-monitor",
+    // Every 15 minutes - checks Airtel operational balance and alerts
+    schedule: process.env.AIRTEL_BALANCE_MONITOR_CRON || "*/15 * * * *",
+    handler: async () => {
+      const { checkAirtelBalanceAndAlert } = await import("./balanceMonitorJob.js");
+      return checkAirtelBalanceAndAlert();
+    },
+  },
+  {
     name: "daily-settlement",
     // Daily at 01:00 AM UTC — sweeps merchant fees and settles provider balances
     schedule: process.env.DAILY_SETTLEMENT_CRON || "0 1 * * *",
