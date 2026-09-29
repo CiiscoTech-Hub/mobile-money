@@ -461,6 +461,12 @@ app.use("/api/developer", developerDashboardRoutes);
 app.use("/api/admin", requireAuth, adminRoutes);
 app.use("/api/admin/providers/status", requireAuth, providerStatusRouter);
 app.use("/api/admin/kyc-upgrades", requireAuth, kycTierUpgradeRoutes);
+
+if (process.env.NODE_ENV === "development" || process.env.NODE_ENV === "test") {
+  // Use require so that we don't load mock dependencies in production
+  const mockWaveRouter = require("./routes/mockWave").default;
+  app.use("/mock/wave", mockWaveRouter);
+}
 app.use("/api/admin/auth", createAdminSep10Router());
 app.use("/sep10", createSep10Router());
 app.use("/sep8", createSep8Router(pool));
