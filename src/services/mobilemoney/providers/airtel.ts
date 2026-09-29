@@ -33,6 +33,7 @@ interface AirtelTokenResponse {
 import logger from "../../../utils/logger";
 import { maskPII } from "../../../utils/masking";
 import { formatPhoneForProvider } from "../../../utils/phoneUtils";
+import { attachCorrelationIdInterceptor } from "../../../utils/correlationIdInterceptor";
 
 // ============================================================================
 // TYPES & INTERFACES
@@ -236,31 +237,43 @@ export class AirtelService {
 
     this.mode = this.resolveMode();
 
-    this.client =
-      opts.httpClient ??
-      axios.create({
+    if (opts.httpClient) {
+      this.client = opts.httpClient;
+    } else {
+      const client = axios.create({
         baseURL: this.config.webBaseUrl,
         timeout: this.config.requestTimeoutMs,
         maxRedirects: 0,
         validateStatus: () => true,
       });
+      attachCorrelationIdInterceptor(client);
+      this.client = client;
+    }
 
-    this.directClient =
-      opts.directHttpClient ??
-      axios.create({
+    if (opts.directHttpClient) {
+      this.directClient = opts.directHttpClient;
+    } else {
+      const directClient = axios.create({
         baseURL: this.config.directBaseUrl,
         timeout: this.config.requestTimeoutMs,
         validateStatus: () => true,
       });
+      attachCorrelationIdInterceptor(directClient);
+      this.directClient = directClient;
+    }
 
     if (this.config.proxyBaseUrl || opts.proxyHttpClient) {
-      this.proxyClient =
-        opts.proxyHttpClient ??
-        axios.create({
+      if (opts.proxyHttpClient) {
+        this.proxyClient = opts.proxyHttpClient;
+      } else {
+        const proxyClient = axios.create({
           baseURL: this.config.proxyBaseUrl,
           timeout: this.config.requestTimeoutMs,
           validateStatus: () => true,
         });
+        attachCorrelationIdInterceptor(proxyClient);
+        this.proxyClient = proxyClient;
+      }
     }
 
     logger.info(

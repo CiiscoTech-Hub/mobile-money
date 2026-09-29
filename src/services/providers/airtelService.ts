@@ -5,6 +5,7 @@ import logger from "../../utils/logger";
 import CircuitBreaker from "opossum";
 import fs from "fs";
 import path from "path";
+import { sendAlert } from "../alertService";
 
 interface AirtelTokenResponse {
   access_token: string;
@@ -157,7 +158,16 @@ export class AirtelService extends BaseProvider {
 
     this.breaker = new CircuitBreaker(async (fn: () => Promise<any>) => fn(), breakerOptions);
 
-    this.breaker.on("open", () => logAuditStatusChange("open", { volumeThreshold: 10, errorThresholdPercentage: 50 }));
+    this.breaker.on("open", () => {
+      logAuditStatusChange("open", { volumeThreshold: 10, errorThresholdPercentage: 50 });
+      void sendAlert({
+        provider: "airtel",
+        error: "Circuit breaker OPEN: error rate exceeded 50% threshold over the last 10 requests",
+        severity: "critical",
+      }).catch((err) =>
+        logger.error({ error: err }, "Failed to dispatch circuit breaker open alert"),
+      );
+    });
     this.breaker.on("halfOpen", () => logAuditStatusChange("half_open", {}));
     this.breaker.on("close", () => logAuditStatusChange("closed", {}));
     this.breaker.fallback(() => {
