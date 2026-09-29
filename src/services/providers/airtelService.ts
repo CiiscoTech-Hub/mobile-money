@@ -335,4 +335,37 @@ export class AirtelService extends BaseProvider {
       return { status: "unknown" };
     }
   }
+
+  async getBalance(): Promise<{ success: boolean; data?: any; error?: string }> {
+    const endpoint = `/standard/v1/users/balance`;
+    try {
+      const token = await this.getAccessToken();
+      const response = await this.executeWithBreaker(async () =>
+        axios.get(
+          `${this.baseUrl}${endpoint}`,
+          {
+            headers: {
+              Authorization: this.buildBearerAuthHeader(token),
+              "X-Country": this.country,
+              "X-Currency": this.currency,
+              "Content-Type": "application/json",
+            },
+            timeout: this.timeoutMs,
+          }
+        )
+      );
+
+      if ((response as any).fallbackRouted) {
+        return { success: false, error: "Circuit breaker open" };
+      }
+
+      return {
+        success: true,
+        data: response.data,
+      };
+    } catch (error) {
+      logger.error({ error: error instanceof Error ? error.message : error }, "Airtel getBalance failed");
+      return { success: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  }
 }
