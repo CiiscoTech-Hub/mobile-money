@@ -27,7 +27,6 @@ jobs:
 
       - name: Run npm audit for high & critical vulnerabilities
         run: npm run audit:high
-        continue-on-error: true
 
       - name: Run Snyk Security Scan
         if: env.SNYK_TOKEN != ''
@@ -83,18 +82,41 @@ jobs:
   trivy-fs-scan:
     name: Trivy Filesystem & Config Scan
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Run Trivy vulnerability scanner in repo mode
+      - name: Run Trivy vulnerability scanner in repo mode (human-readable)
         uses: aquasecurity/trivy-action@master
-        continue-on-error: true
         with:
           scan-type: "fs"
           ignore-unfixed: true
+          trivyignores: ".trivyignore"
           format: "table"
           severity: "CRITICAL,HIGH"
+          exit-code: "1"
+
+      - name: Run Trivy vulnerability scanner in repo mode (SARIF for Security tab)
+        if: always()
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: "fs"
+          ignore-unfixed: true
+          trivyignores: ".trivyignore"
+          format: "sarif"
+          output: "trivy-fs-results.sarif"
+          severity: "CRITICAL,HIGH"
+          exit-code: "0"
+
+      - name: Upload Trivy SARIF report to the Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: "trivy-fs-results.sarif"
+          category: "trivy-fs"
 
   security-pipeline-tests:
     name: Security Pipeline Validation Tests

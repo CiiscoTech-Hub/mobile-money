@@ -9,7 +9,11 @@ import DailyRotateFile from "winston-daily-rotate-file";
 import { REDACT_KEYS } from "./redact";
 import { AsyncLocalStorage } from "async_hooks";
 
-export const requestContext = new AsyncLocalStorage<{ trace_id: string }>();
+export const requestContext = new AsyncLocalStorage<{
+  trace_id: string;
+  /** X-Correlation-ID propagated across services for a single logical request (#1996). */
+  correlation_id?: string;
+}>();
 
 /**
  * Centralized Winston Structured Logger
@@ -352,6 +356,9 @@ function enrichInfo(): winston.Logform.Format {
     const store = requestContext.getStore();
     if (store?.trace_id) {
       info.trace_id = store.trace_id;
+    }
+    if (store?.correlation_id) {
+      info.correlation_id = store.correlation_id;
     }
     info.service = SERVICE_NAME;
     info.instance_id = INSTANCE_ID;

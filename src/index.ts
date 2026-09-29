@@ -68,6 +68,7 @@ import {
 import { requireAuth } from "./middleware/auth";
 import { responseTime } from "./middleware/responseTime";
 import { requestId } from "./middleware/requestId";
+import { correlationIdMiddleware } from "./middleware/correlationId";
 import { readReplicaRoutingMiddleware } from "./middleware/readReplicaRouting";
 import { dbConnectionLeakDetector } from "./middleware/dbConnectionLeakDetector";
 import { i18nMiddleware } from "./utils/i18n";
@@ -211,6 +212,7 @@ app.use(
 // app.use(rateLimitMiddleware);
 app.use(responseTime);
 app.use(requestId);
+app.use(correlationIdMiddleware);
 app.use(readReplicaRoutingMiddleware);
 app.use(i18nMiddleware);
 // Block requests from blacklisted IPs as early as possible — before any
