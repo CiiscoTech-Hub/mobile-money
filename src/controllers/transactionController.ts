@@ -41,6 +41,7 @@ import { travelRuleService } from "../compliance/travelRule";
 import { createError } from "../middleware/errorHandler";
 import { sep08Service } from "../services/compliance/sep08";
 import { validateMemo } from "../utils/stellarValidators";
+import { validateWebhookUrl } from "../security/ssrf";
 
 const IDEMPOTENCY_TTL_HOURS = Number(
   process.env.IDEMPOTENCY_KEY_TTL_HOURS || 24,
@@ -991,6 +992,7 @@ export const cancelTransactionHandler = async (req: Request, res: Response) => {
 
     if (process.env.WEBHOOK_URL) {
       try {
+        await validateWebhookUrl(process.env.WEBHOOK_URL);
         await fetch(process.env.WEBHOOK_URL, {
           method: "POST",
           headers: { "Content-Type": "application/json" },

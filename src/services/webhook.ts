@@ -8,6 +8,7 @@ import { promisify } from "util";
 import { Transaction, WebhookDeliveryUpdate } from "../models/transaction";
 import { enqueueWebhookRetry } from "../queue/webhookRetryQueue";
 import { signWebhookPayload } from "../crypto/webhookSigning";
+import { validateWebhookUrl } from "../security/ssrf";
 
 const gzipAsync = promisify(gzip);
 
@@ -204,6 +205,21 @@ export class WebhookService {
     return this.webhookUrl;
   }
 
+  /**
+   * Strict SSRF check on the configured destination. Returns the rejection
+   * message when the URL must not be contacted, otherwise `null`. Re-run for
+   * every delivery so a destination that changed (or was stored before this
+   * guard existed) can never reach a private address.
+   */
+  private async checkDestination(): Promise<string | null> {
+    try {
+      await validateWebhookUrl(this.webhookUrl);
+      return null;
+    } catch (err: unknown) {
+      return err instanceof Error ? err.message : String(err);
+    }
+  }
+
   getWebhookSecret(): string {
     return this.webhookSecret;
   }
@@ -295,6 +311,18 @@ export class WebhookService {
         lastAttemptAt: null,
         deliveredAt: null,
         lastError: message,
+      };
+    }
+
+    const destinationError = await this.checkDestination();
+    if (destinationError) {
+      this.logger.warn(`[webhook] ${destinationError}`);
+      return {
+        status: "skipped",
+        attempts: 0,
+        lastAttemptAt: null,
+        deliveredAt: null,
+        lastError: destinationError,
       };
     }
 
@@ -397,6 +425,18 @@ export class WebhookService {
       };
     }
 
+    const destinationError = await this.checkDestination();
+    if (destinationError) {
+      this.logger.warn(`[webhook] ${destinationError}`);
+      return {
+        status: "skipped",
+        attempts: 0,
+        lastAttemptAt: null,
+        deliveredAt: null,
+        lastError: destinationError,
+      };
+    }
+
     const payload = this.buildFlatPayload(event, transaction);
     const validation = flatWebhookPayloadSchema.safeParse(payload);
     if (!validation.success) {
@@ -491,6 +531,7 @@ export class WebhookService {
       );
 
       try {
+        await validateWebhookUrl(this.webhookUrl);
         const response = await this.fetchImpl(this.webhookUrl, {
           method: "POST",
           headers: {

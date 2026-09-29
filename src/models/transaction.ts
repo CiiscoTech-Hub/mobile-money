@@ -4,6 +4,7 @@ import { encrypt, decrypt } from "../utils/encryption";
 import { WebSocketManager } from "../websocket";
 import { getRedisPubSub } from "../graphql/redisPubSub";
 import { CachedTransactionInvalidation } from "../services/cachedTransactionService";
+import { publishTransactionEvent } from "../services/transactionEventStream";
 import {
   SubscriptionChannels,
   transactionChannel,
@@ -303,9 +304,7 @@ export const ALLOWED_STATUS_TRANSITIONS: Record<
     TransactionStatus.Failed,
     TransactionStatus.Review,
   ],
-  [TransactionStatus.Cancelled]: [
-    TransactionStatus.Cancelled,
-  ],
+  [TransactionStatus.Cancelled]: [TransactionStatus.Cancelled],
   [TransactionStatus.Dispute]: [
     TransactionStatus.Dispute,
     TransactionStatus.Completed,
@@ -313,12 +312,8 @@ export const ALLOWED_STATUS_TRANSITIONS: Record<
     TransactionStatus.ClawedBack,
     TransactionStatus.Failed,
   ],
-  [TransactionStatus.Reversed]: [
-    TransactionStatus.Reversed,
-  ],
-  [TransactionStatus.ClawedBack]: [
-    TransactionStatus.ClawedBack,
-  ],
+  [TransactionStatus.Reversed]: [TransactionStatus.Reversed],
+  [TransactionStatus.ClawedBack]: [TransactionStatus.ClawedBack],
   [TransactionStatus.Expired]: [
     TransactionStatus.Expired,
     TransactionStatus.Failed,
@@ -422,6 +417,14 @@ export class TransactionModel {
     );
 
     const transaction = mapTransactionRow(result.rows[0]);
+
+    // Initial status event for SSE subscribers watching the transaction.
+    publishTransactionEvent({
+      transactionId: transaction.id,
+      userId: data.userId ?? undefined,
+      status: transaction.status,
+      timestamp: new Date(transaction.createdAt).getTime(),
+    });
 
     // Invalidate caches after successful transaction creation.
     if (data.userId) {
@@ -533,6 +536,16 @@ export class TransactionModel {
         );
       });
     }
+
+    // ── Publish to the SSE transaction stream ───────────────────────────
+    // Buffered in the replay ring buffer so clients reconnecting with
+    // Last-Event-ID still receive status changes made while offline.
+    publishTransactionEvent({
+      transactionId: id,
+      userId: row.user_id ?? undefined,
+      status,
+      timestamp: new Date(row.updated_at ?? Date.now()).getTime(),
+    });
 
     // ── Publish GraphQL subscription event ──────────────────────────────
     // Publish to both the per-transaction channel (targeted) and the
