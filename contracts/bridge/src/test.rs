@@ -122,7 +122,7 @@ fn test_propose_and_accept_after_delay() {
     assert_eq!(s.client.get_pending_admin(), None);
 
     // The new admin now authorises admin-only calls.
-    s.client.set_fee_bps(&50);
+    s.client.propose_fee_bps(&50);
     assert_eq!(last_auth_address(&s.env), new_admin);
 }
 

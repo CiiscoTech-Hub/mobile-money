@@ -140,49 +140,66 @@ router.get("/info", (_req: Request, res: Response) => {
   }
 });
 
+/**
+ * GET /prices — FX discovery.
+ *
+ * Given a sell_asset and sell_amount, returns the indicative price for every
+ * supported buy_asset (Stellar assets XLM/USDC/EURC and mobile-money fiat
+ * corridors KES, NGN, GHS, XOF, XAF, ...). Optionally narrow the result to a
+ * single buy_asset. This is distinct from GET /price, which returns a firm
+ * amount breakdown for one specific sell/buy pair.
+ */
 router.get("/prices", async (req: Request, res: Response) => {
   try {
-    const { sell_asset, buy_asset } = req.query;
+    const { sell_asset, sell_amount, buy_asset } = req.query;
 
-    if (!sell_asset || !buy_asset) {
-      res.status(400).json({
-        error: "Missing required parameters: sell_asset and buy_asset",
-      });
+    if (!sell_asset) {
+      res.status(400).json({ error: "Missing required parameter: sell_asset" });
       return;
     }
 
     const sellAsset = sell_asset as string;
-    const buyAsset = buy_asset as string;
 
-    if (!isValidAsset(sellAsset) || !isValidAsset(buyAsset)) {
+    if (!isValidAsset(sellAsset)) {
       res.status(400).json({
         error:
-          "Invalid asset format. Assets must be in format 'stellar:*' or 'iso4217:*'",
+          "Invalid asset format for sell_asset. Assets must be in format 'stellar:*' or 'iso4217:*'",
       });
       return;
     }
 
-    if (!findSupportedPair(sellAsset, buyAsset)) {
-      res.status(400).json({ error: "Unsupported asset pair" });
+    if (!sell_amount) {
+      res.status(400).json({ error: "Missing required parameter: sell_amount" });
       return;
     }
 
-    const result = await rateProvider.getIndicativePrice(sellAsset, buyAsset);
+    const sellAmount = sell_amount as string;
 
-    if (!result) {
-      res
-        .status(503)
-        .json({ error: "Insufficient liquidity for the requested asset pair" });
+    if (!isValidPositiveNumber(sellAmount)) {
+      res.status(400).json({ error: "sell_amount must be a positive number" });
       return;
     }
 
-    res.json({
-      sell_asset: sellAsset,
-      buy_asset: buyAsset,
-      price: result.price,
-      fee_percent: result.fee_percent,
-      fee_fixed: result.fee_fixed,
-    });
+    let buyAssetsFilter: string[] | undefined;
+    if (buy_asset) {
+      const buyAsset = buy_asset as string;
+      if (!isValidAsset(buyAsset)) {
+        res.status(400).json({
+          error:
+            "Invalid asset format for buy_asset. Assets must be in format 'stellar:*' or 'iso4217:*'",
+        });
+        return;
+      }
+      buyAssetsFilter = [buyAsset];
+    }
+
+    const buyAssets = await sep38Service.getPrices(
+      sellAsset,
+      sellAmount,
+      buyAssetsFilter,
+    );
+
+    res.json({ buy_assets: buyAssets });
   } catch (err) {
     logger.error({ err }, "GET /sep38/prices failed");
     res.status(500).json({ error: "Internal server error" });

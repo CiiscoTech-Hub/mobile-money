@@ -58,11 +58,47 @@ export const Sep38InfoResponseSchema = registry.register(
 
 // ─── Prices / Price ───────────────────────────────────────────────────────────
 
-/** Query parameters shared by GET /prices and GET /price */
+/** Query parameters for GET /price (single explicit pair) */
 export const Sep38PriceQuerySchema = z.object({
   sell_asset: Sep38AssetSchema,
   buy_asset: Sep38AssetSchema,
 });
+
+/** Query parameters for GET /prices (FX discovery across buy assets) */
+export const Sep38PricesQuerySchema = z.object({
+  sell_asset: Sep38AssetSchema,
+  sell_amount: AmountStringSchema,
+  buy_asset: Sep38AssetSchema.optional().openapi({
+    description:
+      "Optional — narrow the discovery result to a single buy_asset.",
+  }),
+});
+
+export const Sep38PriceItemSchema = z
+  .object({
+    asset: Sep38AssetSchema,
+    price: z.string().openapi({
+      example: "129.5000000",
+      description: "Units of this asset per 1 unit of sell_asset.",
+    }),
+    decimals: z.number().int().openapi({ example: 7 }),
+  })
+  .openapi("Sep38PriceItem");
+
+export const Sep38PricesResponseSchema = registry.register(
+  "Sep38PricesResponse",
+  z
+    .object({
+      buy_assets: z.array(Sep38PriceItemSchema).openapi({
+        description:
+          "Indicative price for sell_asset against every supported buy_asset " +
+          "(or just the requested one, if buy_asset was provided).",
+      }),
+    })
+    .openapi("Sep38PricesResponse", {
+      description: "Indicative FX discovery prices for a sell_asset.",
+    }),
+);
 
 export const Sep38PriceResponseSchema = registry.register(
   "Sep38PriceResponse",

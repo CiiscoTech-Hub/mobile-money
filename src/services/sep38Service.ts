@@ -383,6 +383,7 @@ export class Sep38Service {
       "iso4217:XOF",
       "iso4217:KES",
       "iso4217:NGN",
+      "iso4217:GHS",
       "iso4217:USD",
       "stellar:native",
     ];
