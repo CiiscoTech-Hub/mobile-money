@@ -253,13 +253,13 @@ export async function runBalanceMonitorJob(): Promise<void> {
 export async function checkAirtelBalanceAndAlert(): Promise<void> {
   const airtel = new AirtelService();
   try {
-    const result = await airtel.getBalance();
+    const result = await airtel.getOperationalBalance();
     if (!result.success || !result.data) {
       logger.error("[airtel-balance-monitor] Failed to fetch Airtel balance", result.error);
       return;
     }
 
-    const rawBalance = result.data.availableBalance ?? result.data.balance ?? 0;
+    const rawBalance = result.data.availableBalance ?? 0;
     const balance = typeof rawBalance === "number" ? rawBalance : parseFloat(String(rawBalance));
     
     // Configurable threshold, defaulting to 50000

@@ -191,6 +191,10 @@ export const env = cleanEnv(process.env, {
     default: 1,
     desc: "Provider balance alert worker concurrency limit (default 1 – sequential to prevent duplicate alerts)",
   }),
+  MINIMUM_FLOAT_BALANCE: num({
+    default: 500,
+    desc: "Minimum float balance threshold in smallest currency unit (e.g. XAF kobo). Payouts will be held if balance falls below this amount",
+  }),
 });
 
 // Re-export specific values for convenience
@@ -226,4 +230,5 @@ export const {
   ACCOUNTING_RETRY_WORKER_CONCURRENCY,
   ACCOUNTING_TOKEN_REFRESH_WORKER_CONCURRENCY,
   PROVIDER_BALANCE_ALERT_WORKER_CONCURRENCY,
+  MINIMUM_FLOAT_BALANCE,
 } = env;
