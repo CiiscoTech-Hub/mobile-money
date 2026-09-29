@@ -23,6 +23,7 @@ import {
   UpdateWebhookInput,
 } from "../models/merchantWebhook";
 import { MerchantWebhookService } from "../services/merchantWebhookService";
+import { validateWebhookUrl, SsrfBlockedError } from "../security/ssrf";
 
 const router = Router();
 const webhookModel = new MerchantWebhookModel();
@@ -38,6 +39,20 @@ function getUserId(req: Request): string | null {
 }
 
 const URL_REGEX = /^https?:\/\/.+/i;
+
+/**
+ * Runs the strict SSRF guard over a merchant-supplied destination. Returns
+ * the rejection message, or `null` when the URL is safe to call out to.
+ */
+async function checkUrlSafety(url: string): Promise<string | null> {
+  try {
+    await validateWebhookUrl(url);
+    return null;
+  } catch (err) {
+    if (err instanceof SsrfBlockedError) return err.message;
+    throw err;
+  }
+}
 
 function validateCreateBody(
   body: unknown,
@@ -105,6 +120,9 @@ router.post("/", async (req: Request, res: Response) => {
   if (validation.error)
     return res.status(400).json({ error: validation.error });
 
+  const urlError = await checkUrlSafety(validation.data.url);
+  if (urlError) return res.status(400).json({ error: urlError });
+
   try {
     const webhook = await webhookModel.create({ ...validation.data!, userId });
     const { secret: _s, ...safe } = webhook;
@@ -149,6 +167,8 @@ router.patch("/:id", async (req: Request, res: Response) => {
         .status(400)
         .json({ error: "url must be a valid HTTP/HTTPS URL" });
     }
+    const urlError = await checkUrlSafety(b.url);
+    if (urlError) return res.status(400).json({ error: urlError });
     input.url = b.url;
   }
   if (b.secret !== undefined) {

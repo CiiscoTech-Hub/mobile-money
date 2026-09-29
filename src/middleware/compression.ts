@@ -23,6 +23,7 @@ export function shouldCompress(req: Request, res: Response): boolean {
     (contentType.includes("image/") ||
       contentType.includes("video/") ||
       contentType.includes("audio/") ||
+      contentType.includes("text/event-stream") ||
       contentType.includes("application/zip") ||
       contentType.includes("application/gzip") ||
       contentType.includes("application/x-brotli"))

@@ -7,6 +7,7 @@ import {
 import { SAMPLE_WEBHOOK_PAYLOAD } from "../routes/webhooks";
 import { WebhookCacheInvalidation } from "./cacheAside";
 import { signWebhookPayload } from "../crypto/webhookSigning";
+import { validateWebhookUrl, SsrfBlockedError } from "../security/ssrf";
 
 const model = new MerchantWebhookModel();
 
@@ -17,6 +18,8 @@ interface DeliveryResult {
   httpStatus?: number;
   responseBody?: string;
   errorMessage?: string;
+  /** Set for failures that retrying can never fix (e.g. SSRF rejections). */
+  permanent?: boolean;
   durationMs: number;
 }
 
@@ -43,6 +46,7 @@ function signPayload(payload: string, secret: string): string {
 }
 
 function isTransientFailure(result: DeliveryResult): boolean {
+  if (result.permanent) return false;
   if (result.httpStatus === undefined) return true;
   return (
     result.httpStatus === 408 ||
@@ -54,6 +58,9 @@ function isTransientFailure(result: DeliveryResult): boolean {
 /**
  * Deliver a single webhook payload to the given URL.
  * Returns a structured result regardless of success/failure.
+ * The destination is re-validated immediately before the request so a URL
+ * that was safe at registration time (or that predates this guard) can never
+ * be used to reach a private address.
  */
 async function deliver(
   url: string,
@@ -61,9 +68,17 @@ async function deliver(
   payload: Record<string, unknown>,
   fetchImpl: typeof fetch = fetch,
 ): Promise<DeliveryResult> {
+  const start = Date.now();
+  try {
+    await validateWebhookUrl(url);
+  } catch (err: unknown) {
+    const errorMessage =
+      err instanceof SsrfBlockedError ? err.message : String(err);
+    return { status: "failed", errorMessage, permanent: true, durationMs: 0 };
+  }
+
   const body = JSON.stringify(payload);
   const signature = signPayload(body, secret);
-  const start = Date.now();
 
   try {
     const controller = new AbortController();

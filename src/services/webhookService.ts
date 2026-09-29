@@ -2,6 +2,7 @@ import { createHmac } from "crypto";
 import { Queue } from "bullmq";
 import { queueOptions } from "../queue/config";
 import logger from "../utils/logger";
+import { validateWebhookUrl, SsrfBlockedError } from "../security/ssrf";
 
 /** Queue used for notifications sent to SEP-31 receiving anchors. */
 export const RECEIVING_ANCHOR_WEBHOOK_QUEUE = "receiving-anchor-webhooks";
@@ -59,6 +60,17 @@ export class WebhookDispatcherService {
       );
       return;
     }
+    try {
+      await validateWebhookUrl(callbackUrl);
+    } catch (err) {
+      logger.error(
+        { transactionId: payload.id },
+        `SEP-31 webhook skipped: ${
+          err instanceof SsrfBlockedError ? err.message : String(err)
+        }`,
+      );
+      return;
+    }
 
     await receivingAnchorWebhookQueue.add(
       "deliver",
@@ -79,6 +91,20 @@ export class WebhookDispatcherService {
 
   /** Delivers a serialized payload and returns false for retriable HTTP failures. */
   async deliver(job: ReceivingAnchorWebhookJob): Promise<void> {
+    // Re-validated at request time: the callback URL is supplied by the
+    // anchor's transaction metadata and must never reach a private address.
+    try {
+      await validateWebhookUrl(job.callbackUrl);
+    } catch (err) {
+      logger.error(
+        { transactionId: job.payload.id },
+        `Receiving-anchor webhook blocked: ${
+          err instanceof SsrfBlockedError ? err.message : String(err)
+        }`,
+      );
+      return; // permanent — retrying cannot make the destination safe
+    }
+
     const body = JSON.stringify(job.payload);
     const signature = `sha256=${createHmac("sha256", job.secret)
       .update(body)
