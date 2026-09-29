@@ -203,6 +203,15 @@ export class MTNProvider extends BaseProvider {
     }
   }
 
+  /**
+   * Query MTN MoMo disbursement float via
+   * GET /disbursement/v1_0/account/balance (#1967).
+   * Alias over getOperationalBalance for pre-flight payout checks.
+   */
+  async getAccountBalance() {
+    return this.getOperationalBalance();
+  }
+
   async requestPayment(
     phoneNumber: string,
     amount: string,

@@ -17,6 +17,8 @@ import {
   batchPayoutDurationSeconds,
   batchPayoutSize,
 } from "../utils/metrics";
+import { env } from "../config/env";
+import { sendAdminBalanceAlert } from "../services/notifications";
 
 const transactionModel = new TransactionModel();
 const mtnMomoProvider = new MtnMomoProvider();
@@ -232,6 +234,67 @@ export async function executeProviderBatchPayout(
     return { success: true, totalProcessed: 0 };
   }
 
+  if (provider === "mtn_momo" || provider === "mtn") {
+    // Pre-flight disbursement float inquiry (#1967):
+    // GET /disbursement/v1_0/account/balance before bulk payouts to avoid
+    // failure cascades when provider float is insufficient.
+    const minimumFloatBalance = env.MINIMUM_FLOAT_BALANCE;
+    const totalAmount = payouts.reduce((sum, p) => sum + Number(p.amount), 0);
+    let balance: Awaited<ReturnType<typeof mtnMomoProvider.getAccountBalance>>;
+    try {
+      balance = await mtnMomoProvider.getAccountBalance();
+    } catch (error) {
+      logger.error(
+        { error },
+        "MTN MoMo: Failed to fetch operational balance",
+      );
+      balance = { success: false, error } as typeof balance;
+    }
+    if (balance.success && balance.data) {
+      const availableBalance = Number(balance.data.availableBalance);
+      const belowMinimum = availableBalance < minimumFloatBalance;
+      const insufficientForBatch = availableBalance < totalAmount;
+      if (belowMinimum || insufficientForBatch) {
+        logger.warn(
+          {
+            availableBalance,
+            minimumFloatBalance,
+            payoutCount: payouts.length,
+            totalAmount,
+            belowMinimum,
+            insufficientForBatch,
+          },
+          "MTN MoMo: Insufficient float balance, holding payouts pending float replenishment",
+        );
+        // Alert operations/treasury team when float drops below threshold.
+        try {
+          await sendAdminBalanceAlert([
+            {
+              provider: "mtn",
+              availableBalance,
+              currency: balance.data.currency ?? "XAF",
+              threshold: minimumFloatBalance,
+            },
+          ]);
+        } catch (alertErr) {
+          logger.error(
+            { error: alertErr },
+            "MTN MoMo: Failed to send low-float ops alert",
+          );
+        }
+        await holdTransactionsInPendingFloat(payouts);
+        return { success: true, totalProcessed: 0 };
+      }
+    } else {
+      // Fail-open: proceed with batch if balance inquiry itself fails, so a
+      // monitoring outage does not block payouts. Error already logged above.
+      logger.error(
+        { error: balance.error },
+        "MTN MoMo: Failed to fetch operational balance",
+      );
+    }
+  }
+
   logger.info(
     `[PayoutBatchWorker] Processing ${payouts.length} aggregated payouts for provider ${provider}`,
   );
@@ -265,6 +328,26 @@ export async function executeProviderBatchPayout(
   await processBatchPayoutResults(result.results, payouts);
 
   return { success: result.success, totalProcessed: payouts.length };
+}
+
+export async function holdTransactionsInPendingFloat(
+  payouts: PendingPayout[],
+): Promise<void> {
+  for (const payout of payouts) {
+    await transactionModel.updateStatus(
+      payout.transactionId,
+      TransactionStatus.Pending,
+    );
+    await transactionModel.patchMetadata(payout.transactionId, {
+      floatStatus: "pending_float",
+      floatHoldReason: "insufficient_provider_float",
+      batchProcessedAt: new Date().toISOString(),
+    });
+    logger.info(
+      { transactionId: payout.transactionId, amount: payout.amount },
+      "MTN MoMo: Transaction held in pending_float state due to insufficient float",
+    );
+  }
 }
 
 let isRunning = false;

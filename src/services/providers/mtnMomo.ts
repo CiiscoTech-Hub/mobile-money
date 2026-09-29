@@ -15,6 +15,7 @@
  *   - sendPayout     (disbursement)
  *   - getTransactionStatus
  *   - getOperationalBalance
+ *   - getAccountBalance (disbursement float inquiry, alias for pre-flight checks)
  */
 
 import axios, { AxiosError } from "axios";
@@ -424,6 +425,18 @@ export class MtnMomoProvider extends BaseProvider {
 
       return { success: false, error };
     }
+  }
+
+  /**
+   * Query MTN MoMo disbursement float via
+   * GET /disbursement/v1_0/account/balance.
+   *
+   * Required by #1967: pre-flight balance inquiry before bulk payouts.
+   * Delegates to getOperationalBalance so both entry points share one
+   * implementation, response shape, and latency instrumentation.
+   */
+  async getAccountBalance() {
+    return this.getOperationalBalance();
   }
 
   /**
