@@ -6,7 +6,7 @@
  * checks, and balance queries.
  */
 import path from "path";
-import { PactV3, MatchersV3 } from "@pact-foundation/pact";
+import { PactV3, MatchersV3, Verifier } from "@pact-foundation/pact";
 import axios from "axios";
 
 const { like, regex, string } = MatchersV3;
@@ -343,3 +343,52 @@ describe("Airtel Money API Contract", () => {
     });
   });
 });
+
+import { startMockProviderServerForTests, stopMockProviderServerForTests } from "../mocks/mockProviderServer";
+
+describe("Airtel Provider Contract Verification", () => {
+  let server: any;
+  const PORT = 8082;
+
+  beforeAll(async () => {
+    server = startMockProviderServerForTests(PORT);
+  });
+
+  afterAll(async () => {
+    await stopMockProviderServerForTests();
+  });
+
+  it("validates the expectations of MobileMoneyService against the Airtel Mock Provider", async () => {
+    const opts = {
+      provider: "AirtelMoneyAPI",
+      providerBaseUrl: \http://localhost:\\,
+      pactUrls: [
+        path.resolve(__dirname, "../../pacts/MobileMoneyService-AirtelMoneyAPI.json")
+      ],
+      stateHandlers: {
+        "valid Airtel API credentials": async () => {
+          return Promise.resolve("State 'valid Airtel API credentials' setup complete");
+        },
+        "Airtel transaction is successful": async () => {
+          return Promise.resolve("State 'Airtel transaction is successful' setup complete");
+        },
+        "Airtel transaction has failed": async () => {
+          return Promise.resolve("State 'Airtel transaction has failed' setup complete");
+        },
+        "Airtel disbursement service is available": async () => {
+          return Promise.resolve("State 'Airtel disbursement service is available' setup complete");
+        },
+        "Airtel account has funds": async () => {
+          return Promise.resolve("State 'Airtel account has funds' setup complete");
+        },
+        "Airtel service is healthy": async () => {
+          return Promise.resolve("State 'Airtel service is healthy' setup complete");
+        }
+      }
+    };
+
+    const verifier = new Verifier(opts);
+    await verifier.verifyProvider();
+  }, 30000);
+});
+

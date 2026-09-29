@@ -3,8 +3,8 @@ module.exports = {
   preset: "ts-jest",
   testEnvironment: "node",
   setupFilesAfterEnv: ["<rootDir>/tests/jest.setup.ts"],
-  roots: ["<rootDir>/tests/pact"],
-  testMatch: ["**/*.pact.test.ts"],
+  roots: ["<rootDir>/tests/pact", "<rootDir>/tests/contracts"],
+  testMatch: ["**/*.pact.test.ts", "**/*.contract.test.ts"],
   transform: {
     "^.+\\.ts$": ["ts-jest", { diagnostics: false }],
   },
@@ -13,3 +13,4 @@ module.exports = {
   testTimeout: 30000,
   verbose: true,
 };
+
