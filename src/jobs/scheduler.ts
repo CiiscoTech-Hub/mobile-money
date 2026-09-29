@@ -34,6 +34,7 @@ import { runTravelRuleExportJob } from "../services/compliance/travelRuleExport"
 import { runDlqCleanupJob } from "../queue/dlq";
 import { runHighValueComplianceReportJob } from "./highValueComplianceReportJob";
 import { runStellarReconciliationJob } from "../workers/stellarReconciliation";
+import { runAirtelReconciliationWorker } from "../workers/airtelReconciliation";
 
 interface JobConfig {
   name: string;
@@ -227,6 +228,15 @@ const JOBS: JobConfig[] = [
     // Daily at 3:30 AM — removes DLQ entries older than 90 days after overnight audit window
     schedule: process.env.DLQ_CLEANUP_CRON || "30 3 * * *",
     handler: runDlqCleanupJob,
+  },
+  {
+    name: "airtel-disbursement-reconciliation",
+    // Every minute - polls Airtel disbursement status for payouts whose
+    // webhook callback has been delayed beyond 60 seconds (#1955)
+    schedule: process.env.AIRTEL_RECONCILIATION_CRON || "* * * * *",
+    handler: async () => {
+      await runAirtelReconciliationWorker();
+    },
   },
 ];
 
