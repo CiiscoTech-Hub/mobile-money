@@ -35,6 +35,15 @@ type ExchangeRates = Record<string, number>;
 /** Base currency for all conversions (stored amounts are in this currency). */
 export const BASE_CURRENCY: SupportedCurrency = "USD";
 
+/**
+ * A live source of local fiat rates, expressed as units per USD - for example
+ * the on-chain oracle (see services/oracle). Currencies the source cannot price
+ * are simply left out of the result and keep their static fallback rate.
+ */
+export interface FiatRateSource {
+  getUsdRates(currencies: readonly string[]): Promise<ExchangeRates>;
+}
+
 // ---------------------------------------------------------------------------
 // Internal API response shape (exchangerate-api.com v6)
 // ---------------------------------------------------------------------------
@@ -102,6 +111,15 @@ export class CurrencyService {
   private cache: { rates: ExchangeRates; fetchedAt: Date } | null = null;
   private usingFallback = false;
   private refreshTimer: ReturnType<typeof setInterval> | null = null;
+  private rateSource: FiatRateSource | null = null;
+
+  /**
+   * Prefer `source` over the static rate table on the next refresh. Pass null
+   * to go back to the static rates only.
+   */
+  setRateSource(source: FiatRateSource | null): void {
+    this.rateSource = source;
+  }
 
   /**
    * Fetch initial rates and schedule hourly refreshes.
@@ -237,11 +255,33 @@ export class CurrencyService {
   }
 
   private async fetchRates(): Promise<void> {
-    // Placeholder for rate fetching implementation
+    const sourceRates = await this.fetchSourceRates();
+
+    // Source rates win where available; every other currency (or every
+    // currency, when no source is set or it is down) keeps its static rate.
+    this.usingFallback = Object.keys(sourceRates).length === 0;
     this.cache = {
-      rates: FALLBACK_RATES,
+      rates: { ...FALLBACK_RATES, ...sourceRates },
       fetchedAt: new Date(),
     };
+  }
+
+  /**
+   * Rates (units per USD) from the configured rate source, if any. Never
+   * throws: any failure yields an empty result so the static fallback table is
+   * used instead.
+   */
+  private async fetchSourceRates(): Promise<ExchangeRates> {
+    if (!this.rateSource) return {};
+
+    try {
+      return await this.rateSource.getUsdRates(SUPPORTED_CURRENCIES);
+    } catch (err) {
+      logger.warn(
+        `[CurrencyService] Rate source unavailable, using fallback rates: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return {};
+    }
   }
 }
 

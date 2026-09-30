@@ -172,6 +172,9 @@ export const shutdownHandler = createGracefulShutdownHandler({
     console.log("[Shutdown] Stopping heartbeat service");
     stopHeartbeatService();
     console.log("[Shutdown] Heartbeat service stopped");
+
+    const { currencyService } = await import("./services/currency.js");
+    currencyService.shutdown();
   },
 });
 
@@ -521,6 +524,20 @@ async function initializeRuntime(): Promise<void> {
   // Initialize background jobs and monitoring
   const { startJobs } = await import("./jobs/scheduler.js");
   startJobs();
+
+  // Local fiat rates from the on-chain oracle, when ORACLE_RATES_ENABLED is set
+  // and configured. Not awaited: until the first refresh completes, and for any
+  // currency the oracle cannot price, the static rates apply.
+  const { getOracleRateProvider } =
+    await import("./services/oracle/oracleRateProvider.js");
+  const oracleRates = getOracleRateProvider();
+  if (oracleRates) {
+    const { currencyService } = await import("./services/currency.js");
+    currencyService.setRateSource(oracleRates);
+    void currencyService.initialize().catch((err: Error) => {
+      console.error("[OracleRates] Initial rate refresh failed:", err.message);
+    });
+  }
 
   // Start JWT key rotation worker (issue #1971): rotates the signing key
   // on schedule and deprecates old secrets after the grace window.
