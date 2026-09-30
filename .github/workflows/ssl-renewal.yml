@@ -69,6 +69,7 @@ jobs:
     outputs:
       needs_renewal: ${{ steps.evaluate.outputs.needs_renewal }}
       expiring_domains: ${{ steps.evaluate.outputs.expiring_domains }}
+      unreachable_domains: ${{ steps.evaluate.outputs.unreachable_domains }}
       threshold: ${{ steps.evaluate.outputs.threshold }}
     steps:
       - name: Checkout repository
@@ -114,35 +115,70 @@ jobs:
           if [ -n "$DOMAINS" ]; then
             ARGS+=(--domains "$DOMAINS")
           fi
+          # stdout is a single JSON document (see scripts/cert_check.ts);
+          # errors such as bad configuration go to the job log on stderr.
+          # Exit codes: 0 ok, 1 expiring/expired, 2 config error,
+          # 3 nothing expiring but some domains could not be checked.
           set +e
-          npm run check-cert -- "${ARGS[@]}" 2>&1 | tee cert-check-output.json
-          EXIT_CODE=${PIPESTATUS[0]}
+          npx tsx scripts/cert_check.ts "${ARGS[@]}" > cert-check-output.json
+          EXIT_CODE=$?
+          set -e
           echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
-          # Persist for evaluate step even on failure (expiring certs exit 1)
+          cat cert-check-output.json
           exit 0
         continue-on-error: true
 
       - name: Evaluate renewal requirement
         id: evaluate
+        env:
+          CHECK_EXIT_CODE: ${{ steps.cert_check.outputs.exit_code }}
+          THRESHOLD: ${{ steps.resolve.outputs.threshold }}
+          REQUESTED_DOMAINS: ${{ steps.resolve.outputs.domains }}
+          FORCE_RENEW: ${{ inputs.force_renew }}
         run: |
-          THRESHOLD="${{ steps.resolve.outputs.threshold }}"
           echo "threshold=$THRESHOLD" >> "$GITHUB_OUTPUT"
 
-          # The checker exits with code 1 when renewal attention is required.
-          if [ "${{ steps.cert_check.outputs.exit_code }}" = "1" ]; then
-            echo "needs_renewal=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "needs_renewal=false" >> "$GITHUB_OUTPUT"
+          # Take the domain lists from the checker's JSON so the renewal job and
+          # any failure notification name the real domains. Domains loaded from
+          # config/cert_domains.json are not known to this workflow up front.
+          EXPIRING=""
+          UNREACHABLE=""
+          CHECKED="$REQUESTED_DOMAINS"
+          if jq -e . cert-check-output.json > /dev/null 2>&1; then
+            EXPIRING=$(jq -r '.expiringDomains | join(",")' cert-check-output.json)
+            UNREACHABLE=$(jq -r '.unreachableDomains | join(",")' cert-check-output.json)
+            CHECKED=$(jq -r '.domains | join(",")' cert-check-output.json)
           fi
-          echo "expiring_domains=${{ steps.resolve.outputs.domains }}" >> "$GITHUB_OUTPUT"
+
+          NEEDS_RENEWAL=false
+          case "$CHECK_EXIT_CODE" in
+            0)
+              ;;
+            1)
+              NEEDS_RENEWAL=true
+              # Fall back to the requested domains if the JSON was unreadable.
+              EXPIRING="${EXPIRING:-$REQUESTED_DOMAINS}"
+              ;;
+            3)
+              echo "::warning::Could not verify certificates for: ${UNREACHABLE}. No certificate is known to be expiring, so renewal is not triggered."
+              ;;
+            *)
+              echo "::error::Certificate check did not run correctly (exit code '${CHECK_EXIT_CODE}'). See the check step log."
+              exit 1
+              ;;
+          esac
 
           # Force flag overrides evaluation
-          if [ "${{ inputs.force_renew }}" = "true" ]; then
-            echo "needs_renewal=true" >> "$GITHUB_OUTPUT"
+          if [ "$FORCE_RENEW" = "true" ]; then
+            NEEDS_RENEWAL=true
+            EXPIRING="${EXPIRING:-$CHECKED}"
             echo "Forced renewal requested – overriding check result"
           fi
 
-          echo "Renewal needed: $(cat $GITHUB_OUTPUT | grep needs_renewal)"
+          echo "needs_renewal=$NEEDS_RENEWAL" >> "$GITHUB_OUTPUT"
+          echo "expiring_domains=$EXPIRING" >> "$GITHUB_OUTPUT"
+          echo "unreachable_domains=$UNREACHABLE" >> "$GITHUB_OUTPUT"
+          echo "Renewal needed: $NEEDS_RENEWAL (expiring: ${EXPIRING:-none}, unreachable: ${UNREACHABLE:-none})"
 
       - name: Upload check artifact
         uses: actions/upload-artifact@v4
@@ -160,6 +196,15 @@ jobs:
           echo "- Threshold: ${{ steps.resolve.outputs.threshold }} days" >> "$GITHUB_STEP_SUMMARY"
           echo "- Needs renewal: ${{ steps.evaluate.outputs.needs_renewal }}" >> "$GITHUB_STEP_SUMMARY"
           echo "- Expiring domains: \`${{ steps.evaluate.outputs.expiring_domains || 'none' }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Unreachable domains: \`${{ steps.evaluate.outputs.unreachable_domains || 'none' }}\`" >> "$GITHUB_STEP_SUMMARY"
+
+      # A domain we cannot reach is not a renewal problem, so it must not open a
+      # "renewal failed" issue - but it should not pass silently either.
+      - name: Fail when domains could not be verified
+        if: steps.cert_check.outputs.exit_code == '3' && github.event_name != 'pull_request'
+        run: |
+          echo "::error::Could not verify certificates for: ${{ steps.evaluate.outputs.unreachable_domains }}"
+          exit 1
 
   # ──────────────────────────────────────────────────────────────────────────
   # 2) Automatic renewal – Let's Encrypt via certbot / ACME
@@ -328,25 +373,37 @@ jobs:
 
       - name: Create GitHub Issue on renewal failure
         uses: actions/github-script@v7
+        env:
+          EXPIRING_DOMAINS: ${{ needs.check.outputs.expiring_domains }}
+          UNREACHABLE_DOMAINS: ${{ needs.check.outputs.unreachable_domains }}
+          THRESHOLD: ${{ needs.check.outputs.threshold }}
         with:
           script: |
-            const expiring = '${{ needs.check.outputs.expiring_domains }}' || 'unknown';
-            const threshold = '${{ needs.check.outputs.threshold }}' || '30';
+            // Domains come from the checker's JSON output. When none were
+            // reported the renewal job itself failed, so say that instead of
+            // printing a placeholder domain name.
+            const expiring = process.env.EXPIRING_DOMAINS || '';
+            const unreachable = process.env.UNREACHABLE_DOMAINS || '';
+            const threshold = process.env.THRESHOLD || '30';
             const runUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
-            const title = `🚨 SSL certificate renewal failed – ${expiring} expiring within ${threshold} days`;
+            const title = expiring
+              ? `🚨 SSL certificate renewal failed – ${expiring} expiring within ${threshold} days`
+              : `🚨 SSL certificate renewal failed – renewal job error, no expiring domain reported`;
             const body = [
               `Automatic SSL renewal workflow failed on \`${new Date().toISOString()}\`.`,
               ``,
               `- **Workflow run:** ${runUrl}`,
               `- **Threshold:** ${threshold} days`,
-              `- **Expiring domains:** \`${expiring || 'unknown (see logs)'}\``,
+              `- **Expiring domains:** ${expiring ? `\`${expiring}\`` : '_none reported – the renewal step failed without a domain list; see the logs artifact_'}`,
+              ...(unreachable ? [`- **Domains that could not be checked:** \`${unreachable}\``] : []),
               `- **Trigger:** \`${context.eventName}\``,
               ``,
               `### Next steps`,
               `- [ ] Verify DNS / ACME challenge configuration (\`config/ssl-renewal.json\`)`,
-              `- [ ] Check Terraform ACM module (\`terraform/modules/acm\`) auto-renewal status`,
-              `- [ ] For Kubernetes, verify cert-manager \`Certificate\` and \`Issuer\` in \`k8s/\``,
+              `- [ ] Check auto-renewal at the TLS termination layer (cloud load balancer / ingress / certbot host) for the domains above`,
               `- [ ] Re-run workflow with \`force_renew: true\` after fixing root cause`,
+              ``,
+              `Runbook: https://github.com/${context.repo.owner}/${context.repo.repo}/blob/main/docs/SSL_RENEWAL.md`,
               ``,
               `> Auto-generated by \`.github/workflows/ssl-renewal.yml\`. Review logs artifact for details.`,
             ].join('\n');
@@ -365,7 +422,7 @@ jobs:
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: duplicate.number,
-                body: `Re-occurrence at ${new Date().toISOString()} – [workflow run](${runUrl}) still failing for \`${expiring}\`.`,
+                body: `Re-occurrence at ${new Date().toISOString()} – [workflow run](${runUrl}) still failing for \`${expiring || 'renewal job (no domain list reported)'}\`.`,
               });
               console.log(`Updated existing issue #${duplicate.number}`);
             } else {
