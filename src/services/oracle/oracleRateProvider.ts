@@ -108,6 +108,11 @@ export function loadOracleRateConfig(
     );
   }
 
+  if (!assetMap.USD) {
+    // Every CurrencyService rate is quoted against USD.
+    return fail("ORACLE_ASSET_MAP must include a USD entry");
+  }
+
   let quoteAmount: bigint;
   try {
     quoteAmount = env.ORACLE_QUOTE_AMOUNT

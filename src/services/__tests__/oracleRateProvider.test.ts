@@ -176,6 +176,10 @@ describe("loadOracleRateConfig", () => {
     ["an invalid contract id", { ORACLE_CONTRACT_ID: "not-a-contract" }],
     ["a missing asset map", { ORACLE_ASSET_MAP: "" }],
     ["a malformed asset map", { ORACLE_ASSET_MAP: '{"USD":"nope"}' }],
+    [
+      "an asset map without USD",
+      { ORACLE_ASSET_MAP: JSON.stringify({ NGN: ASSETS.NGN }) },
+    ],
     ["a zero spread limit", { ORACLE_MAX_SPREAD_BPS: "0" }],
     ["mainnet without an RPC url", { STELLAR_NETWORK: "mainnet" }],
   ])("stays disabled (and warns) with %s", (_label, override) => {
