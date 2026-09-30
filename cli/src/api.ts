@@ -128,6 +128,19 @@ export async function getSystemHealth(): Promise<HealthStatus> {
   }
 }
 
+export async function getRates(amount: string, currency: string): Promise<unknown> {
+  try {
+    const sellAsset = process.env.SEP38_USDC_ASSET ?? "stellar:USDC";
+    const { data } = await buildClient().get("/sep38/prices", { params: { sell_asset: sellAsset, sell_amount: amount, buy_asset: `iso4217:${currency.toUpperCase()}` } });
+    return data;
+  } catch (err) { throw new Error(extractMessage(err)); }
+}
+
+export async function getProviderHealth(): Promise<unknown> {
+  try { const { data } = await buildClient().get("/api/admin/providers/health"); return data; }
+  catch (err) { throw new Error(extractMessage(err)); }
+}
+
 export async function getQueueMetrics() {
   try {
     const { data } = await buildClient().get("/api/admin/queue/stats");
