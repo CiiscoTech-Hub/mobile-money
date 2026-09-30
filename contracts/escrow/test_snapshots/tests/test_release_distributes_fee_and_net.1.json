@@ -271,14 +271,6 @@
                         "map": [
                           {
                             "key": {
-                              "symbol": "admin_signers"
-                            },
-                            "val": {
-                              "vec": []
-                            }
-                          },
-                          {
-                            "key": {
                               "symbol": "amount"
                             },
                             "val": {
@@ -351,18 +343,35 @@
                           },
                           {
                             "key": {
-                              "symbol": "required_admin_signatures"
-                            },
-                            "val": {
-                              "u32": 0
-                            }
-                          },
-                          {
-                            "key": {
                               "symbol": "token"
                             },
                             "val": {
                               "address": "CACMVW2KK4H5FZDFF2AUCAKQTEJMZZWJUIZF23XMRVYQBSXYLHZ6BKWN"
+                            }
+                          }
+                        ]
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "ESC_ADM"
+                      },
+                      "val": {
+                        "map": [
+                          {
+                            "key": {
+                              "symbol": "admin_signers"
+                            },
+                            "val": {
+                              "vec": []
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "required_admin_signatures"
+                            },
+                            "val": {
+                              "u32": 0
                             }
                           }
                         ]
