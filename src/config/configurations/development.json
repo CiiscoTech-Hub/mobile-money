@@ -8,5 +8,8 @@
   },
   "logging": {
     "enableSlowQueryLogging": true
+  },
+  "cors": {
+    "allowedOrigins": ["http://localhost:3000"]
   }
 }

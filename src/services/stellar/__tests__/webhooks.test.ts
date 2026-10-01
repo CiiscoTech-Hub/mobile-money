@@ -20,7 +20,11 @@ jest.mock("bullmq", () => {
   };
 });
 
-import { enqueueSepWebhook, sepWebhookQueue, sepWebhookWorker } from "../webhooks";
+import {
+  enqueueSepWebhook,
+  sepWebhookQueue,
+  sepWebhookWorker,
+} from "../webhooks";
 
 const getMockQueueAdd = () => (global as any).mockQueueAdd;
 const getRegisteredProcessor = () => (global as any).registeredProcessor;
@@ -63,7 +67,7 @@ describe("SEP Webhooks Service and Worker", () => {
             type: "exponential",
             delay: 1000,
           },
-        })
+        }),
       );
     });
 
@@ -73,6 +77,21 @@ describe("SEP Webhooks Service and Worker", () => {
       const payload = { id: transactionId, status };
 
       await enqueueSepWebhook(transactionId, status, "", payload);
+
+      expect(getMockQueueAdd()).not.toHaveBeenCalled();
+    });
+
+    it("should skip enqueuing for private or internal callback URLs", async () => {
+      const payload = { id: "tx-123", status: "completed" };
+
+      for (const callbackUrl of [
+        "http://169.254.169.254/latest/meta-data/",
+        "http://127.0.0.1:9000/hook",
+        "http://metadata.google.internal/",
+        "http://user:pass@example.com/hook",
+      ]) {
+        await enqueueSepWebhook("tx-123", "completed", callbackUrl, payload);
+      }
 
       expect(getMockQueueAdd()).not.toHaveBeenCalled();
     });
@@ -104,7 +123,9 @@ describe("SEP Webhooks Service and Worker", () => {
       await processor(mockJob);
 
       const expectedBody = JSON.stringify(jobData.payload);
-      const expectedSignature = "sha256=" + createHmac("sha256", "test-secret").update(expectedBody).digest("hex");
+      const expectedSignature =
+        "sha256=" +
+        createHmac("sha256", "test-secret").update(expectedBody).digest("hex");
 
       expect(mockFetch).toHaveBeenCalledWith("https://example.com/callback", {
         method: "POST",
@@ -137,8 +158,27 @@ describe("SEP Webhooks Service and Worker", () => {
 
       const processor = getRegisteredProcessor();
       expect(processor).toBeDefined();
-      
-      await expect(processor(mockJob)).rejects.toThrow("HTTP error 500: Internal Server Error");
+
+      await expect(processor(mockJob)).rejects.toThrow(
+        "HTTP error 500: Internal Server Error",
+      );
+    });
+
+    it("should not call fetch when the stored callback URL is blocked", async () => {
+      const processor = getRegisteredProcessor();
+      expect(processor).toBeDefined();
+
+      await processor({
+        id: "job-2",
+        data: {
+          transactionId: "tx-123",
+          status: "completed",
+          callbackUrl: "http://10.0.0.5/callback",
+          payload: { id: "tx-123", status: "completed" },
+        },
+      });
+
+      expect(mockFetch).not.toHaveBeenCalled();
     });
   });
 });

@@ -2,6 +2,7 @@ import { IncomingMessage, Server } from "http";
 import { WebSocketManager } from "../websocketManager";
 import { verifyToken } from "../../auth/jwt";
 import { createClient } from "redis";
+import { TransactionModel } from "../../models/transaction";
 
 type ConnectionHandler = (ws: unknown, req: IncomingMessage) => void;
 
@@ -13,6 +14,12 @@ jest.mock("../../auth/jwt", () => ({
 
 jest.mock("redis", () => ({
   createClient: jest.fn(),
+}));
+
+jest.mock("../../models/transaction", () => ({
+  TransactionModel: jest.fn().mockImplementation(() => ({
+    findById: jest.fn(),
+  })),
 }));
 
 jest.mock("ws", () => {
@@ -44,6 +51,7 @@ type MockClient = {
   ping: jest.Mock;
   terminate: jest.Mock;
   on: jest.Mock;
+  handlers: Map<string, (...args: unknown[]) => void>;
 };
 
 function createMockClient(): MockClient {
@@ -60,6 +68,7 @@ function createMockClient(): MockClient {
     on: jest.fn((event: string, handler: (...args: unknown[]) => void) => {
       handlers.set(event, handler);
     }),
+    handlers,
   };
 
   return client;
@@ -77,8 +86,15 @@ function connectClient(client: MockClient, token = "test-token"): void {
 }
 
 describe("WebSocketManager", () => {
-  const mockVerifyToken = verifyToken as jest.MockedFunction<typeof verifyToken>;
-  const mockCreateClient = createClient as jest.MockedFunction<typeof createClient>;
+  const mockVerifyToken = verifyToken as jest.MockedFunction<
+    typeof verifyToken
+  >;
+  const mockCreateClient = createClient as jest.MockedFunction<
+    typeof createClient
+  >;
+  const MockTransactionModel = TransactionModel as jest.MockedClass<
+    typeof TransactionModel
+  >;
 
   beforeEach(() => {
     jest.clearAllMocks();
@@ -116,12 +132,60 @@ describe("WebSocketManager", () => {
       userId: "user-123",
     });
 
-    expect(client.send).toHaveBeenCalledWith(
-      expect.stringContaining('"type":"transaction.updated"'),
+    expect(JSON.parse(client.send.mock.calls[0][0] as string)).toEqual({
+      type: "transaction.updated",
+      data: { transactionId: "tx-1" },
+    });
+
+    await manager.close();
+  });
+
+  it("returns transaction details on demand for the authenticated user", async () => {
+    mockVerifyToken.mockReturnValue({
+      userId: "user-123",
+      email: "user@example.com",
+    });
+
+    const manager = new WebSocketManager({} as Server);
+    const client = createMockClient();
+
+    connectClient(client);
+
+    client.send.mockClear();
+
+    const transactionModel = MockTransactionModel.mock.instances[0] as {
+      findById: jest.Mock;
+    };
+    transactionModel.findById.mockResolvedValue({
+      id: "tx-42",
+      status: "completed",
+      userId: "user-123",
+    });
+
+    await Promise.resolve(
+      client.handlers.get("message")?.(
+        JSON.stringify({
+          type: "transaction.details",
+          data: { transactionId: "tx-42" },
+        }),
+      ),
     );
-    expect(client.send).toHaveBeenCalledWith(
-      expect.stringContaining('"id":"tx-1"'),
+
+    expect(transactionModel.findById).toHaveBeenCalledWith(
+      "tx-42",
+      "user-123",
     );
+    expect(JSON.parse(client.send.mock.calls[0][0] as string)).toEqual({
+      type: "transaction.details",
+      data: {
+        transactionId: "tx-42",
+        transaction: {
+          id: "tx-42",
+          status: "completed",
+          userId: "user-123",
+        },
+      },
+    });
 
     await manager.close();
   });
@@ -162,8 +226,12 @@ describe("WebSocketManager", () => {
     };
 
     mockCreateClient
-      .mockImplementationOnce(() => pubClient as unknown as ReturnType<typeof createClient>)
-      .mockImplementationOnce(() => subClient as unknown as ReturnType<typeof createClient>);
+      .mockImplementationOnce(
+        () => pubClient as unknown as ReturnType<typeof createClient>,
+      )
+      .mockImplementationOnce(
+        () => subClient as unknown as ReturnType<typeof createClient>,
+      );
 
     const manager = new WebSocketManager({} as Server);
     const client = createMockClient();
@@ -202,17 +270,25 @@ describe("WebSocketManager", () => {
 
     const subClient = {
       connect: jest.fn().mockResolvedValue(undefined),
-      subscribe: jest.fn().mockImplementation((channel: string, callback: (message: string) => void) => {
-        subscriberCallback = callback;
-        return Promise.resolve();
-      }),
+      subscribe: jest
+        .fn()
+        .mockImplementation(
+          (channel: string, callback: (message: string) => void) => {
+            subscriberCallback = callback;
+            return Promise.resolve();
+          },
+        ),
       unsubscribe: jest.fn().mockResolvedValue(undefined),
       disconnect: jest.fn().mockResolvedValue(undefined),
     };
 
     mockCreateClient
-      .mockImplementationOnce(() => pubClient as unknown as ReturnType<typeof createClient>)
-      .mockImplementationOnce(() => subClient as unknown as ReturnType<typeof createClient>);
+      .mockImplementationOnce(
+        () => pubClient as unknown as ReturnType<typeof createClient>,
+      )
+      .mockImplementationOnce(
+        () => subClient as unknown as ReturnType<typeof createClient>,
+      );
 
     const manager = new WebSocketManager({} as Server);
     const client = createMockClient();
@@ -228,9 +304,7 @@ describe("WebSocketManager", () => {
         message: {
           type: "transaction.updated",
           data: {
-            id: "tx-other-instance",
-            status: "completed",
-            userId: "user-scaling",
+            transactionId: "tx-other-instance",
           },
         },
       });
@@ -239,12 +313,10 @@ describe("WebSocketManager", () => {
     }
 
     // Verify the message was delivered to the local client
-    expect(client.send).toHaveBeenCalledWith(
-      expect.stringContaining('"type":"transaction.updated"'),
-    );
-    expect(client.send).toHaveBeenCalledWith(
-      expect.stringContaining('"id":"tx-other-instance"'),
-    );
+    expect(JSON.parse(client.send.mock.calls[0][0] as string)).toEqual({
+      type: "transaction.updated",
+      data: { transactionId: "tx-other-instance" },
+    });
 
     await manager.close();
   });
@@ -270,8 +342,12 @@ describe("WebSocketManager", () => {
     };
 
     mockCreateClient
-      .mockImplementationOnce(() => pubClient as unknown as ReturnType<typeof createClient>)
-      .mockImplementationOnce(() => subClient as unknown as ReturnType<typeof createClient>);
+      .mockImplementationOnce(
+        () => pubClient as unknown as ReturnType<typeof createClient>,
+      )
+      .mockImplementationOnce(
+        () => subClient as unknown as ReturnType<typeof createClient>,
+      );
 
     const manager = new WebSocketManager({} as Server);
 
@@ -328,17 +404,25 @@ describe("WebSocketManager", () => {
 
     const subClient = {
       connect: jest.fn().mockResolvedValue(undefined),
-      subscribe: jest.fn().mockImplementation((channel: string, callback: (message: string) => void) => {
-        subscriberCallback = callback;
-        return Promise.resolve();
-      }),
+      subscribe: jest
+        .fn()
+        .mockImplementation(
+          (channel: string, callback: (message: string) => void) => {
+            subscriberCallback = callback;
+            return Promise.resolve();
+          },
+        ),
       unsubscribe: jest.fn().mockResolvedValue(undefined),
       disconnect: jest.fn().mockResolvedValue(undefined),
     };
 
     mockCreateClient
-      .mockImplementationOnce(() => pubClient as unknown as ReturnType<typeof createClient>)
-      .mockImplementationOnce(() => subClient as unknown as ReturnType<typeof createClient>);
+      .mockImplementationOnce(
+        () => pubClient as unknown as ReturnType<typeof createClient>,
+      )
+      .mockImplementationOnce(
+        () => subClient as unknown as ReturnType<typeof createClient>,
+      );
 
     const manager = new WebSocketManager({} as Server);
     const client = createMockClient();
@@ -348,22 +432,13 @@ describe("WebSocketManager", () => {
 
     client.send.mockClear();
 
-    // Simulate client subscribing to a transaction
-    const handlers = new Map<string, (...args: unknown[]) => void>();
-    client.on.mockImplementation((event: string, handler: (...args: unknown[]) => void) => {
-      handlers.set(event, handler);
-    });
-
     // Send subscription message
-    const messageHandler = handlers.get("message");
-    if (messageHandler) {
-      messageHandler(
-        JSON.stringify({
-          type: "subscribe",
-          data: { transactionId: "tx-sub-123" },
-        }),
-      );
-    }
+    client.handlers.get("message")?.(
+      JSON.stringify({
+        type: "subscribe",
+        data: { transactionId: "tx-sub-123" },
+      }),
+    );
 
     // Broadcast to that transaction ID
     await manager.broadcastTransactionUpdate({

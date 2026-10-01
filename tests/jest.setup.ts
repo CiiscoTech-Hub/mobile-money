@@ -1,13 +1,63 @@
 process.env.NODE_ENV = "test";
-process.env.DATABASE_URL ??= "postgresql://test_user:test_password@localhost:5432/test_db";
+process.env.DATABASE_URL ??=
+  "postgresql://test_user:test_password@localhost:5432/test_db";
 process.env.REDIS_URL ??= "redis://localhost:6379";
-process.env.STELLAR_ISSUER_SECRET ??=
-  "SDUHELR2QJTQH24GZKNCT5NBWJ2FCGMPRGKED5Y4REUZK4XCM73JMM4V";
+
+// Mock redis globally to prevent connection attempts in all test suites
+jest.mock("redis", () => ({
+  createClient: jest.fn(() => ({
+    on: jest.fn(),
+    connect: jest.fn().mockResolvedValue(undefined),
+    disconnect: jest.fn().mockResolvedValue(undefined),
+    quit: jest.fn().mockResolvedValue(undefined),
+    get: jest.fn(),
+    set: jest.fn(),
+    del: jest.fn(),
+    keys: jest.fn().mockResolvedValue([]),
+    ping: jest.fn().mockResolvedValue("PONG"),
+  })),
+}));
+
+// Mock ioredis used by bullmq
+jest.mock("ioredis", () => {
+  const EventEmitter = require("events");
+  const mockRedis = new EventEmitter();
+  mockRedis.connect = jest.fn().mockResolvedValue(undefined);
+  mockRedis.disconnect = jest.fn().mockResolvedValue(undefined);
+  mockRedis.quit = jest.fn().mockResolvedValue(undefined);
+  mockRedis.status = "close";
+  return {
+    __esModule: true,
+    default: jest.fn(() => mockRedis),
+    Redis: jest.fn(() => mockRedis),
+    Cluster: jest.fn(() => mockRedis),
+  };
+});
+if (!process.env.STELLAR_ISSUER_SECRET || process.env.STELLAR_ISSUER_SECRET.length < 56) {
+  process.env.STELLAR_ISSUER_SECRET = "SDUHELR2QJTQH24GZKNCT5NBWJ2FCGMPRGKED5Y4REUZK4XCM73JMM4V";
+}
+if (process.env.STELLAR_SIGNING_KEY && process.env.STELLAR_SIGNING_KEY.length < 56) {
+  delete process.env.STELLAR_SIGNING_KEY;
+}
+process.env.WEBVIEW_SIGNING_SECRET ??= "test-webview-signing-secret-32-chars";
 process.env.JWT_SECRET ??= "test-jwt-secret";
 process.env.ADMIN_API_KEY ??= "test-admin-key";
 process.env.DB_ENCRYPTION_KEY ??= "development-encryption-key-32-chars-long";
-process.env.KEY_VAULT_MASTER_SECRET ??= "test-key-vault-master-secret-32-chars-long";
+process.env.KEY_VAULT_MASTER_SECRET ??=
+  "test-key-vault-master-secret-32-chars-long";
 process.env.GEOLOCATION_API_KEY ??= "";
+// Outgoing webhook destinations are SSRF-checked (src/security/ssrf.ts).
+// Resolution is off in tests because suites use unresolvable fixture hosts
+// (example.com subdomains, .example) with mocked HTTP clients; the
+// synchronous scheme/host/IP-literal checks always apply. Tests that need
+// the DNS layer inject a resolver or flip this flag back on.
+process.env.WEBHOOK_SSRF_RESOLVE_DNS ??= "false";
+process.env.SMS_PROVIDER ??= "none";
+process.env.WHATSAPP_ENABLED ??= "false";
+process.env.TWILIO_ACCOUNT_SID ??= "";
+process.env.TWILIO_AUTH_TOKEN ??= "";
+process.env.TWILIO_PHONE_NUMBER ??= "";
+process.env.TWILIO_WHATSAPP_NUMBER ??= "";
 
 // Global mock for axios to prevent real HTTP requests to sanction lists
 jest.mock("axios", () => {
@@ -16,7 +66,9 @@ jest.mock("axios", () => {
     ...originalAxios,
     create: jest.fn((...args: any[]) => originalAxios.create(...args)),
     get: jest.fn((url: string, config?: any) => {
-      if (url === "https://scsanctions.un.org/resources/xml/en/consolidated.xml") {
+      if (
+        url === "https://scsanctions.un.org/resources/xml/en/consolidated.xml"
+      ) {
         return Promise.resolve({
           data: `
             <CONSOLIDATED_LIST>
@@ -47,31 +99,51 @@ jest.mock("axios", () => {
         });
       }
       // Fallback to original or error for unhandled external URLs in tests
-      if (url.startsWith("http") && !url.includes("127.0.0.1") && !url.includes("localhost")) {
+      if (
+        url.startsWith("http") &&
+        !url.includes("127.0.0.1") &&
+        !url.includes("localhost")
+      ) {
         return Promise.reject(new Error(`Unmocked external request to ${url}`));
       }
       return originalAxios.get(url, config);
     }),
     post: jest.fn((url: string, data?: any, config?: any) => {
-      if (url.startsWith("http") && !url.includes("127.0.0.1") && !url.includes("localhost")) {
+      if (
+        url.startsWith("http") &&
+        !url.includes("127.0.0.1") &&
+        !url.includes("localhost")
+      ) {
         return Promise.reject(new Error(`Unmocked external request to ${url}`));
       }
       return originalAxios.post(url, data, config);
     }),
     put: jest.fn((url: string, data?: any, config?: any) => {
-      if (url.startsWith("http") && !url.includes("127.0.0.1") && !url.includes("localhost")) {
+      if (
+        url.startsWith("http") &&
+        !url.includes("127.0.0.1") &&
+        !url.includes("localhost")
+      ) {
         return Promise.reject(new Error(`Unmocked external request to ${url}`));
       }
       return originalAxios.put(url, data, config);
     }),
     delete: jest.fn((url: string, config?: any) => {
-      if (url.startsWith("http") && !url.includes("127.0.0.1") && !url.includes("localhost")) {
+      if (
+        url.startsWith("http") &&
+        !url.includes("127.0.0.1") &&
+        !url.includes("localhost")
+      ) {
         return Promise.reject(new Error(`Unmocked external request to ${url}`));
       }
       return originalAxios.delete(url, config);
     }),
     patch: jest.fn((url: string, data?: any, config?: any) => {
-      if (url.startsWith("http") && !url.includes("127.0.0.1") && !url.includes("localhost")) {
+      if (
+        url.startsWith("http") &&
+        !url.includes("127.0.0.1") &&
+        !url.includes("localhost")
+      ) {
         return Promise.reject(new Error(`Unmocked external request to ${url}`));
       }
       return originalAxios.patch(url, data, config);
@@ -99,14 +171,21 @@ try {
   console.error("Failed to patch Express for async errors in tests:", e);
 }
 
-import { connectRedis, disconnectRedis } from "../src/config/redis";
-
-beforeAll(async () => {
-  await connectRedis();
-});
-
-afterAll(async () => {
-  await disconnectRedis();
-});
-
-
+// Mock Redis module to prevent real connections in test environment
+jest.mock("../src/config/redis", () => ({
+  __esModule: true,
+  connectRedis: jest.fn().mockResolvedValue(undefined),
+  disconnectRedis: jest.fn().mockResolvedValue(undefined),
+  redisClient: {
+    isOpen: false,
+    on: jest.fn(),
+    connect: jest.fn(),
+    quit: jest.fn(),
+    disconnect: jest.fn(),
+    get: jest.fn(),
+    setEx: jest.fn(),
+    del: jest.fn(),
+  },
+  createRedisStore: jest.fn().mockReturnValue({ on: jest.fn(), get: jest.fn((sid: any, cb: any) => cb && cb(null, null)), set: jest.fn((sid: any, session: any, cb: any) => cb && cb(null)), destroy: jest.fn((sid: any, cb: any) => cb && cb(null)) }),
+  SESSION_TTL_SECONDS: 86400,
+}));

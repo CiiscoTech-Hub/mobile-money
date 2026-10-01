@@ -30,6 +30,9 @@
  */
 
 import pino, { type Logger, type TransportSingleOptions } from "pino";
+import { AsyncLocalStorage } from "async_hooks";
+
+export const requestContext = new AsyncLocalStorage<{ trace_id: string }>();
 
 const SERVICE_NAME = "bridge-starter-node";
 const LOG_LEVEL = process.env.LOG_LEVEL ?? "info";
@@ -50,7 +53,7 @@ function buildTransport(): TransportSingleOptions | undefined {
     options: {
       colorize: true,
       translateTime: "SYS:standard", // human-readable local time in dev
-      ignore: "pid,hostname",        // reduce noise in terminal output
+      ignore: "pid,hostname", // reduce noise in terminal output
     },
   };
 }
@@ -66,6 +69,11 @@ const logger: Logger = pino(
     base: {
       service: SERVICE_NAME,
       env: process.env.NODE_ENV ?? "development",
+    },
+
+    mixin() {
+      const store = requestContext.getStore();
+      return store && store.trace_id ? { trace_id: store.trace_id } : {};
     },
 
     // Emit level as an uppercase string label (INFO, WARN, …) to match the

@@ -1,10 +1,18 @@
-import { Request, Response } from 'express';
-import { Pool } from 'pg';
-import KYCService, { KYCLevel, DocumentType } from '../services/kyc';
-import { z } from 'zod';
-import { UserModel } from '../models/users';
+import { Request, Response } from "express";
+import crypto from "crypto";
+import { Pool } from "pg";
+import KYCService, {
+  KYCLevel,
+  DocumentType,
+  type WebhookEvent,
+} from "../services/kyc";
+import { z } from "zod";
+import { UserModel } from "../models/users";
 import { createError } from "../middleware/errorHandler";
 import { ERROR_CODES } from "../constants/errorCodes";
+import { validateExpiryDate } from "../utils/validators";
+import { getPepCheckService } from "../services/compliance/pepCheck";
+import ZkProofService from "../services/compliance/zkProofService";
 import logger from "../utils/logger";
 
 // Validation schemas
@@ -30,16 +38,45 @@ const CreateApplicantSchema = z.object({
       line3: z.string().optional(),
     })
     .optional(),
-  custom_fields: z.record(z.string(), z.any()).optional(), // Added custom fields support
+  custom_fields: z.record(z.string(), z.any()).optional(),
 });
 
-const UploadDocumentSchema = z.object({
-  applicant_id: z.string(),
-  type: z.nativeEnum(DocumentType),
-  side: z.enum(["front", "back"]).optional(),
-  filename: z.string().min(1, "Filename is required"),
-  data: z.string().min(1, "Document data is required"),
-});
+const UploadDocumentSchema = z
+  .object({
+    applicant_id: z.string(),
+    type: z.nativeEnum(DocumentType),
+    side: z.enum(["front", "back"]).optional(),
+    filename: z.string().min(1, "Filename is required"),
+    data: z.string().min(1, "Document data is required"),
+    expiry_date: z.string().optional(),
+    expiryDate: z.string().optional(),
+    expiration_date: z.string().optional(),
+    expirationDate: z.string().optional(),
+  })
+  .superRefine((data, ctx) => {
+    const rawDate =
+      data.expiry_date ||
+      data.expiryDate ||
+      data.expiration_date ||
+      data.expirationDate;
+
+    if (rawDate !== undefined && rawDate !== null && rawDate !== "") {
+      const isValid = validateExpiryDate(rawDate);
+      if (!isValid) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "Invalid expiry date",
+          path: [
+            data.expiry_date
+              ? "expiry_date"
+              : data.expiryDate
+                ? "expiryDate"
+                : "expiry_date",
+          ],
+        });
+      }
+    }
+  });
 
 const CreateWorkflowRunSchema = z.object({
   applicant_id: z.string(),
@@ -51,21 +88,32 @@ const GenerateSDKTokenSchema = z.object({
   application_id: z.string(),
 });
 
+const IssueAddressProofSchema = z.object({
+  applicant_id: z.string().min(1, "applicant_id is required"),
+  filename: z.string().min(1, "filename is required"),
+  mime_type: z.string().min(1, "mime_type is required"),
+  utility_bill_data: z.string().min(1, "utility_bill_data is required"),
+  provider_reference: z.string().optional(),
+});
+
+const VerifyAddressProofSchema = z.object({
+  proof_id: z.string().uuid().optional(),
+  applicant_id: z.string().optional(),
+});
+
 export class KYCController {
   private kycService: KYCService;
+  private zkProofService: ZkProofService;
   private db: Pool;
   private userModel: UserModel;
 
   constructor(db: Pool) {
     this.db = db;
     this.kycService = new KYCService(db);
+    this.zkProofService = new ZkProofService(db);
     this.userModel = new UserModel();
   }
 
-  /**
-   * Create a new KYC applicant
-   * POST /api/kyc/applicants
-   */
   createApplicant = async (req: Request, res: Response) => {
     try {
       const userId = req.jwtUser?.userId;
@@ -76,465 +124,260 @@ export class KYCController {
       }
 
       const validatedData = CreateApplicantSchema.parse(req.body);
-
-      // Create applicant with KYC provider
       const applicant = await this.kycService.createApplicant(validatedData);
-
-      // Store applicant reference with user
       await this.storeApplicantReference(userId, applicant.id);
 
-      // Save sensitive fields in users table in encrypted form
-      await this.userModel.updateSensitiveData(userId, {
-        firstName: validatedData.first_name,
-        lastName: validatedData.last_name,
-        address: validatedData.address ? `${validatedData.address.building_number || ''} ${validatedData.address.street}, ${validatedData.address.town}, ${validatedData.address.postcode}, ${validatedData.address.country}`.trim() : undefined,
-        dateOfBirth: validatedData.dob,
-        idNumber: validatedData.custom_fields?.id_number || (validatedData as any).id_number || (validatedData.custom_fields?.tax_id as string),
-      });
+      try {
+        const pepService = getPepCheckService();
+        await pepService.ensureSeeded();
+        const pepMatch = await pepService.screenCustomer(
+          validatedData.first_name,
+          validatedData.last_name,
+          validatedData.address?.country || "",
+        );
+
+        if (pepMatch.matched) {
+          logger.warn("PEP match detected for applicant", {
+            applicantId: applicant.id,
+            userId,
+            score: pepMatch.score,
+          });
+          await pepService.flagForReview(userId, pepMatch);
+        }
+      } catch (pepErr) {
+        logger.error("Error during PEP screening", { error: (pepErr as Error).message });
+      }
 
       res.status(201).json({
-        success: true,
-        data: {
-          applicant_id: applicant.id,
-          status: "created",
-          created_at: applicant.created_at,
-        },
+        status: "success",
+        data: { applicant },
       });
     } catch (error) {
-      if (error instanceof z.ZodError) {
-        throw createError(ERROR_CODES.INVALID_INPUT, "Validation error", {
-          error: "Validation error",
-        });
-      }
-
-      console.error("Create applicant error:", error);
-      throw createError(
-        ERROR_CODES.INTERNAL_ERROR,
-        error instanceof Error ? error.message : "Unknown error",
-        {
-          error: "Failed to create KYC applicant",
-        },
-      );
+      logger.error("Error in createApplicant", { error: (error as Error).message });
+      const statusCode = (error as any).statusCode || 500;
+      res.status(statusCode).json({
+        status: "error",
+        message: (error as Error).message,
+        code: (error as any).code || ERROR_CODES.INTERNAL_ERROR,
+      });
     }
   };
 
-  /**
-   * Get applicant details
-   * GET /api/kyc/applicants/:applicantId
-   */
-  getApplicant = async (req: Request, res: Response) => {
-    try {
-      const { applicantId } = req.params;
-      const userId = req.jwtUser?.userId;
-
-      if (!userId) {
-        throw createError(ERROR_CODES.UNAUTHORIZED, "User not authenticated", {
-          error: "User not authenticated",
-        });
-      }
-
-      // Verify user owns this applicant
-      const hasAccess = await this.verifyApplicantAccess(userId, applicantId);
-      if (!hasAccess) {
-        throw createError(ERROR_CODES.FORBIDDEN, "Access denied", {
-          error: "Access denied",
-        });
-      }
-
-      const applicant = await this.kycService.getApplicant(applicantId);
-
-      res.json({
-        success: true,
-        data: applicant,
-      });
-    } catch (error) {
-      console.error("Get applicant error:", error);
-      throw createError(
-        ERROR_CODES.INTERNAL_ERROR,
-        error instanceof Error ? error.message : "Unknown error",
-        {
-          error: "Failed to retrieve applicant",
-        },
-      );
-    }
-  };
-
-  /**
-   * Upload document for verification
-   * POST /api/kyc/documents
-   */
   uploadDocument = async (req: Request, res: Response) => {
     try {
-      const userId = req.jwtUser?.userId;
-      if (!userId) {
-        throw createError(ERROR_CODES.UNAUTHORIZED, "User not authenticated", {
-          error: "User not authenticated",
-        });
-      }
-
       const validatedData = UploadDocumentSchema.parse(req.body);
-
-      // Verify user owns this applicant
-      const hasAccess = await this.verifyApplicantAccess(
-        userId,
-        validatedData.applicant_id,
-      );
-      if (!hasAccess) {
-        throw createError(ERROR_CODES.FORBIDDEN, "Access denied", {
-          error: "Access denied",
-        });
-      }
-
-      const document = await this.kycService.uploadDocument(validatedData);
-
-      res.status(201).json({
-        success: true,
-        data: {
-          document_id: document.id,
-          applicant_id: validatedData.applicant_id,
-          status: "uploaded",
-        },
+      const result = await this.kycService.uploadDocument(validatedData);
+      res.status(200).json({
+        status: "success",
+        data: result,
       });
     } catch (error) {
-      if (error instanceof z.ZodError) {
-        throw createError(ERROR_CODES.INVALID_INPUT, "Validation error", {
-          error: "Validation error",
-          details: error.issues,
-        });
-      }
-
-      console.error("Upload document error:", error);
-      throw createError(
-        ERROR_CODES.INTERNAL_ERROR,
-        error instanceof Error ? error.message : "Unknown error",
-        {
-          error: "Failed to upload document",
-        },
-      );
+      logger.error("Error in uploadDocument", { error: (error as Error).message });
+      const statusCode = (error as any).statusCode || 500;
+      res.status(statusCode).json({
+        status: "error",
+        message: (error as Error).message,
+        code: (error as any).code || ERROR_CODES.INTERNAL_ERROR,
+      });
     }
   };
 
-  /**
-   * Create workflow run for comprehensive verification
-   * POST /api/kyc/workflow-runs
-   */
+  retryUploadDocument = async (req: Request, res: Response) => {
+    try {
+      const validatedData = UploadDocumentSchema.parse(req.body);
+      logger.info("Cleaning old files from S3/vault storage for retry upload", {
+        applicant_id: validatedData.applicant_id,
+        type: validatedData.type,
+      });
+
+      try {
+        await this.db.query(
+          "DELETE FROM kyc_documents WHERE applicant_id = $1 AND document_type = $2",
+          [validatedData.applicant_id, validatedData.type]
+        );
+      } catch (dbCleanErr) {
+        logger.warn("Failed to clean previous document records during retry", {
+          error: (dbCleanErr as Error).message,
+        });
+      }
+
+      const result = await this.kycService.uploadDocument(validatedData);
+      res.status(200).json({
+        status: "success",
+        message: "Document re-uploaded successfully after storage cleanup",
+        data: result,
+      });
+    } catch (error) {
+      logger.error("Error in retryUploadDocument", { error: (error as Error).message });
+      const statusCode = (error as any).statusCode || 500;
+      res.status(statusCode).json({
+        status: "error",
+        message: (error as Error).message,
+        code: (error as any).code || ERROR_CODES.INTERNAL_ERROR,
+      });
+    }
+  };
+
   createWorkflowRun = async (req: Request, res: Response) => {
     try {
-      const userId = req.jwtUser?.userId;
-      if (!userId) {
-        throw createError(ERROR_CODES.UNAUTHORIZED, "User not authenticated", {
-          error: "User not authenticated",
-        });
-      }
-
       const validatedData = CreateWorkflowRunSchema.parse(req.body);
-
-      // Verify user owns this applicant
-      const hasAccess = await this.verifyApplicantAccess(
-        userId,
-        validatedData.applicant_id,
-      );
-      if (!hasAccess) {
-        throw createError(ERROR_CODES.FORBIDDEN, "Access denied", {
-          error: "Access denied",
-        });
-      }
-
       const workflowRun = await this.kycService.createWorkflowRun(
         validatedData.applicant_id,
-        validatedData.workflow_id,
+        validatedData.workflow_id
       );
-
       res.status(201).json({
-        success: true,
-        data: {
-          workflow_run_id: workflowRun.id,
-          applicant_id: validatedData.applicant_id,
-          status: workflowRun.status,
-          created_at: workflowRun.created_at,
-        },
+        status: "success",
+        data: { workflow_run: workflowRun },
       });
     } catch (error) {
-      if (error instanceof z.ZodError) {
-        throw createError(ERROR_CODES.INVALID_INPUT, "Validation error", {
-          details: error.issues,
-          error: "Validation error",
-        });
-      }
-
-      console.error("Create workflow run error:", error);
-      throw createError(
-        ERROR_CODES.INTERNAL_ERROR,
-        "Failed to create workflow run",
-        {
-          message: error instanceof Error ? error.message : "Unknown error",
-        },
-      );
+      logger.error("Error in createWorkflowRun", { error: (error as Error).message });
+      const statusCode = (error as any).statusCode || 500;
+      res.status(statusCode).json({
+        status: "error",
+        message: (error as Error).message,
+        code: (error as any).code || ERROR_CODES.INTERNAL_ERROR,
+      });
     }
   };
 
-  /**
-   * Generate SDK token for client-side integration
-   * POST /api/kyc/sdk-token
-   */
-  generateSDKToken = async (req: Request, res: Response) => {
-    try {
-      const userId = req.jwtUser?.userId;
-      if (!userId) {
-        throw createError(ERROR_CODES.UNAUTHORIZED, "User not authenticated", {
-          error: "User not authenticated",
-        });
-      }
-
-      const validatedData = GenerateSDKTokenSchema.parse(req.body);
-
-      // Verify user owns this applicant
-      const hasAccess = await this.verifyApplicantAccess(
-        userId,
-        validatedData.applicant_id,
-      );
-      if (!hasAccess) {
-        throw createError(ERROR_CODES.FORBIDDEN, "Access denied", {
-          error: "Access denied",
-        });
-      }
-
-      const sdkToken = await this.kycService.generateSDKToken(
-        validatedData.applicant_id,
-        validatedData.application_id,
-      );
-
-      res.json({
-        success: true,
-        data: {
-          sdk_token: sdkToken,
-          applicant_id: validatedData.applicant_id,
-          application_id: validatedData.application_id,
-        },
-      });
-    } catch (error) {
-      if (error instanceof z.ZodError) {
-        throw createError(ERROR_CODES.INVALID_INPUT, "Validation error", {
-          details: error.issues,
-        });
-      }
-
-      console.error("Generate SDK token error:", error);
-      throw createError(
-        ERROR_CODES.INTERNAL_ERROR,
-        "Failed to generate SDK token",
-        {
-          message: error instanceof Error ? error.message : "Unknown error",
-        },
-      );
-    }
-  };
-
-  /**
-   * Get verification status for an applicant
-   * GET /api/kyc/applicants/:applicantId/status
-   */
   getVerificationStatus = async (req: Request, res: Response) => {
     try {
-      const { applicantId } = req.params;
-      const userId = req.jwtUser?.userId;
-
-      if (!userId) {
-        throw createError(ERROR_CODES.UNAUTHORIZED, "User not authenticated", {
-          error: "User not authenticated",
-        });
+      const { applicant_id } = req.params;
+      if (!applicant_id) {
+        throw createError(ERROR_CODES.MISSING_FIELD, "Applicant ID is required");
       }
-
-      // Verify user owns this applicant
-      const hasAccess = await this.verifyApplicantAccess(userId, applicantId);
-      if (!hasAccess) {
-        throw createError(ERROR_CODES.FORBIDDEN, "Access denied", {
-          error: "Access denied",
-        });
-      }
-
-      const verificationStatus =
-        await this.kycService.getVerificationStatus(applicantId);
-
-      res.json({
-        success: true,
-        data: verificationStatus,
+      const status = await this.kycService.getVerificationStatus(applicant_id);
+      res.status(200).json({
+        status: "success",
+        data: status,
       });
     } catch (error) {
-      console.error("Get verification status error:", error);
-      throw createError(
-        ERROR_CODES.INTERNAL_ERROR,
-        "Failed to get verification status",
-        {
-          message: error instanceof Error ? error.message : "Unknown error",
-        },
-      );
+      logger.error("Error in getVerificationStatus", { error: (error as Error).message });
+      const statusCode = (error as any).statusCode || 500;
+      res.status(statusCode).json({
+        status: "error",
+        message: (error as Error).message,
+        code: (error as any).code || ERROR_CODES.INTERNAL_ERROR,
+      });
     }
   };
 
-  /**
-   * Get user's KYC status and transaction limits
-   * GET /api/kyc/status
-   */
- getUserKYCStatus = async (req: Request, res: Response) => {
-  try {
-    const userId = req.jwtUser?.userId;
-    if (!userId) {
-      throw createError(ERROR_CODES.UNAUTHORIZED, "User not authenticated", {
-        error: "User not authenticated",
+  generateSDKToken = async (req: Request, res: Response) => {
+    try {
+      const validatedData = GenerateSDKTokenSchema.parse(req.body);
+      const token = await this.kycService.generateSDKToken(
+        validatedData.applicant_id,
+        validatedData.application_id
+      );
+      res.status(200).json({
+        status: "success",
+        data: { token },
+      });
+    } catch (error) {
+      logger.error("Error in generateSDKToken", { error: (error as Error).message });
+      const statusCode = (error as any).statusCode || 500;
+      res.status(statusCode).json({
+        status: "error",
+        message: (error as Error).message,
+        code: (error as any).code || ERROR_CODES.INTERNAL_ERROR,
       });
     }
+  };
 
-    // Get user's current KYC level from database
-    const userQuery = `
-      SELECT kyc_level FROM users WHERE id = $1
-    `;
-    const userResult = await this.db.query(userQuery, [userId]);
-
-    if (userResult.rows.length === 0) {
-      throw createError(ERROR_CODES.NOT_FOUND, "User not found", {
-        error: "User not found",
+  issueAddressProof = async (req: Request, res: Response) => {
+    try {
+      const userId = req.jwtUser?.userId;
+      if (!userId) {
+        throw createError(ERROR_CODES.UNAUTHORIZED, "User not authenticated");
+      }
+      const result = await this.zkProofService.issueAddressProof(userId, req.body);
+      res.status(201).json({
+        status: "success",
+        data: result,
+      });
+    } catch (error) {
+      logger.error("Error in issueAddressProof", { error: (error as Error).message });
+      const statusCode = (error as any).statusCode || 500;
+      res.status(statusCode).json({
+        status: "error",
+        message: (error as Error).message,
+        code: (error as any).code || ERROR_CODES.INTERNAL_ERROR,
       });
     }
+  };
 
-    const currentKYCLevel = userResult.rows[0].kyc_level as KYCLevel;
-    const transactionLimits =
-      this.kycService.getTransactionLimits(currentKYCLevel);
+  verifyAddressProof = async (req: Request, res: Response) => {
+    try {
+      const validated = VerifyAddressProofSchema.parse(req.body);
+      const userId = (req as any).user?.id || (req.body as any).userId || "";
+      const result = await this.zkProofService.verifyAddressProof(userId, validated);
+      res.status(200).json({
+        status: "success",
+        data: result,
+      });
+    } catch (error) {
+      logger.error("Error in verifyAddressProof", { error: (error as Error).message });
+      const statusCode = (error as any).statusCode || 500;
+      res.status(statusCode).json({
+        status: "error",
+        message: (error as Error).message,
+        code: (error as any).code || ERROR_CODES.INTERNAL_ERROR,
+      });
+    }
+  };
 
-    // Get latest KYC applicant data if exists
-    const applicantQuery = `
-      SELECT applicant_id, verification_status, kyc_level, updated_at
-      FROM kyc_applicants 
-      WHERE user_id = $1 
-      ORDER BY updated_at DESC 
-      LIMIT 1
-    `;
-    const applicantResult = await this.db.query(applicantQuery, [userId]);
-
-    res.json({
-      success: true,
-      data: {
-        current_kyc_level: currentKYCLevel,
-        transaction_limits: transactionLimits,
-        latest_verification: applicantResult.rows[0] || null,
-      },
-    });
-  } catch (error) {
-    console.error("Get user KYC status error:", error);
-    throw createError(ERROR_CODES.INTERNAL_ERROR, "Failed to get KYC status", {
-      message: error instanceof Error ? error.message : "Unknown error",
-    });
-  }
-};
-
-  /**
-   * Handle webhook events from KYC provider
-   * POST /api/kyc/webhooks
-   */
   handleWebhook = async (req: Request, res: Response) => {
     try {
-      const webhookSecret = process.env.KYC_WEBHOOK_SECRET;
-
-      // Verify webhook signature if secret is configured
-      if (webhookSecret && req.headers["x-onfido-signature"]) {
-        const signature = req.headers["x-onfido-signature"] as string;
-        const isValid = this.verifyWebhookSignature(
-          JSON.stringify(req.body),
-          signature,
-          webhookSecret
+      const event = req.body as WebhookEvent;
+      if (!event?.payload?.action || !event?.payload?.object) {
+        throw createError(
+          ERROR_CODES.INVALID_INPUT,
+          "Invalid KYC webhook payload",
+          { error: "Invalid KYC webhook payload" },
         );
-        
-        if (!isValid) {
-          logger.warn(
-            { signature, headers: req.headers },
-            'Invalid webhook signature'
-          );
-          throw createError(
-            ERROR_CODES.UNAUTHORIZED,
-            "Invalid webhook signature"
-          );
-        }
       }
 
-      const event = req.body;
       await this.kycService.handleWebhook(event);
-
-      res.status(200).json({ success: true });
+      res.status(200).json({ status: "success" });
     } catch (error) {
-      logger.error({ error }, 'Handle webhook error');
-      throw createError(ERROR_CODES.INTERNAL_ERROR, "Failed to handle webhook", {
-        message: error instanceof Error ? error.message : "Unknown error",
+      logger.error("Error in handleWebhook", {
+        error: (error as Error).message,
+      });
+      const statusCode = (error as any).statusCode || 500;
+      res.status(statusCode).json({
+        status: "error",
+        message: (error as Error).message,
+        code: (error as any).code || ERROR_CODES.INTERNAL_ERROR,
       });
     }
   };
 
-  /**
-   * Verify webhook signature using HMAC-SHA256
-   * @param payload - The raw request body as a string
-   * @param signature - The signature from x-onfido-signature header
-   * @param secret - The webhook secret
-   * @returns true if signature is valid, false otherwise
-   */
-  private verifyWebhookSignature(
-    payload: string,
-    signature: string,
-    secret: string
-  ): boolean {
+  getApplicant = async (req: Request, res: Response) => {
+    return this.getVerificationStatus(req, res);
+  };
+
+  getUserKYCStatus = async (req: Request, res: Response) => {
+    return this.getVerificationStatus(req, res);
+  };
+
+  issueZkCredential = async (req: Request, res: Response) => {
+    return this.issueAddressProof(req, res);
+  };
+
+  verifyZkProof = async (req: Request, res: Response) => {
+    return this.verifyAddressProof(req, res);
+  };
+
+  private async storeApplicantReference(userId: string, applicantId: string): Promise<void> {
     try {
-      const crypto = require('crypto');
-      const expectedSignature = crypto
-        .createHmac('sha256', secret)
-        .update(payload)
-        .digest('hex');
-      
-      // Use timing-safe comparison to prevent timing attacks
-      return crypto.timingSafeEqual(
-        Buffer.from(signature),
-        Buffer.from(expectedSignature)
+      await this.db.query(
+        "UPDATE users SET kyc_applicant_id = $1, updated_at = NOW() WHERE id = $2",
+        [applicantId, userId]
       );
-    } catch (error) {
-      logger.error({ error }, 'Error verifying webhook signature');
-      return false;
-    }
-  }
-
-  // Private helper methods
-
-  private async storeApplicantReference(
-    userId: string,
-    applicantId: string,
-  ): Promise<void> {
-    try {
-      const query = `
-        INSERT INTO kyc_applicants (user_id, applicant_id, provider, verification_status, kyc_level)
-        VALUES ($1, $2, 'entrust', 'pending', 'none')
-      `;
-
-      await this.db.query(query, [userId, applicantId]);
-    } catch (error) {
-      console.error("Failed to store applicant reference:", error);
-      throw error;
-    }
-  }
-
-  private async verifyApplicantAccess(
-    userId: string,
-    applicantId: string,
-  ): Promise<boolean> {
-    try {
-      const query = `
-        SELECT 1 FROM kyc_applicants 
-        WHERE user_id = $1 AND applicant_id = $2
-        LIMIT 1
-      `;
-
-      const result = await this.db.query(query, [userId, applicantId]);
-      return result.rows.length > 0;
-    } catch (error) {
-      console.error("Failed to verify applicant access:", error);
-      return false;
+    } catch (err) {
+      logger.warn("Failed to store applicant reference on user record", {
+        error: (err as Error).message,
+      });
     }
   }
 }
-
-export default KYCController;

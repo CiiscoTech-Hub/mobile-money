@@ -1,3 +1,4 @@
+import logger from "../utils/logger";
 import { Request, Response, NextFunction } from "express";
 import { z } from "zod";
 import { resolveToBaseAddress } from "../stellar/muxed";
@@ -10,7 +11,7 @@ function validateStellarAddress(address: string): boolean {
   if (!address || typeof address !== "string") {
     return false;
   }
-  
+
   try {
     resolveToBaseAddress(address);
     return true;
@@ -27,9 +28,10 @@ const transactionSchema = z.object({
   provider: z.enum(["MTN", "AIRTEL", "ORANGE"], {
     message: "Provider must be one of: MTN, AIRTEL, ORANGE",
   }),
-  stellarAddress: z
-    .string()
-    .refine(validateStellarAddress, { message: "Invalid Stellar address format (must be valid G-address or M-address)" }),
+  stellarAddress: z.string().refine(validateStellarAddress, {
+    message:
+      "Invalid Stellar address format (must be valid G-address or M-address)",
+  }),
   userId: z.string().nonempty({ message: "userId is required" }),
 });
 
@@ -53,7 +55,7 @@ export const validateTransaction = (
     }
 
     // Fallback for non-Zod errors
-    console.error("Unexpected validation error:", err);
+    logger.error("Unexpected validation error:", err);
     return res.status(500).json({
       error: "An internal server error occurred during validation",
     });

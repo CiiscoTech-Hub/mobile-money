@@ -1,8 +1,10 @@
 generatorName: kotlin
 library: jvm-retrofit2
 packageName: com.mobilemoney.sdk
+invokerPackage: com.mobilemoney.sdk
 apiPackage: com.mobilemoney.sdk.api
 modelPackage: com.mobilemoney.sdk.models
+sourceFolder: src/main/kotlin
 artifactId: mobile-money-sdk
 artifactVersion: 1.0.0
 enumPropertyNaming: original
@@ -16,3 +18,6 @@ additionalProperties:
   useRxJava3: false
   useAndroidMavenGradlePlugin: true
   androidSupport: true
+  dynamicTokenMapping:
+    script: generate_token.sh
+    args: []

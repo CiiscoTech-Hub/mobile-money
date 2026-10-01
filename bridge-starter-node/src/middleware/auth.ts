@@ -1,6 +1,17 @@
 import { Request, Response, NextFunction } from "express";
 import crypto from "crypto";
 import { config } from "../config/env";
+import logger from "../logger";
+import { formatErrorResponse } from "../utils/errors";
+
+/**
+ * Verifies the HMAC-SHA256 signature on incoming webhook requests.
+ * Rejects requests whose x-bridge-signature header does not match the
+ * expected digest of the raw request body.
+ *
+ * Logs a structured warning on every rejected request so security teams
+ * can monitor for signature mismatches without parsing free-text messages.
+ */
 
 function getRawBody(req: Request): Buffer {
   // body parsers can attach a raw body buffer to the request (app.ts config).
@@ -27,12 +38,25 @@ export const verifyWebhookSignature = (
     req.headers["x-bridge-signature-256"]) as string | undefined;
 
   if (!signatureHeader) {
-    return res.status(401).json({ error: "Missing signature header" });
+    logger.warn(
+      { path: req.path, method: req.method },
+      "Webhook rejected: missing signature header",
+    );
+    return res
+      .status(401)
+      .json(
+        formatErrorResponse(401, "UNAUTHORIZED", "Missing signature header"),
+      );
   }
 
   if (!config.webhookSecret) {
-    console.error("WEBHOOK_SECRET not configured; rejecting webhook request");
-    return res.status(500).json({ error: "Server misconfigured" });
+    logger.error(
+      { path: req.path, method: req.method },
+      "WEBHOOK_SECRET not configured; rejecting webhook request",
+    );
+    return res
+      .status(500)
+      .json(formatErrorResponse(500, "INTERNAL_ERROR", "Server misconfigured"));
   }
 
   const raw = getRawBody(req);
@@ -42,7 +66,11 @@ export const verifyWebhookSignature = (
     .digest("hex");
 
   try {
-    const sigBuf = Buffer.from(signatureHeader, "utf8");
+    const rawSig = signatureHeader.startsWith("sha256=")
+      ? signatureHeader.substring(7)
+      : signatureHeader;
+
+    const sigBuf = Buffer.from(rawSig, "utf8");
     const expectedBuf = Buffer.from(expected, "utf8");
     if (
       sigBuf.length === expectedBuf.length &&
@@ -51,10 +79,20 @@ export const verifyWebhookSignature = (
       return next();
     }
   } catch (e) {
+    logger.error(
+      { path: req.path, method: req.method, err: e },
+      "Error during signature verification",
+    );
     // fall through to unauthorized below
   }
 
-  return res.status(401).json({ error: "Invalid signature" });
+  logger.warn(
+    { path: req.path, method: req.method },
+    "Webhook rejected: invalid signature",
+  );
+  return res
+    .status(401)
+    .json(formatErrorResponse(401, "UNAUTHORIZED", "Invalid signature"));
 };
 
 export default verifyWebhookSignature;

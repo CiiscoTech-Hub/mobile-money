@@ -12,6 +12,11 @@ describe("phoneUtils", () => {
       expect(result.valid).toBe(true);
     });
 
+    it("should return valid for a matching Kenya airtel number", () => {
+      const result = validatePhoneProviderMatch("+254730123456", "airtel");
+      expect(result.valid).toBe(true);
+    });
+
     it("should return valid for a matching orange number", () => {
       const result = validatePhoneProviderMatch("+237651234567", "orange");
       expect(result.valid).toBe(true);
@@ -37,6 +42,38 @@ describe("phoneUtils", () => {
       const result = validatePhoneProviderMatch("+256701234567", "mtn");
       expect(result.valid).toBe(false);
       expect(result.error).toContain("does not belong to the MTN network");
+    });
+
+    it("should return valid for a matching vodacom number", () => {
+      const result = validatePhoneProviderMatch("+255762000000", "vodacom");
+      expect(result.valid).toBe(true);
+    });
+
+    it("should return valid for a matching vodacom number with 0740 prefix", () => {
+      const result = validatePhoneProviderMatch("+255740000000", "vodacom");
+      expect(result.valid).toBe(true);
+    });
+
+    it("should return valid for a matching tigo number with 071 prefix", () => {
+      const result = validatePhoneProviderMatch("+255713000000", "tigo");
+      expect(result.valid).toBe(true);
+    });
+
+    it("should return valid for a matching tigo number with 075 prefix", () => {
+      const result = validatePhoneProviderMatch("+255752000000", "tigo");
+      expect(result.valid).toBe(true);
+    });
+
+    it("should return invalid for a vodacom number claimed as tigo", () => {
+      const result = validatePhoneProviderMatch("+255762000000", "tigo");
+      expect(result.valid).toBe(false);
+      expect(result.error).toContain("does not belong to the TIGO network");
+    });
+
+    it("should return invalid for a tigo number claimed as vodacom", () => {
+      const result = validatePhoneProviderMatch("+255713000000", "vodacom");
+      expect(result.valid).toBe(false);
+      expect(result.error).toContain("does not belong to the VODACOM network");
     });
   });
 });

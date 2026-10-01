@@ -24,17 +24,57 @@ export const httpRequestDurationSeconds = new Histogram({
   name: "http_request_duration_seconds",
   help: "Duration of HTTP requests in seconds",
   labelNames: ["method", "route", "status_code"],
-  buckets: [0.1, 0.3, 0.5, 0.7, 1, 3, 5, 7, 10], // standard buckets
+  buckets: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10], // standard latency buckets
+  registers: [register],
+});
+
+export const httpRequestDurationSummary = new Summary({
+  name: "http_request_duration_summary_seconds",
+  help: "Summary of HTTP request durations with p50, p95, and p99 percentiles",
+  labelNames: ["method", "route", "status_code"],
+  percentiles: [0.5, 0.95, 0.99],
   registers: [register],
 });
 
 // Business Logic Metrics
+export const transactionsTotal = new Counter({
+  name: "transactions_total",
+  help: "Total number of transactions processed",
+  labelNames: ["provider", "status", "currency"],
+  registers: [register],
+});
+
 export const transactionTotal = new Counter({
   name: "transaction_total",
   help: "Total number of transactions processed",
   labelNames: ["type", "provider", "status"], // type: payment/payout
   registers: [register],
 });
+
+export const activeTransactions = new Gauge({
+  name: "active_transactions",
+  help: "Current number of active transactions being processed",
+  labelNames: ["provider"],
+  registers: [register],
+});
+
+export interface RecordTransactionParams {
+  provider: string;
+  status: string;
+  currency: string;
+  count?: number;
+}
+
+export function recordTransactionMetrics({
+  provider,
+  status,
+  currency,
+  count = 1,
+}: RecordTransactionParams): void {
+  transactionsTotal.inc({ provider, status, currency }, count);
+  // Also keep backward-compatible transactionTotal updated
+  transactionTotal.inc({ type: "payment", provider, status }, count);
+}
 
 export const transactionErrorsTotal = new Counter({
   name: "transaction_errors_total",
@@ -217,3 +257,54 @@ export const systemHeartbeat = new Gauge({
   labelNames: ["service"],
   registers: [register],
 });
+
+// AML and KYC Metrics
+export const kycRequestsTotal = new Counter({
+  name: "kyc_requests_total",
+  help: "Total number of KYC and AML check requests",
+  labelNames: ["provider", "status"],
+  registers: [register],
+});
+
+// Database Connection Pool Health Metrics
+export const dbPoolActiveConnections = new Gauge({
+  name: "db_pool_active_connections",
+  help: "Number of active connections checked out from the database pool",
+  labelNames: ["pool"],
+  registers: [register],
+});
+
+export const dbPoolIdleConnections = new Gauge({
+  name: "db_pool_idle_connections",
+  help: "Number of idle connections available in the database pool",
+  labelNames: ["pool"],
+  registers: [register],
+});
+
+export const dbPoolWaitingClients = new Gauge({
+  name: "db_pool_waiting_clients",
+  help: "Number of clients waiting for a database pool connection",
+  labelNames: ["pool"],
+  registers: [register],
+});
+
+export interface PoolMetricsSource {
+  totalCount?: number;
+  idleCount?: number;
+  waitingCount?: number;
+}
+
+export function emitPoolMetrics(
+  poolInstance?: PoolMetricsSource | null,
+  poolName = "primary",
+): void {
+  if (!poolInstance) return;
+  const total = poolInstance.totalCount ?? 0;
+  const idle = poolInstance.idleCount ?? 0;
+  const waiting = poolInstance.waitingCount ?? 0;
+  const active = Math.max(0, total - idle);
+
+  dbPoolActiveConnections.labels(poolName).set(active);
+  dbPoolIdleConnections.labels(poolName).set(idle);
+  dbPoolWaitingClients.labels(poolName).set(waiting);
+}

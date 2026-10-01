@@ -1,3 +1,4 @@
+import logger from "../utils/logger";
 import { NextFunction, Request, Response } from "express";
 import { extractFingerprint, hashString } from "../middleware/fingerprint";
 
@@ -211,15 +212,13 @@ export function sessionAnomalyLogger(
 
       req.session.destroy((err) => {
         if (err) {
-          console.error("Failed to destroy hijacked session:", err);
+          logger.error("Failed to destroy hijacked session:", err);
         }
       });
-      res
-        .status(401)
-        .json({
-          error:
-            "Session invalidated due to suspicious activity. Please log in again.",
-        });
+      res.status(401).json({
+        error:
+          "Session invalidated due to suspicious activity. Please log in again.",
+      });
       return;
     }
   }

@@ -21,13 +21,15 @@ beforeEach(() => {
   // Sensible defaults for all tests
   process.env.STELLAR_NETWORK = "testnet";
   process.env.STELLAR_ASSET_CODE = "USDC";
-  process.env.STELLAR_ASSET_ISSUER = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
+  process.env.STELLAR_ASSET_ISSUER =
+    "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
   process.env.STELLAR_WEB_AUTH_DOMAIN = "mobilemoney.com";
   delete process.env.STELLAR_FEDERATION_SERVER_URL;
   delete process.env.STELLAR_FEDERATION_SERVER;
   delete process.env.STELLAR_SIGNING_KEY;
   delete process.env.STELLAR_EXTRA_ASSETS;
   delete process.env.ORG_NAME;
+  delete process.env.ANCHOR_QUOTES_URL;
 
   assetModel.findAll = jest.fn().mockResolvedValue([]);
 });
@@ -89,7 +91,8 @@ describe("GET /.well-known/stellar.toml", () => {
     const before = await request(app).get("/.well-known/stellar.toml");
 
     // Change config between requests
-    process.env.STELLAR_SIGNING_KEY = "GABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890ABCDEFGHIJKLMNOPQRS";
+    process.env.STELLAR_SIGNING_KEY =
+      "GABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890ABCDEFGHIJKLMNOPQRS";
 
     const after = await request(app).get("/.well-known/stellar.toml");
 
@@ -141,6 +144,21 @@ describe("generateToml()", () => {
       expect(toml).toMatch(/DIRECT_PAYMENT_SERVER=/);
     });
 
+    it("includes ANCHOR_QUOTES_SERVER line with a default fallback", async () => {
+      delete process.env.ANCHOR_QUOTES_URL;
+      const toml = await generateToml();
+      expect(toml).toMatch(/ANCHOR_QUOTES_SERVER=/);
+      expect(toml).toContain("/sep38");
+    });
+
+    it("uses ANCHOR_QUOTES_URL env var when set", async () => {
+      process.env.ANCHOR_QUOTES_URL = "https://quotes.example.com/sep38";
+      const toml = await generateToml();
+      expect(toml).toContain(
+        'ANCHOR_QUOTES_SERVER="https://quotes.example.com/sep38"',
+      );
+    });
+
     it("includes SIGNING_KEY when set", async () => {
       process.env.STELLAR_SIGNING_KEY = "GABCDEFG";
       const toml = await generateToml();
@@ -159,7 +177,9 @@ describe("generateToml()", () => {
   describe("CURRENCIES section", () => {
     it("always includes native XLM entry", async () => {
       const toml = await generateToml();
-      const xlmSection = toml.split("[[CURRENCIES]]").find((s) => s.includes('code="XLM"'));
+      const xlmSection = toml
+        .split("[[CURRENCIES]]")
+        .find((s) => s.includes('code="XLM"'));
       expect(xlmSection).toBeDefined();
     });
 
@@ -173,14 +193,18 @@ describe("generateToml()", () => {
       process.env.STELLAR_NETWORK = "testnet";
       const toml = await generateToml();
       // The USDC entry should have status="test"
-      const usdcSection = toml.split("[[CURRENCIES]]").find((s) => s.includes('code="USDC"'));
+      const usdcSection = toml
+        .split("[[CURRENCIES]]")
+        .find((s) => s.includes('code="USDC"'));
       expect(usdcSection).toContain('status="test"');
     });
 
     it("marks asset as 'live' on mainnet", async () => {
       process.env.STELLAR_NETWORK = "mainnet";
       const toml = await generateToml();
-      const usdcSection = toml.split("[[CURRENCIES]]").find((s) => s.includes('code="USDC"'));
+      const usdcSection = toml
+        .split("[[CURRENCIES]]")
+        .find((s) => s.includes('code="USDC"'));
       expect(usdcSection).toContain('status="live"');
     });
 
@@ -197,9 +221,11 @@ describe("generateToml()", () => {
       const mockAsset = {
         id: "asset-1",
         assetCode: "EURC",
-        issuerPublicKey: "GABCDE12345ABCDE12345ABCDE12345ABCDE12345ABCDE12345ABCDE12345",
+        issuerPublicKey:
+          "GABCDE12345ABCDE12345ABCDE12345ABCDE12345ABCDE12345ABCDE12345",
         issuerSecretKey: "SSECRET",
-        distributionPublicKey: "GDISP12345DISP12345DISP12345DISP12345DISP12345DISP12345DISP",
+        distributionPublicKey:
+          "GDISP12345DISP12345DISP12345DISP12345DISP12345DISP12345DISP",
         distributionSecretKey: "DSECRET",
         issuanceLimit: "1000000",
         status: "active",
@@ -218,10 +244,12 @@ describe("generateToml()", () => {
       const toml = await generateToml();
 
       expect(toml).toContain('code="EURC"');
-      expect(toml).toContain('issuer="GABCDE12345ABCDE12345ABCDE12345ABCDE12345ABCDE12345ABCDE12345"');
+      expect(toml).toContain(
+        'issuer="GABCDE12345ABCDE12345ABCDE12345ABCDE12345ABCDE12345ABCDE12345"',
+      );
       expect(toml).toContain('status="test"');
       expect(toml).toContain('desc="Euro Coin"');
-      expect(toml).toContain('display_decimals=2');
+      expect(toml).toContain("display_decimals=2");
       expect(toml).toContain('anchor_asset_type="fiat"');
       expect(toml).toContain('anchor_asset="EUR"');
     });
@@ -275,14 +303,18 @@ describe("generateToml()", () => {
       // Every key=value line (excluding headers and booleans/numbers) should use quotes
       const keyValueLines = toml
         .split("\n")
-        .filter((l) => l.includes("=") && !l.startsWith("#") && !l.startsWith("["));
+        .filter(
+          (l) => l.includes("=") && !l.startsWith("#") && !l.startsWith("["),
+        );
 
       for (const line of keyValueLines) {
         const [, val] = line.split(/=(.*)/s);
         // Values that are NOT quoted must be boolean or numeric
         if (val && !val.trim().startsWith('"')) {
           const trimmed = val.trim();
-          expect(["true", "false"].includes(trimmed) || !isNaN(Number(trimmed))).toBe(true);
+          expect(
+            ["true", "false"].includes(trimmed) || !isNaN(Number(trimmed)),
+          ).toBe(true);
         }
       }
     });

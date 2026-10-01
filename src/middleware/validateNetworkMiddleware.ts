@@ -1,5 +1,9 @@
+import logger from "../utils/logger";
 import { Request, Response, NextFunction } from "express";
-import { NETWORK_PREFIXES, type MobileNetworkName } from "../constants/networkPrefixes";
+import {
+  NETWORK_PREFIXES,
+  type MobileNetworkName,
+} from "../constants/networkPrefixes";
 
 const LOCAL_PREFIX_CACHE = Object.entries(NETWORK_PREFIXES).reduce(
   (current, [prefix, network]) => {
@@ -11,8 +15,12 @@ const LOCAL_PREFIX_CACHE = Object.entries(NETWORK_PREFIXES).reduce(
   {} as Record<string, MobileNetworkName>,
 );
 
-const sortedNetworkKeys = Object.keys(NETWORK_PREFIXES).sort((a, b) => b.length - a.length);
-const sortedLocalKeys = Object.keys(LOCAL_PREFIX_CACHE).sort((a, b) => b.length - a.length);
+const sortedNetworkKeys = Object.keys(NETWORK_PREFIXES).sort(
+  (a, b) => b.length - a.length,
+);
+const sortedLocalKeys = Object.keys(LOCAL_PREFIX_CACHE).sort(
+  (a, b) => b.length - a.length,
+);
 
 function normalizePhoneNumber(rawPhone: string): string {
   let digits = rawPhone.trim().replace(/\D/g, "");
@@ -28,7 +36,9 @@ function normalizePhoneNumber(rawPhone: string): string {
   return digits;
 }
 
-function resolveNetworkForDigits(phoneDigits: string): MobileNetworkName | null {
+function resolveNetworkForDigits(
+  phoneDigits: string,
+): MobileNetworkName | null {
   for (const prefix of sortedNetworkKeys) {
     if (phoneDigits.startsWith(prefix)) {
       return NETWORK_PREFIXES[prefix];
@@ -61,8 +71,8 @@ export const validateNetworkMiddleware = (
       typeof req.body.destinationPhone === "string"
         ? req.body.destinationPhone
         : typeof req.body.phoneNumber === "string"
-        ? req.body.phoneNumber
-        : undefined;
+          ? req.body.phoneNumber
+          : undefined;
 
     if (!rawPhone) {
       return res.status(400).json({
@@ -97,7 +107,7 @@ export const validateNetworkMiddleware = (
           {
             path: "destinationPhone or phoneNumber",
             message:
-              "Unsupported destination network prefix. Supported networks are MTN, AIRTEL, and ORANGE.",
+              "Unsupported destination network prefix. Supported networks are MTN, AIRTEL, ORANGE, VODACOM, and TIGO.",
           },
         ],
       });
@@ -106,7 +116,7 @@ export const validateNetworkMiddleware = (
     (req.body as any).resolvedNetwork = resolvedNetwork;
     next();
   } catch (error) {
-    console.error("Error in validateNetworkMiddleware:", error);
+    logger.error("Error in validateNetworkMiddleware:", error);
     return res.status(500).json({
       error: "An internal server error occurred during network validation",
     });

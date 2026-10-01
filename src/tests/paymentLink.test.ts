@@ -7,7 +7,7 @@ import {
   jest,
 } from "@jest/globals";
 import request from "supertest";
-import { Keypair } from "stellar-sdk";
+import { Keypair } from "@stellar/stellar-sdk";
 
 // Initialize valid Stellar keys in environment BEFORE loading the app to satisfy startup config checks
 const randomKeypair = Keypair.random();
@@ -77,15 +77,6 @@ jest.mock("../middleware/auth", () => ({
   },
 }));
 
-// Mock spdy to prevent http_parser legacy import issue inside modern Node.js environments
-jest.mock("spdy", () => ({
-  createServer: jest.fn<any>().mockReturnValue({
-    listen: jest.fn<any>((port: any, cb: any) => {
-      if (cb) cb();
-    }),
-  }),
-}));
-
 // Mock MobileMoneyService to avoid loading legacy JS files during tests
 jest.mock("../services/mobilemoney/mobileMoneyService", () => ({
   MobileMoneyService: jest.fn<any>().mockImplementation(() => ({
@@ -132,6 +123,15 @@ jest.mock("../graphql/redisPubSub", () => ({
 // Mock apollo server to avoid database/redis integration starts
 jest.mock("../graphql/server", () => ({
   startApolloServer: jest.fn<any>().mockResolvedValue(undefined),
+}));
+
+// Mock disputeStateMachine to prevent the background SLA check worker from running during tests
+jest.mock("../services/disputeStateMachine", () => ({
+  DisputeStateMachine: jest.fn().mockImplementation(() => ({
+    isValidTransition: jest.fn().mockReturnValue(true),
+  })),
+  checkSlaDeadlines: jest.fn().mockResolvedValue(undefined),
+  startSlaCheckWorker: jest.fn(),
 }));
 
 // Mock bullmq to avoid queue listener initialization during tests

@@ -1,3 +1,4 @@
+import logger from "../utils/logger";
 import { pool, queryRead, queryWrite } from "../config/database";
 
 export interface RefreshTokenFamily {
@@ -11,6 +12,17 @@ export interface RefreshTokenFamily {
   revoked_at?: Date;
 }
 
+export interface RefreshTokenFamilyRow {
+  id: string;
+  user_id: string;
+  family_id: string;
+  token: string;
+  parent_token?: string | null;
+  is_revoked: boolean;
+  created_at: Date | string;
+  revoked_at?: Date | string | null;
+}
+
 export class RefreshTokenFamilyModel {
   async create({
     user_id,
@@ -22,31 +34,36 @@ export class RefreshTokenFamilyModel {
     family_id: string;
     token: string;
     parent_token?: string;
-  }) {
-    const result = await queryWrite(
+  }): Promise<RefreshTokenFamily> {
+    const result = await queryWrite<RefreshTokenFamilyRow>(
       `INSERT INTO refresh_token_families (user_id, family_id, token, parent_token) VALUES ($1, $2, $3, $4) RETURNING *`,
       [user_id, family_id, token, parent_token || null],
     );
-    return result.rows[0];
+    return mapRefreshTokenFamilyRow(result.rows[0]);
   }
 
-  async findAllActive(userId: string, familyId: string) {
-    const result = await pool.query(
+  async findAllActive(
+    userId: string,
+    familyId: string,
+  ): Promise<RefreshTokenFamily[]> {
+    const result = await pool.query<RefreshTokenFamilyRow>(
       `SELECT * FROM refresh_token_families
        WHERE user_id = $1 AND family_id = $2 AND is_revoked = FALSE
        ORDER BY created_at DESC`,
       [userId, familyId],
     );
 
-    return result.rows;
+    return result.rows.map(mapRefreshTokenFamilyRow);
   }
 
-  async findByToken(token: string) {
-    const result = await queryRead(
+  async findByToken(token: string): Promise<RefreshTokenFamily | null> {
+    const result = await queryRead<RefreshTokenFamilyRow>(
       `SELECT * FROM refresh_token_families WHERE token = $1`,
       [token],
     );
-    return result.rows[0];
+    return result.rows.length > 0
+      ? mapRefreshTokenFamilyRow(result.rows[0])
+      : null;
   }
 
   async revokeFamily(familyId: string, userId: string, tokenId: string) {
@@ -84,7 +101,7 @@ export class RefreshTokenFamilyModel {
       };
     } catch (err: any) {
       await client.query("ROLLBACK");
-      console.error(err);
+      logger.error(err);
 
       throw err;
     } finally {
@@ -126,7 +143,7 @@ export class RefreshTokenFamilyModel {
     }
   }
 
-  async revokeAll(userId: string, familyId:string) {
+  async revokeAll(userId: string, familyId: string) {
     const client = await pool.connect();
 
     try {
@@ -149,7 +166,7 @@ export class RefreshTokenFamilyModel {
       };
     } catch (err: any) {
       await client.query("ROLLBACK");
-      console.error("Error revoking all tokens:", err);
+      logger.error("Error revoking all tokens:", err);
 
       throw err.message;
     } finally {
@@ -157,11 +174,26 @@ export class RefreshTokenFamilyModel {
     }
   }
 
-  async isRevoked(token: string) {
-    const result = await queryRead(
+  async isRevoked(token: string): Promise<boolean> {
+    const result = await queryRead<{ is_revoked: boolean }>(
       `SELECT is_revoked FROM refresh_token_families WHERE token = $1`,
       [token],
     );
     return result.rows[0]?.is_revoked || false;
   }
+}
+
+function mapRefreshTokenFamilyRow(
+  row: RefreshTokenFamilyRow,
+): RefreshTokenFamily {
+  return {
+    id: row.id,
+    user_id: row.user_id,
+    family_id: row.family_id,
+    token: row.token,
+    parent_token: row.parent_token ?? undefined,
+    is_revoked: row.is_revoked,
+    created_at: new Date(row.created_at),
+    revoked_at: row.revoked_at ? new Date(row.revoked_at) : undefined,
+  };
 }

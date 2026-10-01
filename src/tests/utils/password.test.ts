@@ -5,12 +5,13 @@ import { registerSchema } from "../../routes/auth";
 const makePass = (parts: string[]) => parts.join("");
 
 describe("Password utils", () => {
-  it("should hash a password and compare correctly", async () => {
+  it("should hash a password with minimum 12 rounds and compare correctly", async () => {
     const password = makePass(["Test", "123", "!"]);
     const hash = await hashPassword(password);
 
     expect(typeof hash).toBe("string");
     expect(hash).not.toBe(password);
+    expect(hash).toMatch(/^\$2[aby]\$12\$/);
 
     const valid = await comparePassword(password, hash);
     expect(valid).toBe(true);
@@ -29,31 +30,46 @@ describe("registerSchema password complexity", () => {
   });
 
   it("rejects passwords shorter than 12 characters", () => {
-    const result = registerSchema.safeParse({ ...valid, password: makePass(["Short", "1", "!"]) });
+    const result = registerSchema.safeParse({
+      ...valid,
+      password: makePass(["Short", "1", "!"]),
+    });
     expect(result.success).toBe(false);
     expect(JSON.stringify(result)).toMatch(/12 characters/);
   });
 
   it("rejects passwords without an uppercase letter", () => {
-    const result = registerSchema.safeParse({ ...valid, password: makePass(["nouppercase", "1", "!"]) });
+    const result = registerSchema.safeParse({
+      ...valid,
+      password: makePass(["nouppercase", "1", "!"]),
+    });
     expect(result.success).toBe(false);
     expect(JSON.stringify(result)).toMatch(/uppercase/);
   });
 
   it("rejects passwords without a lowercase letter", () => {
-    const result = registerSchema.safeParse({ ...valid, password: makePass(["NOLOWERCASE", "1", "!"]) });
+    const result = registerSchema.safeParse({
+      ...valid,
+      password: makePass(["NOLOWERCASE", "1", "!"]),
+    });
     expect(result.success).toBe(false);
     expect(JSON.stringify(result)).toMatch(/lowercase/);
   });
 
   it("rejects passwords without a number", () => {
-    const result = registerSchema.safeParse({ ...valid, password: makePass(["NoNumber", "!", "@", "abc"]) });
+    const result = registerSchema.safeParse({
+      ...valid,
+      password: makePass(["NoNumber", "!", "@", "abc"]),
+    });
     expect(result.success).toBe(false);
     expect(JSON.stringify(result)).toMatch(/number/);
   });
 
   it("rejects passwords without a special character", () => {
-    const result = registerSchema.safeParse({ ...valid, password: makePass(["NoSpecialChar", "1"]) });
+    const result = registerSchema.safeParse({
+      ...valid,
+      password: makePass(["NoSpecialChar", "1"]),
+    });
     expect(result.success).toBe(false);
     expect(JSON.stringify(result)).toMatch(/special character/);
   });

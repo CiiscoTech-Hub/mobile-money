@@ -2,6 +2,7 @@
   "title": "Mobile Money API",
   "items": [
     { "to": "/", "label": "Vue d'ensemble" },
+    { "type": "docSidebar", "sidebarId": "docsSidebar", "label": "Guides" },
     { "to": "/api", "label": "Référence" },
     { "href": "https://github.com/sublime247/mobile-money", "label": "GitHub" }
   ]

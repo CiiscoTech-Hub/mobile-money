@@ -1,3 +1,4 @@
+import logger from "../utils/logger";
 import { Request, Response, RequestHandler } from "express";
 
 /**
@@ -5,14 +6,12 @@ import { Request, Response, RequestHandler } from "express";
  * Supports multiple API versions with backward compatibility
  */
 
-export const setApiVersion = (version: string): RequestHandler => (
-  req,
-  _res,
-  next,
-) => {
-  (req as VersionedRequest).apiVersion = version;
-  next();
-};
+export const setApiVersion =
+  (version: string): RequestHandler =>
+  (req, _res, next) => {
+    (req as VersionedRequest).apiVersion = version;
+    next();
+  };
 
 export interface VersionedRequest extends Request {
   apiVersion?: string;
@@ -82,7 +81,7 @@ export const apiVersionMiddleware: RequestHandler = (req, res, next) => {
 
     next();
   } catch (error) {
-    console.error("Error in apiVersionMiddleware:", error);
+    logger.error("Error in apiVersionMiddleware:", error);
     next(error);
   }
 };
@@ -95,11 +94,12 @@ export const validateVersionMiddleware: RequestHandler = (req, res, next) => {
   const apiVersion = versionedReq.apiVersion || CURRENT_VERSION;
 
   if (!SUPPORTED_VERSIONS.includes(apiVersion)) {
-    return res.status(400).json({
+    res.status(400).json({
       error: "Unsupported API Version",
       message: `API version ${apiVersion} is not supported. Supported versions: ${SUPPORTED_VERSIONS.join(", ")}`,
       supportedVersions: SUPPORTED_VERSIONS,
     });
+    return;
   }
 
   // Check if version is deprecated

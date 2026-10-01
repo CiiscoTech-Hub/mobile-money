@@ -14,15 +14,15 @@ jest.mock("../../utils/metrics", () => ({
 }));
 
 // Replace the real Horizon.Server with controllable fakes keyed by URL.
-jest.mock("stellar-sdk", () => {
-  const actual = jest.requireActual("stellar-sdk");
+jest.mock("@stellar/stellar-sdk", () => {
+  const actual = jest.requireActual("@stellar/stellar-sdk");
   return {
     ...actual,
     Horizon: { ...actual.Horizon, Server: jest.fn() },
   };
 });
 
-import * as StellarSdk from "stellar-sdk";
+import * as StellarSdk from "@stellar/stellar-sdk";
 import { HorizonPool, isFailoverEligible } from "../horizonPool";
 import {
   horizonNodeFailuresTotal,
@@ -179,9 +179,7 @@ describe("HorizonPool", () => {
     servers[URLS[0]].transactions.mockReturnValue(
       makeChain(undefined, serverError()),
     );
-    servers[URLS[1]].transactions.mockReturnValue(
-      makeChain({ records: [] }),
-    );
+    servers[URLS[1]].transactions.mockReturnValue(makeChain({ records: [] }));
 
     const proxy = pool.getProxiedServer();
     const res = await proxy

@@ -1,3 +1,4 @@
+import logger from "../utils/logger";
 import { Router, Request, Response, NextFunction } from "express";
 import multer, { MulterError } from "multer";
 import { Readable } from "stream";
@@ -65,7 +66,10 @@ function validateRow(row: CsvRow, index: number): ValidationError[] {
   }
 
   // Validate phone number (required)
-  if (!row.phone_number || !PHONE_REGEX.test(row.phone_number.replace(/[\s\-()]/g, ""))) {
+  if (
+    !row.phone_number ||
+    !PHONE_REGEX.test(row.phone_number.replace(/[\s\-()]/g, ""))
+  ) {
     errors.push({
       row: rowNum,
       field: "phone_number",
@@ -78,7 +82,8 @@ function validateRow(row: CsvRow, index: number): ValidationError[] {
     errors.push({
       row: rowNum,
       field: "country",
-      message: "Country must be a valid ISO 3166-1 alpha-2 code (e.g., US, CM, GB)",
+      message:
+        "Country must be a valid ISO 3166-1 alpha-2 code (e.g., US, CM, GB)",
     });
   }
 
@@ -111,7 +116,7 @@ function parseCsv(buffer: Buffer): Promise<CsvRow[]> {
         csvParser({
           mapHeaders: ({ header }) => header.trim(),
           mapValues: ({ value }) => value.trim(),
-        })
+        }),
       )
       .on("data", (row: CsvRow) => rows.push(row))
       .on("end", () => resolve(rows))
@@ -202,13 +207,13 @@ merchantRoutes.post(
         },
       });
     } catch (error) {
-      console.error("[Merchants] Error creating merchant:", error);
+      logger.error("[Merchants] Error creating merchant:", error);
       res.status(400).json({
         error: "Failed to create merchant",
         message: error instanceof Error ? error.message : "Unknown error",
       });
     }
-  }
+  },
 );
 
 // POST /api/merchants/bulk - Bulk import merchants via CSV
@@ -222,7 +227,8 @@ merchantRoutes.post(
       if (!req.file) {
         return res.status(400).json({
           error: "No file uploaded",
-          message: 'Send a CSV file using multipart/form-data with field name "file"',
+          message:
+            'Send a CSV file using multipart/form-data with field name "file"',
         });
       }
 
@@ -266,17 +272,20 @@ merchantRoutes.post(
       const createdBy = authReq.user?.id as string;
 
       // Submit for bulk processing
-      const result = await merchantService.bulkCreateMerchants(inputs, createdBy);
+      const result = await merchantService.bulkCreateMerchants(
+        inputs,
+        createdBy,
+      );
 
       res.status(202).json(result);
     } catch (error) {
-      console.error("[Merchants] Error in bulk import:", error);
+      logger.error("[Merchants] Error in bulk import:", error);
       res.status(500).json({
         error: "Bulk import failed",
         message: error instanceof Error ? error.message : "Unknown error",
       });
     }
-  }
+  },
 );
 
 // GET /api/merchants/bulk/:jobId - Get bulk import job status
@@ -297,13 +306,13 @@ merchantRoutes.get(
 
       res.json(status);
     } catch (error) {
-      console.error("[Merchants] Error fetching job status:", error);
+      logger.error("[Merchants] Error fetching job status:", error);
       res.status(500).json({
         error: "Failed to fetch job status",
         message: error instanceof Error ? error.message : "Unknown error",
       });
     }
-  }
+  },
 );
 
 // GET /api/merchants - List merchants
@@ -327,13 +336,13 @@ merchantRoutes.get(
 
       res.json(result);
     } catch (error) {
-      console.error("[Merchants] Error listing merchants:", error);
+      logger.error("[Merchants] Error listing merchants:", error);
       res.status(500).json({
         error: "Failed to list merchants",
         message: error instanceof Error ? error.message : "Unknown error",
       });
     }
-  }
+  },
 );
 
 // GET /api/merchants/:id - Get merchant by ID
@@ -354,13 +363,13 @@ merchantRoutes.get(
 
       res.json(merchant);
     } catch (error) {
-      console.error("[Merchants] Error fetching merchant:", error);
+      logger.error("[Merchants] Error fetching merchant:", error);
       res.status(500).json({
         error: "Failed to fetch merchant",
         message: error instanceof Error ? error.message : "Unknown error",
       });
     }
-  }
+  },
 );
 
 // POST /api/merchants/invite/:token/accept - Accept merchant invitation
@@ -387,13 +396,13 @@ merchantRoutes.post(
         },
       });
     } catch (error) {
-      console.error("[Merchants] Error accepting invitation:", error);
+      logger.error("[Merchants] Error accepting invitation:", error);
       res.status(500).json({
         error: "Failed to accept invitation",
         message: error instanceof Error ? error.message : "Unknown error",
       });
     }
-  }
+  },
 );
 
 // Error handler for multer errors
@@ -414,5 +423,5 @@ merchantRoutes.use(
     }
 
     res.status(500).json({ error: "Internal server error" });
-  }
+  },
 );

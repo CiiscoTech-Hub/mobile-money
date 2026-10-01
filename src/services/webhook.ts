@@ -1,17 +1,20 @@
 import { createHmac } from "crypto";
-import { webhookPayloadSchema, flatWebhookPayloadSchema } from "./webhookSchema";
+import {
+  webhookPayloadSchema,
+  flatWebhookPayloadSchema,
+} from "./webhookSchema";
 import { gzip } from "zlib";
 import { promisify } from "util";
 import { Transaction, WebhookDeliveryUpdate } from "../models/transaction";
+import { enqueueWebhookRetry } from "../queue/webhookRetryQueue";
+import { signWebhookPayload } from "../crypto/webhookSigning";
+import { validateWebhookUrl } from "../security/ssrf";
 
 const gzipAsync = promisify(gzip);
 
 export type WebhookEvent = "transaction.completed" | "transaction.failed";
 export type WebhookDeliveryStatus =
-  | "pending"
-  | "delivered"
-  | "failed"
-  | "skipped";
+  "pending" | "delivered" | "failed" | "skipped";
 
 export interface WebhookPayload {
   event: WebhookEvent;
@@ -20,10 +23,7 @@ export interface WebhookPayload {
 }
 
 export type WebhookOutboxStatus =
-  | "pending"
-  | "processing"
-  | "delivered"
-  | "failed";
+  "pending" | "processing" | "delivered" | "failed";
 
 export interface WebhookOutboxEntry {
   id: string;
@@ -84,11 +84,25 @@ interface WebhookServiceOptions {
   webhookSecret?: string;
   maxAttempts?: number;
   baseDelayMs?: number;
+  /**
+   * Per-request timeout for outbound webhook deliveries, in milliseconds.
+   * Applied via AbortController so a hung/unresponsive endpoint can't block
+   * the caller indefinitely — this matters most for processOutbox, where
+   * entries are delivered sequentially and one stuck connection would
+   * otherwise stall every entry behind it in the batch.
+   */
+  timeoutMs?: number;
   sleep?: (ms: number) => Promise<void>;
   now?: () => Date;
   logger?: WebhookLogger;
   /** When true, payloads are Gzip-compressed before sending (Content-Encoding: gzip) */
   compress?: boolean;
+  /**
+   * Stellar secret seed ("S...") or PEM-encoded Ed25519 private key. When
+   * set, outbound deliveries are cryptographically signed with Ed25519
+   * (`X-Webhook-Signature: ed25519=<hex>`) instead of HMAC-SHA256.
+   */
+  ed25519SigningKey?: string;
 }
 
 interface WebhookTransactionModel {
@@ -158,8 +172,10 @@ export class WebhookService {
   private readonly fetchImpl: typeof fetch;
   private readonly webhookUrl: string;
   private readonly webhookSecret: string;
+  private readonly ed25519SigningKey: string | undefined;
   private readonly maxAttempts: number;
   private readonly baseDelayMs: number;
+  private readonly timeoutMs: number;
   private readonly sleepImpl: (ms: number) => Promise<void>;
   private readonly now: () => Date;
   private readonly logger: WebhookLogger;
@@ -171,14 +187,41 @@ export class WebhookService {
     this.webhookUrl = options.webhookUrl ?? process.env.WEBHOOK_URL ?? "";
     this.webhookSecret =
       options.webhookSecret ?? process.env.WEBHOOK_SECRET ?? "";
+    this.ed25519SigningKey =
+      options.ed25519SigningKey ?? process.env.WEBHOOK_ED25519_SIGNING_KEY;
     this.maxAttempts = options.maxAttempts ?? 3;
     this.baseDelayMs = options.baseDelayMs ?? 500;
+    this.timeoutMs = options.timeoutMs ?? 10_000;
     this.sleepImpl = options.sleep ?? wait;
     this.now = options.now ?? (() => new Date());
     this.logger = options.logger ?? console;
-    this.compress = options.compress ?? (process.env.WEBHOOK_COMPRESSION === "true");
+    this.compress =
+      options.compress ?? process.env.WEBHOOK_COMPRESSION === "true";
     // Zod schemas for payload validation
     // Imported lazily to avoid circular dependencies
+  }
+
+  getWebhookUrl(): string {
+    return this.webhookUrl;
+  }
+
+  /**
+   * Strict SSRF check on the configured destination. Returns the rejection
+   * message when the URL must not be contacted, otherwise `null`. Re-run for
+   * every delivery so a destination that changed (or was stored before this
+   * guard existed) can never reach a private address.
+   */
+  private async checkDestination(): Promise<string | null> {
+    try {
+      await validateWebhookUrl(this.webhookUrl);
+      return null;
+    } catch (err: unknown) {
+      return err instanceof Error ? err.message : String(err);
+    }
+  }
+
+  getWebhookSecret(): string {
+    return this.webhookSecret;
   }
 
   buildPayload(event: WebhookEvent, transaction: Transaction): WebhookPayload {
@@ -206,7 +249,8 @@ export class WebhookService {
       phone_number: transaction.phoneNumber,
       provider: transaction.provider,
       stellar_address: transaction.stellarAddress,
-      status: transaction.status as "pending" | "completed" | "failed" | "cancelled",
+      status: transaction.status as
+        "pending" | "completed" | "failed" | "cancelled",
       user_id: transaction.userId || undefined,
       notes: transaction.notes || undefined,
       tags: transaction.tags ? transaction.tags.join(",") : undefined,
@@ -229,8 +273,18 @@ export class WebhookService {
     return payload;
   }
 
+  /**
+   * Sign a payload for the `X-Webhook-Signature` header. Uses Ed25519
+   * (`ed25519=<hex>`) when `WEBHOOK_ED25519_SIGNING_KEY` is configured,
+   * otherwise falls back to HMAC-SHA256 (`sha256=<hex>`).
+   */
   signPayload(rawPayload: string): string {
-    return `sha256=${createHmac("sha256", this.webhookSecret).update(rawPayload).digest("hex")}`;
+    return signWebhookPayload(
+      rawPayload,
+      (payload) =>
+        `sha256=${createHmac("sha256", this.webhookSecret).update(payload).digest("hex")}`,
+      this.ed25519SigningKey,
+    ).signature;
   }
 
   async sendTransactionEvent(
@@ -260,11 +314,31 @@ export class WebhookService {
       };
     }
 
+    const destinationError = await this.checkDestination();
+    if (destinationError) {
+      this.logger.warn(`[webhook] ${destinationError}`);
+      return {
+        status: "skipped",
+        attempts: 0,
+        lastAttemptAt: null,
+        deliveredAt: null,
+        lastError: destinationError,
+      };
+    }
+
     const payload = this.buildPayload(event, transaction);
     const validation = webhookPayloadSchema.safeParse(payload);
     if (!validation.success) {
-      this.logger.warn(`[webhook] payload validation failed: ${validation.error}`);
-      return { status: "failed", attempts: 0, lastAttemptAt: null, deliveredAt: null, lastError: "Payload validation failed" };
+      this.logger.warn(
+        `[webhook] payload validation failed: ${validation.error}`,
+      );
+      return {
+        status: "failed",
+        attempts: 0,
+        lastAttemptAt: null,
+        deliveredAt: null,
+        lastError: "Payload validation failed",
+      };
     }
     const rawPayload = JSON.stringify(payload);
     const signature = this.signPayload(rawPayload);
@@ -351,11 +425,31 @@ export class WebhookService {
       };
     }
 
+    const destinationError = await this.checkDestination();
+    if (destinationError) {
+      this.logger.warn(`[webhook] ${destinationError}`);
+      return {
+        status: "skipped",
+        attempts: 0,
+        lastAttemptAt: null,
+        deliveredAt: null,
+        lastError: destinationError,
+      };
+    }
+
     const payload = this.buildFlatPayload(event, transaction);
     const validation = flatWebhookPayloadSchema.safeParse(payload);
     if (!validation.success) {
-      this.logger.warn(`[webhook] flat payload validation failed: ${validation.error}`);
-      return { status: "failed", attempts: 0, lastAttemptAt: null, deliveredAt: null, lastError: "Payload validation failed" };
+      this.logger.warn(
+        `[webhook] flat payload validation failed: ${validation.error}`,
+      );
+      return {
+        status: "failed",
+        attempts: 0,
+        lastAttemptAt: null,
+        deliveredAt: null,
+        lastError: "Payload validation failed",
+      };
     }
     const rawPayload = JSON.stringify(payload);
     const signature = this.signPayload(rawPayload);
@@ -430,7 +524,14 @@ export class WebhookService {
       const { body, extraHeaders } = await prepareBody(rawPayload, useCompress);
       const now = this.now();
 
+      const abortController = new AbortController();
+      const timeoutHandle = setTimeout(
+        () => abortController.abort(),
+        this.timeoutMs,
+      );
+
       try {
+        await validateWebhookUrl(this.webhookUrl);
         const response = await this.fetchImpl(this.webhookUrl, {
           method: "POST",
           headers: {
@@ -439,6 +540,7 @@ export class WebhookService {
             ...extraHeaders,
           },
           body: body as any,
+          signal: abortController.signal,
         });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         this.logger.log(
@@ -463,6 +565,20 @@ export class WebhookService {
             lastAttemptAt: now,
             errorMessage: `Exhausted retries: ${errorMessage}`,
           });
+
+          // Enqueue to BullMQ retry queue for persistent retry
+          if (this.getWebhookUrl() && this.getWebhookSecret()) {
+            const isFlat = "event_id" in entry.payload;
+            await enqueueWebhookRetry({
+              webhookId: entry.id,
+              userId: "",
+              url: this.getWebhookUrl(),
+              secret: this.getWebhookSecret(),
+              eventType: entry.eventType,
+              payload: entry.payload as unknown as Record<string, unknown>,
+              useFlatPayload: isFlat,
+            });
+          }
         } else {
           const backoffMs = this.baseDelayMs * Math.pow(2, attempts - 1);
           await outboxModel.update(entry.id, {
@@ -476,6 +592,8 @@ export class WebhookService {
         this.logger.warn(
           `[webhook-outbox] Failed to deliver entry=${entry.id} attempt=${attempts}/${entry.maxAttempts}: ${errorMessage}`,
         );
+      } finally {
+        clearTimeout(timeoutHandle);
       }
     }
 
@@ -503,6 +621,26 @@ export async function notifyTransactionWebhook(
     return null;
   }
   const result = await webhookService.sendTransactionEvent(event, transaction);
+
+  // Enqueue to BullMQ retry queue if delivery failed
+  if (
+    result.status === "failed" &&
+    webhookService.getWebhookUrl() &&
+    webhookService.getWebhookSecret()
+  ) {
+    await enqueueWebhookRetry({
+      webhookId: transactionId,
+      userId: transaction.userId || "",
+      url: webhookService.getWebhookUrl(),
+      secret: webhookService.getWebhookSecret(),
+      eventType: event,
+      payload: webhookService.buildPayload(
+        event,
+        transaction,
+      ) as unknown as Record<string, unknown>,
+      useFlatPayload: false,
+    });
+  }
 
   // Guard clause added here
   if (
@@ -570,6 +708,26 @@ export async function notifyFlatTransactionWebhook(
     event,
     transaction,
   );
+
+  // Enqueue to BullMQ retry queue if delivery failed
+  if (
+    result.status === "failed" &&
+    webhookService.getWebhookUrl() &&
+    webhookService.getWebhookSecret()
+  ) {
+    await enqueueWebhookRetry({
+      webhookId: transactionId,
+      userId: transaction.userId || "",
+      url: webhookService.getWebhookUrl(),
+      secret: webhookService.getWebhookSecret(),
+      eventType: event,
+      payload: webhookService.buildFlatPayload(
+        event,
+        transaction,
+      ) as unknown as Record<string, unknown>,
+      useFlatPayload: true,
+    });
+  }
 
   // Guard clause added here
   if (

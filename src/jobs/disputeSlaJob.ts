@@ -1,9 +1,10 @@
+import logger from "../utils/logger";
 import { DisputeService } from "../services/dispute";
 import { DisputeStateMachine } from "../services/disputeStateMachine";
 
 /**
  * Scheduled job for monitoring dispute SLA compliance
- * 
+ *
  * This job should be run periodically (e.g., every hour) to:
  * - Send warnings for disputes approaching SLA deadline
  * - Escalate overdue disputes
@@ -32,10 +33,10 @@ export class DisputeSlaJob {
     try {
       // Send SLA warnings for disputes approaching deadline
       const warningResult = await this.disputeService.processSlaWarnings();
-      
+
       // Get overdue disputes for escalation
       const overdueDisputes = await this.disputeService.getOverdueDisputes();
-      
+
       // Escalate overdue disputes
       let escalated = 0;
       for (const dispute of overdueDisputes) {
@@ -43,7 +44,7 @@ export class DisputeSlaJob {
           await this.escalateOverdueDispute(dispute.id);
           escalated++;
         } catch (error) {
-          console.error(`Failed to escalate dispute ${dispute.id}:`, error);
+          logger.error(`Failed to escalate dispute ${dispute.id}:`, error);
         }
       }
 
@@ -55,9 +56,8 @@ export class DisputeSlaJob {
 
       console.log("[DisputeSlaJob] Job completed:", result);
       return result;
-
     } catch (error) {
-      console.error("[DisputeSlaJob] Job failed:", error);
+      logger.error("[DisputeSlaJob] Job failed:", error);
       throw error;
     }
   }
@@ -67,12 +67,12 @@ export class DisputeSlaJob {
    */
   private async escalateOverdueDispute(disputeId: string): Promise<void> {
     const dispute = await this.disputeService.getDispute(disputeId);
-    
+
     // Add internal note about escalation
     await this.disputeService.addNote(
       disputeId,
       "system",
-      `ESCALATION: Dispute is overdue (SLA: ${this.stateMachine.getSlaHours(dispute.priority)} hours). Priority elevated and management notified.`
+      `ESCALATION: Dispute is overdue (SLA: ${this.stateMachine.getSlaHours(dispute.priority)} hours). Priority elevated and management notified.`,
     );
 
     // Escalate priority if not already critical
@@ -127,15 +127,15 @@ export class DisputeSlaJob {
       }
     }
 
-    const averageResolutionHours = resolvedDisputes > 0 
-      ? totalResolutionHours / resolvedDisputes 
-      : 0;
+    const averageResolutionHours =
+      resolvedDisputes > 0 ? totalResolutionHours / resolvedDisputes : 0;
 
     // For this example, assume 80% compliance rate
     // In a real implementation, you'd calculate this based on actual SLA deadlines
     const onTime = Math.floor(resolvedDisputes * 0.8);
     const overdue = resolvedDisputes - onTime;
-    const complianceRate = resolvedDisputes > 0 ? (onTime / resolvedDisputes) * 100 : 0;
+    const complianceRate =
+      resolvedDisputes > 0 ? (onTime / resolvedDisputes) * 100 : 0;
 
     return {
       totalDisputes,

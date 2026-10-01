@@ -18,9 +18,30 @@ export interface Merchant {
   invitationToken?: string;
   invitationSentAt?: Date;
   invitationAcceptedAt?: Date;
-  metadata: Record<string, any>;
+  metadata: Record<string, unknown>;
   createdAt: Date;
   updatedAt: Date;
+}
+
+export interface MerchantRow {
+  id: string;
+  name: string;
+  email: string;
+  phone_number: string;
+  business_name?: string | null;
+  business_type?: string | null;
+  tax_id?: string | null;
+  address?: string | null;
+  city?: string | null;
+  country: string;
+  status: Merchant["status"] | string;
+  kyc_status: Merchant["kycStatus"] | string;
+  invitation_token?: string | null;
+  invitation_sent_at?: Date | string | null;
+  invitation_accepted_at?: Date | string | null;
+  metadata: Record<string, unknown> | null;
+  created_at: Date | string;
+  updated_at: Date | string;
 }
 
 export interface CreateMerchantInput {
@@ -33,7 +54,7 @@ export interface CreateMerchantInput {
   address?: string;
   city?: string;
   country?: string;
-  metadata?: Record<string, any>;
+  metadata?: Record<string, unknown>;
 }
 
 export interface UpdateMerchantInput {
@@ -46,7 +67,7 @@ export interface UpdateMerchantInput {
   country?: string;
   status?: "pending" | "active" | "suspended" | "rejected";
   kycStatus?: "not_started" | "in_progress" | "verified" | "rejected";
-  metadata?: Record<string, any>;
+  metadata?: Record<string, unknown>;
 }
 
 export interface MerchantBatchJob {
@@ -78,7 +99,7 @@ export class MerchantModel {
       RETURNING *
     `;
 
-    const result = await queryWrite(query, [
+    const result = await queryWrite<MerchantRow>(query, [
       id,
       input.name,
       input.email.toLowerCase().trim(),
@@ -99,8 +120,11 @@ export class MerchantModel {
 
   async createMany(
     merchants: CreateMerchantInput[],
-    createdBy: string
-  ): Promise<{ created: Merchant[]; errors: Array<{ row: number; error: string; email?: string }> }> {
+    createdBy: string,
+  ): Promise<{
+    created: Merchant[];
+    errors: Array<{ row: number; error: string; email?: string }>;
+  }> {
     const created: Merchant[] = [];
     const errors: Array<{ row: number; error: string; email?: string }> = [];
 
@@ -127,7 +151,7 @@ export class MerchantModel {
             RETURNING *
           `;
 
-          const result = await client.query(query, [
+          const result = await client.query<MerchantRow>(query, [
             id,
             input.name,
             input.email.toLowerCase().trim(),
@@ -144,7 +168,8 @@ export class MerchantModel {
 
           created.push(this.mapRowToMerchant(result.rows[0]));
         } catch (error) {
-          const errorMessage = error instanceof Error ? error.message : "Unknown error";
+          const errorMessage =
+            error instanceof Error ? error.message : "Unknown error";
           errors.push({
             row: rowNum,
             error: errorMessage,
@@ -165,26 +190,38 @@ export class MerchantModel {
   }
 
   async findById(id: string): Promise<Merchant | null> {
-    const result = await queryRead("SELECT * FROM merchants WHERE id = $1", [id]);
+    const result = await queryRead<MerchantRow>(
+      "SELECT * FROM merchants WHERE id = $1",
+      [id],
+    );
     if (result.rows.length === 0) return null;
     return this.mapRowToMerchant(result.rows[0]);
   }
 
   async findByEmail(email: string): Promise<Merchant | null> {
-    const result = await queryRead("SELECT * FROM merchants WHERE email = $1", [email.toLowerCase().trim()]);
+    const result = await queryRead<MerchantRow>(
+      "SELECT * FROM merchants WHERE email = $1",
+      [email.toLowerCase().trim()],
+    );
     if (result.rows.length === 0) return null;
     return this.mapRowToMerchant(result.rows[0]);
   }
 
   async findByInvitationToken(token: string): Promise<Merchant | null> {
-    const result = await queryRead("SELECT * FROM merchants WHERE invitation_token = $1", [token]);
+    const result = await queryRead<MerchantRow>(
+      "SELECT * FROM merchants WHERE invitation_token = $1",
+      [token],
+    );
     if (result.rows.length === 0) return null;
     return this.mapRowToMerchant(result.rows[0]);
   }
 
-  async update(id: string, input: UpdateMerchantInput): Promise<Merchant | null> {
+  async update(
+    id: string,
+    input: UpdateMerchantInput,
+  ): Promise<Merchant | null> {
     const sets: string[] = [];
-    const values: any[] = [];
+    const values: unknown[] = [];
     let paramIndex = 1;
 
     if (input.name !== undefined) {
@@ -236,7 +273,7 @@ export class MerchantModel {
     values.push(id);
 
     const query = `UPDATE merchants SET ${sets.join(", ")} WHERE id = $${paramIndex} RETURNING *`;
-    const result = await queryWrite(query, values);
+    const result = await queryWrite<MerchantRow>(query, values);
 
     if (result.rows.length === 0) return null;
     return this.mapRowToMerchant(result.rows[0]);
@@ -245,7 +282,7 @@ export class MerchantModel {
   async markInvitationSent(id: string): Promise<void> {
     await queryWrite(
       "UPDATE merchants SET invitation_sent_at = CURRENT_TIMESTAMP WHERE id = $1",
-      [id]
+      [id],
     );
   }
 
@@ -260,7 +297,7 @@ export class MerchantModel {
       RETURNING *
     `;
 
-    const result = await queryWrite(query, [id]);
+    const result = await queryWrite<MerchantRow>(query, [id]);
     if (result.rows.length === 0) return null;
     return this.mapRowToMerchant(result.rows[0]);
   }
@@ -276,7 +313,7 @@ export class MerchantModel {
     const offset = (page - 1) * limit;
 
     const conditions: string[] = [];
-    const values: any[] = [];
+    const values: unknown[] = [];
     let paramIndex = 1;
 
     if (options?.status) {
@@ -288,10 +325,11 @@ export class MerchantModel {
       values.push(options.kycStatus);
     }
 
-    const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+    const whereClause =
+      conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
 
     const countQuery = `SELECT COUNT(*) as total FROM merchants ${whereClause}`;
-    const countResult = await queryRead(countQuery, values);
+    const countResult = await queryRead<{ total: string }>(countQuery, values);
     const total = parseInt(countResult.rows[0]?.total || "0", 10);
 
     const dataQuery = `
@@ -301,39 +339,26 @@ export class MerchantModel {
     `;
     values.push(limit, offset);
 
-    const result = await queryRead(dataQuery, values);
-    const merchants = result.rows.map((row: any) => this.mapRowToMerchant(row));
+    const result = await queryRead<MerchantRow>(dataQuery, values);
+    const merchants = result.rows.map((row) => this.mapRowToMerchant(row));
 
     return { merchants, total };
   }
 
   async getBatchJob(jobId: string): Promise<MerchantBatchJob | null> {
-    const result = await queryRead(
+    const result = await queryRead<MerchantBatchJobRow>(
       "SELECT * FROM merchant_batch_jobs WHERE job_id = $1",
-      [jobId]
+      [jobId],
     );
     if (result.rows.length === 0) return null;
 
-    const row = result.rows[0];
-    return {
-      id: row.id,
-      jobId: row.job_id,
-      status: row.status,
-      totalRecords: row.total_records,
-      processedRecords: row.processed_records,
-      succeededRecords: row.succeeded_records,
-      failedRecords: row.failed_records,
-      errors: row.errors || [],
-      createdBy: row.created_by,
-      createdAt: row.created_at,
-      completedAt: row.completed_at,
-    };
+    return this.mapBatchJobRow(result.rows[0]);
   }
 
   async createBatchJob(
     jobId: string,
     totalRecords: number,
-    createdBy: string
+    createdBy: string,
   ): Promise<MerchantBatchJob> {
     const id = uuidv4();
     const query = `
@@ -345,21 +370,28 @@ export class MerchantModel {
       RETURNING *
     `;
 
-    const result = await queryWrite(query, [id, jobId, totalRecords, createdBy]);
-    const row = result.rows[0];
+    const result = await queryWrite<MerchantBatchJobRow>(query, [
+      id,
+      jobId,
+      totalRecords,
+      createdBy,
+    ]);
+    return this.mapBatchJobRow(result.rows[0]);
+  }
 
+  private mapBatchJobRow(row: MerchantBatchJobRow): MerchantBatchJob {
     return {
       id: row.id,
       jobId: row.job_id,
-      status: row.status,
+      status: row.status as MerchantBatchJob["status"],
       totalRecords: row.total_records,
       processedRecords: row.processed_records,
       succeededRecords: row.succeeded_records,
       failedRecords: row.failed_records,
-      errors: row.errors || [],
+      errors: row.errors ?? [],
       createdBy: row.created_by,
-      createdAt: row.created_at,
-      completedAt: row.completed_at,
+      createdAt: new Date(row.created_at),
+      completedAt: row.completed_at ? new Date(row.completed_at) : undefined,
     };
   }
 
@@ -372,10 +404,10 @@ export class MerchantModel {
       failedRecords?: number;
       errors?: Array<{ row: number; error: string; email?: string }>;
       completedAt?: Date;
-    }
+    },
   ): Promise<void> {
     const sets: string[] = [];
-    const values: any[] = [];
+    const values: unknown[] = [];
     let paramIndex = 1;
 
     if (updates.status !== undefined) {
@@ -410,26 +442,44 @@ export class MerchantModel {
     await queryWrite(query, values);
   }
 
-  private mapRowToMerchant(row: any): Merchant {
+  private mapRowToMerchant(row: MerchantRow): Merchant {
     return {
       id: row.id,
       name: row.name,
       email: row.email,
       phoneNumber: row.phone_number,
-      businessName: row.business_name,
-      businessType: row.business_type,
-      taxId: row.tax_id,
-      address: row.address,
-      city: row.city,
+      businessName: row.business_name ?? undefined,
+      businessType: row.business_type ?? undefined,
+      taxId: row.tax_id ?? undefined,
+      address: row.address ?? undefined,
+      city: row.city ?? undefined,
       country: row.country,
-      status: row.status,
-      kycStatus: row.kyc_status,
-      invitationToken: row.invitation_token,
-      invitationSentAt: row.invitation_sent_at,
-      invitationAcceptedAt: row.invitation_accepted_at,
-      metadata: row.metadata || {},
-      createdAt: row.created_at,
-      updatedAt: row.updated_at,
+      status: row.status as Merchant["status"],
+      kycStatus: row.kyc_status as Merchant["kycStatus"],
+      invitationToken: row.invitation_token ?? undefined,
+      invitationSentAt: row.invitation_sent_at
+        ? new Date(row.invitation_sent_at)
+        : undefined,
+      invitationAcceptedAt: row.invitation_accepted_at
+        ? new Date(row.invitation_accepted_at)
+        : undefined,
+      metadata: row.metadata ?? {},
+      createdAt: new Date(row.created_at),
+      updatedAt: new Date(row.updated_at),
     };
   }
+}
+
+export interface MerchantBatchJobRow {
+  id: string;
+  job_id: string;
+  status: MerchantBatchJob["status"] | string;
+  total_records: number;
+  processed_records: number;
+  succeeded_records: number;
+  failed_records: number;
+  errors: Array<{ row: number; error: string; email?: string }> | null;
+  created_by: string;
+  created_at: Date | string;
+  completed_at?: Date | string | null;
 }

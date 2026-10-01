@@ -1,3 +1,4 @@
+import logger from "../utils/logger";
 import { Request, Response, NextFunction } from "express";
 import { ssoService } from "../auth/sso";
 import { ssoConfig } from "../config/sso";
@@ -14,7 +15,7 @@ import { pool } from "../config/database";
 export async function enforceSSOOnly(
   req: Request,
   res: Response,
-  next: NextFunction
+  next: NextFunction,
 ): Promise<void> {
   try {
     // Skip if SSO is not enabled
@@ -52,7 +53,7 @@ export async function enforceSSOOnly(
 
     next();
   } catch (error) {
-    console.error("[SSO Enforcement] Error checking SSO-only status:", error);
+    logger.error("[SSO Enforcement] Error checking SSO-only status:", error);
     // Don't block request on error, just continue
     next();
   }
@@ -64,7 +65,7 @@ export async function enforceSSOOnly(
 export function enforceSSOForEmployees(
   req: Request,
   res: Response,
-  next: NextFunction
+  next: NextFunction,
 ): void {
   // Skip if SSO enforcement is not enabled
   if (!ssoConfig.enabled || !ssoConfig.enforceSSOForEmployees) {
@@ -102,7 +103,7 @@ export function enforceSSOForEmployees(
 export async function checkSSOUserStatus(
   req: Request,
   res: Response,
-  next: NextFunction
+  next: NextFunction,
 ): Promise<void> {
   try {
     const userId = req.jwtUser?.userId;
@@ -131,7 +132,7 @@ export async function checkSSOUserStatus(
 
     next();
   } catch (error) {
-    console.error("[SSO Enforcement] Error checking SSO user status:", error);
+    logger.error("[SSO Enforcement] Error checking SSO user status:", error);
     // Don't block request on error, just continue
     next();
   }
@@ -143,7 +144,7 @@ export async function checkSSOUserStatus(
 export async function attachSSOContext(
   req: Request,
   res: Response,
-  next: NextFunction
+  next: NextFunction,
 ): Promise<void> {
   try {
     const userId = req.jwtUser?.userId;
@@ -163,7 +164,7 @@ export async function attachSSOContext(
 
     next();
   } catch (error) {
-    console.error("[SSO Enforcement] Error attaching SSO context:", error);
+    logger.error("[SSO Enforcement] Error attaching SSO context:", error);
     // Don't block request on error, just continue
     next();
   }
@@ -175,7 +176,7 @@ export async function attachSSOContext(
 export async function validateSSOProvider(
   req: Request,
   res: Response,
-  next: NextFunction
+  next: NextFunction,
 ): Promise<void> {
   const providerId = req.params.providerId;
 
@@ -210,7 +211,7 @@ export async function validateSSOProvider(
     (req as any).ssoProvider = provider;
     next();
   } catch (error) {
-    console.error("[SSO Enforcement] Error validating SSO provider:", error);
+    logger.error("[SSO Enforcement] Error validating SSO provider:", error);
     res.status(500).json({
       error: "SSO provider validation failed",
       message: error instanceof Error ? error.message : "Unknown error",
@@ -223,7 +224,7 @@ export async function validateSSOProvider(
  */
 export function logSSOEvent(
   eventType: string,
-  getUserId: (req: Request) => string | null
+  getUserId: (req: Request) => string | null,
 ) {
   return async (req: Request, res: Response, next: NextFunction) => {
     try {
@@ -244,11 +245,11 @@ export function logSSOEvent(
             }),
             req.ip,
             req.get("user-agent"),
-          ]
+          ],
         );
       }
     } catch (error) {
-      console.error("[SSO Enforcement] Error logging SSO event:", error);
+      logger.error("[SSO Enforcement] Error logging SSO event:", error);
       // Don't block request on error
     }
 

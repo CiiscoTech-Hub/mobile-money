@@ -7,7 +7,7 @@
  */
 
 import { Request, Response } from "express";
-import * as StellarSdk from "stellar-sdk";
+import * as StellarSdk from "@stellar/stellar-sdk";
 
 // ── Mock heavy dependencies before importing the controller ──────────────────
 
@@ -54,7 +54,12 @@ jest.mock("../../models/transaction", () => {
       countByStatuses: jest.fn().mockResolvedValue(0),
       findByStatuses: jest.fn().mockResolvedValue([]),
     })),
-    TransactionStatus: { Pending: "pending", Failed: "failed", Completed: "completed", Cancelled: "cancelled" },
+    TransactionStatus: {
+      Pending: "pending",
+      Failed: "failed",
+      Completed: "completed",
+      Cancelled: "cancelled",
+    },
   };
 });
 
@@ -88,7 +93,9 @@ jest.mock("../../utils/phoneUtils", () => ({
 
 jest.mock("../../utils/lock", () => ({
   lockManager: {
-    withLock: jest.fn().mockImplementation((_key: string, fn: () => unknown) => fn()),
+    withLock: jest
+      .fn()
+      .mockImplementation((_key: string, fn: () => unknown) => fn()),
   },
   LockKeys: {
     phoneNumber: (p: string) => `phone:${p}`,
@@ -97,10 +104,17 @@ jest.mock("../../utils/lock", () => ({
 }));
 
 jest.mock("../../services/aml", () => ({
-  amlService: { monitorTransaction: jest.fn().mockResolvedValue({ flagged: false }) },
+  amlService: {
+    profileTransaction: jest.fn().mockResolvedValue({ flagged: false }),
+    monitorTransaction: jest.fn().mockResolvedValue({ flagged: false }),
+  },
 }));
 
 jest.mock("../../compliance/travelRule", () => ({
+  travelRuleService: {
+    applies: jest.fn().mockReturnValue(false),
+    capture: jest.fn(),
+  },
   TravelRuleService: jest.fn().mockImplementation(() => ({
     applies: jest.fn().mockReturnValue(false),
     capture: jest.fn(),
@@ -108,6 +122,11 @@ jest.mock("../../compliance/travelRule", () => ({
 }));
 
 jest.mock("../../queue/transactionQueue", () => ({
+  addTransactionJob: jest.fn().mockResolvedValue({ id: "job-1" }),
+  getJobProgress: jest.fn().mockResolvedValue(null),
+}));
+
+jest.mock("../../queue/transactionQueue.js", () => ({
   addTransactionJob: jest.fn().mockResolvedValue({ id: "job-1" }),
   getJobProgress: jest.fn().mockResolvedValue(null),
 }));
@@ -122,12 +141,13 @@ jest.mock("../../services/mobilemoney/mobileMoneyService", () => ({
 
 // ── Import after mocks ────────────────────────────────────────────────────────
 
-import { withdrawHandler } from "../transactionController";
+import { withdrawHandler, depositHandler } from "../transactionController";
 import {
   checkDestinationTrustline,
   TrustlineError,
 } from "../../stellar/trustlines";
 import { getConfiguredPaymentAsset } from "../../services/stellar/assetService";
+import { amlService } from "../../services/aml";
 import { ERROR_CODES } from "../../constants/errorCodes";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -153,7 +173,11 @@ function makeReq(overrides: Partial<Request["body"]> = {}): Partial<Request> {
   } as unknown as Partial<Request>;
 }
 
-function makeRes(): { res: Partial<Response>; status: jest.Mock; json: jest.Mock } {
+function makeRes(): {
+  res: Partial<Response>;
+  status: jest.Mock;
+  json: jest.Mock;
+} {
   const json = jest.fn();
   const status = jest.fn().mockReturnValue({ json });
   const res = { status, json } as unknown as Partial<Response>;
@@ -165,13 +189,15 @@ function makeRes(): { res: Partial<Response>; status: jest.Mock; json: jest.Mock
 describe("withdrawHandler — trustline check", () => {
   const mockCheckTrustline = checkDestinationTrustline as jest.Mock;
   const mockGetAsset = getConfiguredPaymentAsset as jest.Mock;
+  const mockProfileTransaction = amlService.profileTransaction as jest.Mock;
 
   beforeEach(() => {
     jest.clearAllMocks();
     mockGetAsset.mockReturnValue(USDC);
+    mockProfileTransaction.mockResolvedValue({ flagged: false });
   });
 
-  it("returns 400 with TRUSTLINE_MISSING when destination has no trustline", async () => {
+  it("returns TRUSTLINE_MISSING when destination has no trustline", async () => {
     mockCheckTrustline.mockRejectedValue(
       new TrustlineError(
         `Destination account ${VALID_STELLAR_ADDRESS} has no trustline for USDC`,
@@ -180,67 +206,100 @@ describe("withdrawHandler — trustline check", () => {
     );
 
     const req = makeReq();
-    const { res, status, json } = makeRes();
+    const { res } = makeRes();
 
-    await withdrawHandler(req as Request, res as Response);
-
-    expect(status).toHaveBeenCalledWith(400);
-    expect(json).toHaveBeenCalledWith(
-      expect.objectContaining({ code: ERROR_CODES.TRUSTLINE_MISSING }),
-    );
+    await expect(
+      withdrawHandler(req as Request, res as Response),
+    ).rejects.toMatchObject({
+      code: ERROR_CODES.TRUSTLINE_MISSING,
+      statusCode: 400,
+      details: expect.objectContaining({
+        error: expect.stringContaining("no trustline"),
+      }),
+    });
   });
 
-  it("includes a descriptive error message in the 400 response", async () => {
+  it("includes a descriptive trustline error detail", async () => {
     const errorMsg = `Destination account ${VALID_STELLAR_ADDRESS} has no trustline for USDC`;
     mockCheckTrustline.mockRejectedValue(new TrustlineError(errorMsg, USDC));
 
     const req = makeReq();
-    const { res, status, json } = makeRes();
+    const { res } = makeRes();
 
-    await withdrawHandler(req as Request, res as Response);
-
-    expect(status).toHaveBeenCalledWith(400);
-    expect(json).toHaveBeenCalledWith(
-      expect.objectContaining({ error: errorMsg }),
-    );
+    await expect(
+      withdrawHandler(req as Request, res as Response),
+    ).rejects.toMatchObject({
+      details: expect.objectContaining({ error: errorMsg }),
+    });
   });
 
-  it("returns 502 when Horizon throws an unexpected error", async () => {
+  it("returns SERVICE_UNAVAILABLE when Horizon throws an unexpected error", async () => {
     mockCheckTrustline.mockRejectedValue(new Error("Horizon network timeout"));
 
     const req = makeReq();
-    const { res, status, json } = makeRes();
+    const { res } = makeRes();
 
-    await withdrawHandler(req as Request, res as Response);
-
-    expect(status).toHaveBeenCalledWith(502);
-    expect(json).toHaveBeenCalledWith(
-      expect.objectContaining({ error: expect.stringContaining("trustline") }),
-    );
+    await expect(
+      withdrawHandler(req as Request, res as Response),
+    ).rejects.toMatchObject({
+      code: ERROR_CODES.SERVICE_UNAVAILABLE,
+      statusCode: 503,
+      details: expect.objectContaining({
+        error: expect.stringContaining("trustline"),
+      }),
+    });
   });
 
   it("calls checkDestinationTrustline with the stellarAddress from the request", async () => {
-    mockCheckTrustline.mockResolvedValue(undefined); // trustline present — let it proceed past the check
+    mockCheckTrustline.mockResolvedValue(undefined);
 
     const req = makeReq({ stellarAddress: VALID_STELLAR_ADDRESS });
-    const { res } = makeRes();
+    const { res, status, json } = makeRes();
 
-    // The handler may 500 after the trustline check (no real DB), but we only
-    // care that checkDestinationTrustline was called with the right arguments.
-    await withdrawHandler(req as Request, res as Response);
+    await expect(
+      withdrawHandler(req as Request, res as Response),
+    ).resolves.toBeUndefined();
 
-    expect(mockCheckTrustline).toHaveBeenCalledWith(VALID_STELLAR_ADDRESS, USDC);
+    expect(mockCheckTrustline).toHaveBeenCalledWith(
+      VALID_STELLAR_ADDRESS,
+      USDC,
+    );
+    expect(status).toHaveBeenCalledWith(200);
+    expect(json).toHaveBeenCalledWith(
+      expect.objectContaining({ transactionId: "tx-1", jobId: "job-1" }),
+    );
   });
 
   it("does NOT call checkDestinationTrustline for deposit requests", async () => {
-    const { depositHandler } = await import("../transactionController");
+
+    const req = makeReq();
+    const { res, status } = makeRes();
+
+    await expect(
+      depositHandler(req as Request, res as Response),
+    ).resolves.toBeUndefined();
+
+    expect(mockCheckTrustline).not.toHaveBeenCalled();
+    expect(status).toHaveBeenCalledWith(200);
+  });
+
+  it("runs pre-dispatch AML profiling before queue dispatch", async () => {
+    mockCheckTrustline.mockResolvedValue(undefined);
 
     const req = makeReq();
     const { res } = makeRes();
 
-    await depositHandler(req as Request, res as Response);
+    await expect(
+      withdrawHandler(req as Request, res as Response),
+    ).resolves.toBeUndefined();
 
-    expect(mockCheckTrustline).not.toHaveBeenCalled();
+    expect(mockProfileTransaction).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "tx-1",
+        userId: "user-1",
+        amount: 100,
+      }),
+    );
   });
 
   it("uses the configured payment asset from getConfiguredPaymentAsset", async () => {
@@ -251,15 +310,19 @@ describe("withdrawHandler — trustline check", () => {
     );
 
     const req = makeReq();
-    const { res, status } = makeRes();
+    const { res } = makeRes();
 
-    await withdrawHandler(req as Request, res as Response);
+    await expect(
+      withdrawHandler(req as Request, res as Response),
+    ).rejects.toMatchObject({
+      code: ERROR_CODES.TRUSTLINE_MISSING,
+      statusCode: 400,
+    });
 
     expect(mockGetAsset).toHaveBeenCalled();
     expect(mockCheckTrustline).toHaveBeenCalledWith(
       expect.any(String),
       customAsset,
     );
-    expect(status).toHaveBeenCalledWith(400);
   });
 });

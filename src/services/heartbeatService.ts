@@ -1,11 +1,12 @@
+import logger from "../utils/logger";
 import { systemHeartbeat } from "../utils/metrics";
 
 /**
  * HeartbeatService manages the system heartbeat metric.
  * The heartbeat is a gauge that reports baseline availability state consistently.
- * 
+ *
  * Value: 1 = available, 0 = unavailable
- * 
+ *
  * This metric is useful for:
  * - Monitoring system uptime and availability
  * - Alerting on service degradation
@@ -58,7 +59,7 @@ function updateHeartbeat(): void {
   try {
     systemHeartbeat.set({ service: "mobile-money" }, 1);
   } catch (error) {
-    console.error("[Heartbeat Service] Failed to update heartbeat:", error);
+    logger.error("[Heartbeat Service] Failed to update heartbeat:", error);
   }
 }
 
@@ -75,7 +76,7 @@ export async function getHeartbeatStatus(): Promise<number> {
     );
     return heartbeatMetric ? heartbeatMetric.value : 0;
   } catch (error) {
-    console.error("[Heartbeat Service] Failed to get heartbeat status:", error);
+    logger.error("[Heartbeat Service] Failed to get heartbeat status:", error);
     return 0;
   }
 }

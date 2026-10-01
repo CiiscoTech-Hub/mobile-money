@@ -1,8 +1,14 @@
+import logger from "../utils/logger";
 import { pool } from "../config/database";
 import { TransactionModel, TransactionStatus } from "../models/transaction";
-import { Sep31Status, mapToSep31Status, isValidTransition } from "../stellar/sep31";
+import {
+  Sep31Status,
+  mapToSep31Status,
+  isValidTransition,
+} from "../stellar/sep31";
 import { getStellarServer } from "../config/stellar";
-import * as StellarSdk from "stellar-sdk";
+import * as StellarSdk from "@stellar/stellar-sdk";
+import { notifyReceivingAnchorStatus } from "../services/webhookService";
 
 /**
  * SEP-31 Transaction Monitor Job
@@ -16,14 +22,16 @@ export async function runSep31MonitorJob(): Promise<void> {
   try {
     // Find all pending SEP-31 transactions
     const result = await pool.query(`
-      SELECT id, metadata, stellar_address, amount, status
+      SELECT id, metadata, stellar_address, amount, status, created_at
       FROM transactions
       WHERE status IN ('pending', 'processing')
         AND provider = 'stellar-sep31'
         AND metadata->'sep31' IS NOT NULL
     `);
 
-    console.log(`[sep31-monitor] Found ${result.rows.length} SEP-31 transactions to check`);
+    console.log(
+      `[sep31-monitor] Found ${result.rows.length} SEP-31 transactions to check`,
+    );
 
     for (const row of result.rows) {
       try {
@@ -32,19 +40,28 @@ export async function runSep31MonitorJob(): Promise<void> {
         const currentStatus = mapToSep31Status(row.status, metadata);
 
         // Skip if already completed or errored
-        if (currentStatus === Sep31Status.Completed || currentStatus === Sep31Status.Error) {
+        if (
+          currentStatus === Sep31Status.Completed ||
+          currentStatus === Sep31Status.Error
+        ) {
           continue;
         }
 
         // Check if payment has been received
         if (currentStatus === Sep31Status.PendingSender) {
-          const paymentReceived = await checkPaymentReceived(server, sep31Meta, row.amount);
+          const paymentReceived = await checkPaymentReceived(
+            server,
+            sep31Meta,
+            row.amount,
+          );
           if (paymentReceived) {
             // Update to pending_stellar
             const newStatus = Sep31Status.PendingStellar;
             if (isValidTransition(currentStatus, newStatus)) {
               await updateSep31Status(row.id, newStatus, metadata);
-              console.log(`[sep31-monitor] Transaction ${row.id} payment received, status: ${newStatus}`);
+              console.log(
+                `[sep31-monitor] Transaction ${row.id} payment received, status: ${newStatus}`,
+              );
             }
           }
         }
@@ -59,29 +76,36 @@ export async function runSep31MonitorJob(): Promise<void> {
           const newStatus = Sep31Status.Completed;
           if (isValidTransition(currentStatus, newStatus)) {
             await updateSep31Status(row.id, newStatus, metadata);
-            console.log(`[sep31-monitor] Transaction ${row.id} completed, status: ${newStatus}`);
+            await notifyReceivingAnchorStatus(row, newStatus, metadata);
+            console.log(
+              `[sep31-monitor] Transaction ${row.id} completed, status: ${newStatus}`,
+            );
           }
         }
-
       } catch (error) {
-        console.error(`[sep31-monitor] Error processing transaction ${row.id}:`, error);
+        logger.error(
+          `[sep31-monitor] Error processing transaction ${row.id}:`,
+          error,
+        );
       }
     }
   } catch (error) {
-    console.error("[sep31-monitor] Job failed:", error);
+    logger.error("[sep31-monitor] Job failed:", error);
   }
 }
 
 async function checkPaymentReceived(
   server: StellarSdk.Horizon.Server,
   sep31Meta: any,
-  expectedAmount: string
+  expectedAmount: string,
 ): Promise<boolean> {
   try {
     // Query transactions for the receiving account with the memo
     const operations = await server
       .operations()
-      .forAccount(sep31Meta.stellar_account_id || process.env.STELLAR_RECEIVING_ACCOUNT)
+      .forAccount(
+        sep31Meta.stellar_account_id || process.env.STELLAR_RECEIVING_ACCOUNT,
+      )
       .includeFailed(false)
       .limit(10)
       .call();
@@ -91,13 +115,14 @@ async function checkPaymentReceived(
       if (op.type === "payment") {
         const amount = parseFloat(op.amount);
         const expected = parseFloat(expectedAmount);
-        if (Math.abs(amount - expected) < 0.0000001) { // Account for floating point precision
+        if (Math.abs(amount - expected) < 0.0000001) {
+          // Account for floating point precision
           return true;
         }
       }
     }
   } catch (error) {
-    console.error("[sep31-monitor] Error checking payment:", error);
+    logger.error("[sep31-monitor] Error checking payment:", error);
   }
 
   return false;
@@ -106,7 +131,7 @@ async function checkPaymentReceived(
 async function updateSep31Status(
   transactionId: string,
   newStatus: Sep31Status,
-  currentMetadata: any
+  currentMetadata: any,
 ): Promise<void> {
   const transactionModel = new TransactionModel();
 

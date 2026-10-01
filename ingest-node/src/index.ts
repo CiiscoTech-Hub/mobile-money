@@ -30,24 +30,31 @@ import Fastify from "fastify";
 import { z } from "zod";
 import Redis from "ioredis";
 import { connect as natsConnect, StringCodec, type NatsConnection } from "nats";
-import { Registry, Counter, Histogram, collectDefaultMetrics } from "prom-client";
+import {
+  Registry,
+  Counter,
+  Histogram,
+  Gauge,
+  collectDefaultMetrics,
+} from "prom-client";
+import fastifyRateLimit from "@fastify/rate-limit";
 
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
 
-const PORT               = parseInt(process.env.PORT               || "3001");
-const REDIS_URL          = process.env.REDIS_URL                   || "redis://localhost:6379";
-const NATS_URL           = process.env.NATS_URL                    || "nats://localhost:4222";
-const REDIS_ENABLED      = process.env.REDIS_ENABLED               !== "false";
-const NATS_ENABLED       = process.env.NATS_ENABLED                === "true";
-const REDIS_STREAM       = process.env.REDIS_STREAM                || "callbacks";
-const NATS_SUBJECT       = process.env.NATS_SUBJECT                || "callbacks.ingest";
+const PORT = parseInt(process.env.PORT || "3001");
+const REDIS_URL = process.env.REDIS_URL || "redis://localhost:6379";
+const NATS_URL = process.env.NATS_URL || "nats://localhost:4222";
+const REDIS_ENABLED = process.env.REDIS_ENABLED !== "false";
+const NATS_ENABLED = process.env.NATS_ENABLED === "true";
+const REDIS_STREAM = process.env.REDIS_STREAM || "callbacks";
+const NATS_SUBJECT = process.env.NATS_SUBJECT || "callbacks.ingest";
 
 // Redis connection pool configuration
-const REDIS_POOL_SIZE    = parseInt(process.env.REDIS_POOL_SIZE    || "10");
-const REDIS_POOL_MIN     = parseInt(process.env.REDIS_POOL_MIN     || "2");
-const REDIS_POOL_MAX     = parseInt(process.env.REDIS_POOL_MAX     || "20");
+const REDIS_POOL_SIZE = parseInt(process.env.REDIS_POOL_SIZE || "10");
+const REDIS_POOL_MIN = parseInt(process.env.REDIS_POOL_MIN || "2");
+const REDIS_POOL_MAX = parseInt(process.env.REDIS_POOL_MAX || "20");
 
 // ---------------------------------------------------------------------------
 // Prometheus metrics
@@ -92,7 +99,7 @@ const redisPoolConnectionsTotal = new Counter({
   registers: [register],
 });
 
-const redisPoolConnectionsActive = new Counter({
+const redisPoolConnectionsActive = new Gauge({
   name: "redis_pool_connections_active",
   help: "Number of active Redis pool connections",
   labelNames: ["state"], // available, in_use
@@ -112,14 +119,14 @@ const redisPoolOperationDurationSeconds = new Histogram({
 // ---------------------------------------------------------------------------
 
 const CallbackSchema = z.object({
-  event_type:    z.string().min(1).max(64),
-  provider:      z.string().min(1).max(32),
-  reference:     z.string().min(1).max(128),
-  amount:        z.number().positive(),
-  currency:      z.string().length(3),
-  status:        z.enum(["pending", "success", "failed"]),
-  timestamp:     z.string().datetime(),
-  metadata:      z.record(z.unknown()).optional(),
+  event_type: z.string().min(1).max(64),
+  provider: z.string().min(1).max(32),
+  reference: z.string().min(1).max(128),
+  amount: z.number().positive(),
+  currency: z.string().length(3),
+  status: z.enum(["pending", "success", "failed"]),
+  timestamp: z.string().datetime(),
+  metadata: z.record(z.unknown()).optional(),
 });
 
 type CallbackPayload = z.infer<typeof CallbackSchema>;
@@ -144,8 +151,10 @@ class RedisConnectionPool {
   async initialize(): Promise<void> {
     if (this.isInitialized) return;
 
-    console.log(`[redis-pool] initializing with ${this.minConnections}-${this.maxConnections} connections`);
-    
+    console.log(
+      `[redis-pool] initializing with ${this.minConnections}-${this.maxConnections} connections`,
+    );
+
     // Create minimum connections
     for (let i = 0; i < this.minConnections; i++) {
       const client = await this.createConnection();
@@ -154,7 +163,9 @@ class RedisConnectionPool {
     }
 
     this.isInitialized = true;
-    console.log(`[redis-pool] initialized with ${this.available.length} connections`);
+    console.log(
+      `[redis-pool] initialized with ${this.available.length} connections`,
+    );
   }
 
   private async createConnection(): Promise<Redis> {
@@ -184,7 +195,7 @@ class RedisConnectionPool {
 
   async getConnection(): Promise<Redis> {
     const start = process.hrtime.bigint();
-    
+
     if (!this.isInitialized) {
       throw new Error("Redis pool not initialized");
     }
@@ -227,21 +238,24 @@ class RedisConnectionPool {
       });
     } finally {
       const duration = Number(process.hrtime.bigint() - start) / 1e9;
-      redisPoolOperationDurationSeconds.observe({ operation: "get_connection" }, duration);
+      redisPoolOperationDurationSeconds.observe(
+        { operation: "get_connection" },
+        duration,
+      );
     }
   }
 
   releaseConnection(client: Redis): void {
     if (this.inUse.has(client)) {
       this.inUse.delete(client);
-      
+
       // Only return to pool if connection is still healthy
       if (client.status === "ready") {
         this.available.push(client);
       } else {
         this.removeConnection(client);
       }
-      
+
       this.updateMetrics();
     }
   }
@@ -249,7 +263,10 @@ class RedisConnectionPool {
   private updateMetrics(): void {
     // Reset counters and set current values
     redisPoolConnectionsActive.reset();
-    redisPoolConnectionsActive.inc({ state: "available" }, this.available.length);
+    redisPoolConnectionsActive.inc(
+      { state: "available" },
+      this.available.length,
+    );
     redisPoolConnectionsActive.inc({ state: "in_use" }, this.inUse.size);
   }
 
@@ -269,12 +286,15 @@ class RedisConnectionPool {
     // Ensure minimum connections
     if (this.pool.length < this.minConnections) {
       this.createConnection()
-        .then(newClient => {
+        .then((newClient) => {
           this.pool.push(newClient);
           this.available.push(newClient);
         })
-        .catch(err => {
-          console.error("[redis-pool] failed to create replacement connection:", err.message);
+        .catch((err) => {
+          console.error(
+            "[redis-pool] failed to create replacement connection:",
+            err.message,
+          );
         });
     }
   }
@@ -282,13 +302,16 @@ class RedisConnectionPool {
   async executeCommand<T>(command: (client: Redis) => Promise<T>): Promise<T> {
     const start = process.hrtime.bigint();
     const client = await this.getConnection();
-    
+
     try {
       return await command(client);
     } finally {
       this.releaseConnection(client);
       const duration = Number(process.hrtime.bigint() - start) / 1e9;
-      redisPoolOperationDurationSeconds.observe({ operation: "execute_command" }, duration);
+      redisPoolOperationDurationSeconds.observe(
+        { operation: "execute_command" },
+        duration,
+      );
     }
   }
 
@@ -304,18 +327,20 @@ class RedisConnectionPool {
 
   async shutdown(): Promise<void> {
     console.log("[redis-pool] shutting down...");
-    
+
     const allConnections = [...this.pool];
     this.pool = [];
     this.available = [];
     this.inUse.clear();
 
     await Promise.all(
-      allConnections.map(client => 
-        client.disconnect().catch(err => 
-          console.error("[redis-pool] error during shutdown:", err.message)
-        )
-      )
+      allConnections.map((client) =>
+        client
+          .disconnect()
+          .catch((err) =>
+            console.error("[redis-pool] error during shutdown:", err.message),
+          ),
+      ),
     );
 
     console.log("[redis-pool] shutdown complete");
@@ -348,19 +373,23 @@ async function publish(payload: CallbackPayload): Promise<void> {
 
   if (REDIS_ENABLED && redisPool) {
     const redisStart = process.hrtime.bigint();
-    
+
     // Use connection pool to execute Redis Stream command
     await redisPool.executeCommand(async (client) => {
       return client.xadd(
         REDIS_STREAM,
-        "*",                        // auto-generate message ID
-        "event_type", payload.event_type,
-        "provider",   payload.provider,
-        "reference",  payload.reference,
-        "data",       serialised,
+        "*", // auto-generate message ID
+        "event_type",
+        payload.event_type,
+        "provider",
+        payload.provider,
+        "reference",
+        payload.reference,
+        "data",
+        serialised,
       );
     });
-    
+
     const redisNs = Number(process.hrtime.bigint() - redisStart);
     ingestPublishDurationSeconds.observe({ target: "redis" }, redisNs / 1e9);
   }
@@ -380,42 +409,58 @@ async function publish(payload: CallbackPayload): Promise<void> {
 // ---------------------------------------------------------------------------
 
 const app = Fastify({
-  logger: false,          // disable for benchmark — logging adds latency
+  logger: false, // disable for benchmark — logging adds latency
   trustProxy: true,
 });
+app.register(fastifyRateLimit, { max: 100, timeWindow: 60000 });
 
 app.post<{ Body: unknown }>("/ingest", async (req, reply) => {
   const requestStart = process.hrtime.bigint();
+  try {
+    // --- Parse + validate ---
+    const parseStart = process.hrtime.bigint();
+    const parsed = CallbackSchema.safeParse(req.body);
+    const parseNs = Number(process.hrtime.bigint() - parseStart);
+    ingestParseDurationSeconds.observe(parseNs / 1e9);
 
-  // --- Parse + validate ---
-  const parseStart = process.hrtime.bigint();
-  const parsed = CallbackSchema.safeParse(req.body);
-  const parseNs = Number(process.hrtime.bigint() - parseStart);
-  ingestParseDurationSeconds.observe(parseNs / 1e9);
+    if (!parsed.success) {
+      ingestRequestsTotal.inc({ status_code: "400" });
+      const totalNs = Number(process.hrtime.bigint() - requestStart);
+      ingestRequestDurationSeconds.observe(
+        { status_code: "400" },
+        totalNs / 1e9,
+      );
+      return reply
+        .status(400)
+        .send({ error: "Invalid payload", details: parsed.error.flatten() });
+    }
 
-  if (!parsed.success) {
-    ingestRequestsTotal.inc({ status_code: "400" });
+    // --- Publish to streams ---
+    const publishStart = process.hrtime.bigint();
+    await publish(parsed.data);
+    const publishNs = Number(process.hrtime.bigint() - publishStart);
+    ingestPublishDurationSeconds.observe({ target: "all" }, publishNs / 1e9);
+
+    ingestRequestsTotal.inc({ status_code: "202" });
     const totalNs = Number(process.hrtime.bigint() - requestStart);
-    ingestRequestDurationSeconds.observe({ status_code: "400" }, totalNs / 1e9);
-    return reply.status(400).send({ error: "Invalid payload", details: parsed.error.flatten() });
+    ingestRequestDurationSeconds.observe({ status_code: "202" }, totalNs / 1e9);
+
+    return reply
+      .status(202)
+      .send({ status: "accepted", reference: parsed.data.reference });
+  } catch (err) {
+    // Unexpected error handling
+    ingestRequestsTotal.inc({ status_code: "500" });
+    const totalNs = Number(process.hrtime.bigint() - requestStart);
+    ingestRequestDurationSeconds.observe({ status_code: "500" }, totalNs / 1e9);
+    console.error("[ingest-node] unexpected error:", err);
+    return reply.status(500).send({ error: "Internal server error" });
   }
-
-  // --- Publish to streams ---
-  const publishStart = process.hrtime.bigint();
-  await publish(parsed.data);
-  const publishNs = Number(process.hrtime.bigint() - publishStart);
-  ingestPublishDurationSeconds.observe({ target: "all" }, publishNs / 1e9);
-
-  ingestRequestsTotal.inc({ status_code: "202" });
-  const totalNs = Number(process.hrtime.bigint() - requestStart);
-  ingestRequestDurationSeconds.observe({ status_code: "202" }, totalNs / 1e9);
-
-  return reply.status(202).send({ status: "accepted", reference: parsed.data.reference });
 });
 
 app.get("/health", async (_req, reply) => {
-  const health: any = { 
-    status: "ok", 
+  const health: any = {
+    status: "ok",
     runtime: "node",
     timestamp: new Date().toISOString(),
   };
@@ -449,6 +494,39 @@ app.get("/metrics", async (_req, reply) => {
 });
 
 // ---------------------------------------------------------------------------
+// Readiness endpoint – verifies underlying message queues before reporting ready
+// ---------------------------------------------------------------------------
+
+async function checkDependencies(): Promise<boolean> {
+  // Verify Redis connection if enabled
+  if (REDIS_ENABLED && redisPool) {
+    try {
+      await redisPool.executeCommand(async (client) => client.ping());
+    } catch (err) {
+      console.error("[ready] Redis ping failed", err);
+      return false;
+    }
+  }
+  // Verify NATS connection if enabled
+  if (NATS_ENABLED && nats) {
+    if (nats.isClosed()) {
+      console.error("[ready] NATS connection closed");
+      return false;
+    }
+  }
+  return true;
+}
+
+app.get("/ready", async (_req, reply) => {
+  const healthy = await checkDependencies();
+  if (healthy) {
+    return reply.status(200).send({ status: "ready" });
+  } else {
+    return reply.status(503).send({ status: "unavailable" });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Boot
 // ---------------------------------------------------------------------------
 
@@ -461,7 +539,7 @@ async function main(): Promise<void> {
 // Graceful shutdown
 async function shutdown(): Promise<void> {
   console.log("[ingest-node] shutting down...");
-  
+
   try {
     await app.close();
     console.log("[ingest-node] HTTP server closed");
@@ -488,12 +566,16 @@ async function shutdown(): Promise<void> {
 // Handle shutdown signals
 process.on("SIGTERM", () => {
   console.log("[ingest-node] received SIGTERM");
-  shutdown().then(() => process.exit(0)).catch(() => process.exit(1));
+  shutdown()
+    .then(() => process.exit(0))
+    .catch(() => process.exit(1));
 });
 
 process.on("SIGINT", () => {
   console.log("[ingest-node] received SIGINT");
-  shutdown().then(() => process.exit(0)).catch(() => process.exit(1));
+  shutdown()
+    .then(() => process.exit(0))
+    .catch(() => process.exit(1));
 });
 
 main().catch((err) => {
